@@ -23,6 +23,21 @@ fi
 # shellcheck source=tests/lib/assertions.sh
 source "${REPO_ROOT}/tests/lib/assertions.sh"
 
+# 本文件通过「假 PATH 农场」模拟工具缺失/存在，但农场靠 symlink 真实二进制。
+# 若宿主根本没装 shellcheck/shfmt，则无法构造「已安装」场景 → 那几条用例不可能绿。
+# 按纪律不静默：显式 SKIP 并告知（容器内装了全套，是权威基环境）。
+MISSING_TOOLS=""
+for t in shellcheck shfmt jq; do
+  if ! command -v "${t}" >/dev/null 2>&1; then
+    MISSING_TOOLS="${MISSING_TOOLS}${t} "
+  fi
+done
+if [[ -n "${MISSING_TOOLS// /}" ]]; then
+  t_describe "ci.sh 自测前置：缺少 ${MISSING_TOOLS}"
+  t_skip "宿主缺 ${MISSING_TOOLS}，无法构造工具已安装的农场；换容器内跑（Dockerfile 已装齐 shellcheck shfmt jq）"
+  t_done
+fi
+
 TMPDIR_T0="$(mktemp -d)"
 export TMPDIR_T0
 trap 'rm -rf "${TMPDIR_T0}"' EXIT
@@ -159,7 +174,9 @@ EOS
 run_ci() { # run_ci <repo-root> [env assignments...]
   local root="$1"
   shift
-  run env PATH="${FAKE_BIN}" "$@" bash "${root}/scripts/ci.sh"
+  # 隔离：外层可能带着 HERDR_FORWARD_CI_LAX=1（例如整体验证降级开关），
+  # 但本文件的用例各自显式控制该变量；不清洗会让嵌套 ci.sh 行为偏离预期。
+  run env -u HERDR_FORWARD_CI_LAX PATH="${FAKE_BIN}" "$@" bash "${root}/scripts/ci.sh"
 }
 
 t_describe "ci.sh：工具缺失必须显式报错（禁止静默绿）"
