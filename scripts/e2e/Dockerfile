@@ -8,6 +8,7 @@ FROM docker.io/library/archlinux:latest
 
 # openssh      sshd + ssh 客户端（用户态 sshd 回环）
 # jq           状态文件断言（断言库 t_json_valid 依赖）
+# python3      T1/T2/T3 单测集成测试的硬依赖（固定 TOML/tomllib 解析、Rust regex 代理）
 # openbsd-netcat  nc：客户端与端口探活（archlinux 无 gnu-netcat 包）
 # socat        echo 服务承载进程：openbsd nc 无 -e/-c，不能自己回显；
 #              socat 的 EXEC:/bin/cat（或 while-read 脚本）fork-per-conn 提供真回显，
@@ -15,10 +16,26 @@ FROM docker.io/library/archlinux:latest
 # shellcheck/shfmt  容器内完整 ci 基线（宿主可能缺）
 # coreutils/util-linux  timeout/pgrep/ss 等测试原语
 RUN pacman -Sy --noconfirm \
-  openssh jq openbsd-netcat socat bash coreutils util-linux \
-  shellcheck shfmt iproute2 \
+  openssh jq python openbsd-netcat socat bash coreutils util-linux \
+  iproute2 \
   && pacman -Scc --noconfirm \
-  && command -v shellcheck shfmt jq nc socat sshd ssh-keygen bash
+  && command -v shellcheck jq nc socat sshd ssh-keygen bash python3
+
+# shellcheck 与 shfmt 用二进制固定版本覆盖 pacman 版：
+# pacman 的 shfmt 是滚动更新（本容器 3.14.x），与宿主/开发者常用 3.10 对同一构造
+# （`if ! cmd <<HEREDOC ... then`）会给出不同格式 —— 同一份源码在 CI 与本地得出
+# 不同结论是基线拦截最忌讳的。固定到与项目声明一致的版本，保证“格式化结果唯一”。
+ARG SHFMT_VERSION=3.10.0
+ARG SHELLCHECK_VERSION=0.10.0
+RUN curl -fsSL -o /usr/local/bin/shfmt \
+  "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" \
+  && chmod 0755 /usr/local/bin/shfmt \
+  && curl -fsSL -o /tmp/sc.tar.xz \
+  "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+  && tar -xJf /tmp/sc.tar.xz -C /tmp \
+  && install -m 0755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck \
+  && rm -rf /tmp/sc.tar.xz "/tmp/shellcheck-v${SHELLCHECK_VERSION}" \
+  && shfmt --version && shellcheck --version | head -2
 
 # 非 root 测试用户（贴近真实运行环境，且验证用户态 sshd 在无特权下可行）
 RUN useradd -m -s /bin/bash fwduser
