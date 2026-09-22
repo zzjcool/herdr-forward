@@ -148,9 +148,11 @@ python3 -c 'import sys; sys.stdout.write("Z" * 1100000)' >"${LOGFILE}"
 log info "after-rotate-probe"
 _count wc -c <"${LOGFILE}"
 SIZE="${got}"
-ROT_FLAG=""
-[[ "${SIZE}" -lt 800000 ]] && ROT_FLAG="yes"
-t_ok "${ROT_FLAG}" "轮转后体积 ${SIZE} < 800KB"
+ROT_FLAG="no"
+if [[ "${SIZE}" -lt 800000 ]]; then
+  ROT_FLAG="yes"
+fi
+t_eq "yes" "${ROT_FLAG}" "轮转后体积 ${SIZE} < 800KB"
 _readfile "${LOGFILE}"
 t_match "after-rotate-probe" "${got}" "轮转保留新日志"
 
@@ -245,8 +247,12 @@ _capture_src 'tcp_serve_once abc'
 t_exit_ok 1 "${rc}" "非数字端口 die 1"
 
 t_it "tcp_serve_once 后端存在（nc 或 python3）；两者皆无则 die 127"
+BACKEND="no"
 if command -v nc >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
-  t_ok "yes" "存在 nc 或 python3 后端"
+  BACKEND="yes"
+fi
+if [[ "${BACKEND}" == "yes" ]]; then
+  t_eq "yes" "${BACKEND}" "存在 nc 或 python3 后端"
 else
   _capture_src 'tcp_serve_once 19555'
   t_exit_ok 127 "${rc}" "两者皆无 -> die 127"

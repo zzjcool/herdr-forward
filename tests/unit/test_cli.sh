@@ -356,8 +356,12 @@ t_exit_ok 9 "${rc}" "unpublish -> 9"
 
 t_it "watch 需要 watch 命令；无 watch 则 die 127"
 _stage
+HAS_WATCH="no"
 if command -v watch >/dev/null 2>&1; then
-  t_ok "yes" "watch 存在（真循环留给 pane 交互验证）"
+  HAS_WATCH="yes"
+fi
+if [[ "${HAS_WATCH}" == "yes" ]]; then
+  t_eq "yes" "${HAS_WATCH}" "watch 存在（真循环留给 pane 交互验证）"
 else
   _fw watch
   t_exit_ok 127 "${rc}" "缺 watch -> 127"
