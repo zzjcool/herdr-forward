@@ -23,10 +23,11 @@ set -Eeuo pipefail
 # 公共状态（由测试文件消费，故显式导出，避免「未使用变量」误报）
 PASS=0
 FAIL=0
+SKIP=0
 out=""
 err=""
 rc=0
-export PASS FAIL out err rc
+export PASS FAIL SKIP out err rc
 
 _T_NAMED_MSG="${_T_NAMED_MSG:-(unnamed)}"
 
@@ -43,6 +44,12 @@ _t_pass() {
 _t_fail() {
   FAIL=$((FAIL + 1))
   printf 'not ok %d - %s\n' "${FAIL}" "${1}"
+}
+
+# 显式跳过（环境能力缺失等不可控因素）。绝不静默：必须带上原因，且 t_done 会汇总。
+_t_skip() {
+  SKIP=$((SKIP + 1))
+  printf 'ok %d - SKIP: %s\n' "$((PASS + FAIL + SKIP))" "${1}"
 }
 
 # ---------------------------------------------------------------------------
@@ -68,6 +75,9 @@ t_ok() {
 
 # t_pass [msg]  无条件记录一次通过（与 t_fail 配对，便于分支写法）
 t_pass() { _t_pass "${1:-${_T_NAMED_MSG}}"; }
+
+# t_skip <reason>  显式跳过（环境能力缺失）：输出中带 SKIP 与原因，t_done 单独统计
+t_skip() { _t_skip "${1:-${_T_NAMED_MSG}}"; }
 
 # t_fail [msg]  无条件记录一次失败
 t_fail() { _t_fail "${1:-${_T_NAMED_MSG}}"; }
@@ -179,20 +189,48 @@ t_json_valid() {
 }
 
 # t_no_zombie_ssh  集成/E2E 收尾断言：无 `ssh ... herdr-forward ...` 残留进程
+#
+# 契约 B.1 的扫描模式是 `pgrep -f 'ssh.*herdr-forward'`。直接用它有个陷阱：沙箱/runner 的
+# 自身命令行可能同时含 "ssh"（如 sshd 路径、--ro-bind .../empty.sshd）与 "herdr-forward"
+# （项目路径），造成自匹配假阳性。故先采集当前进程的整条祖先链（bwrap/runner/…）并排除，
+# 只关心「我们自己 fork 出来的、真正遗留的」测试进程。
 t_no_zombie_ssh() {
   local msg="${1:-无残留 ssh/herdr-forward 进程}"
   if ! command -v pgrep >/dev/null 2>&1; then
     _t_fail "${msg}（pgrep 未安装，无法检测残留）"
     return 0
   fi
+  # 祖先链（含自身与父进程，一直上溯到 pid 1；bwrap 在沙箱内就是 pid 1）
+  local -a excluded=()
+  local cur="$$"
+  local ppid=""
+  while [[ -n "${cur}" && "${cur}" != "0" ]]; do
+    excluded+=("${cur}")
+    [[ "${cur}" == "1" ]] && break
+    ppid=""
+    ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/${cur}/status" 2>/dev/null | head -1 || true)"
+    if [[ -z "${ppid}" || "${ppid}" == "${cur}" ]]; then
+      break
+    fi
+    cur="${ppid}"
+  done
+
   local -a pids=()
   mapfile -t pids < <(pgrep -f 'ssh.*herdr-forward' 2>/dev/null || true)
   local -a residue=()
   local p=""
+  local ex=""
+  local skip=0
   for p in "${pids[@]}"; do
     [[ -z "${p}" ]] && continue
-    # 排除本测试进程自身与其父进程（命令行里可能含项目路径）
-    [[ "${p}" == "$$" || "${p}" == "${PPID}" ]] && continue
+    skip=0
+    for ex in "${excluded[@]}"; do
+      if [[ "${p}" == "${ex}" ]]; then
+        skip=1
+        break
+      fi
+    done
+    [[ "${skip}" -eq 1 ]] && continue
     residue+=("${p}")
   done
   if [[ "${#residue[@]}" -eq 0 ]]; then
@@ -204,9 +242,9 @@ t_no_zombie_ssh() {
 
 # t_done / t_summary  汇总；FAIL>0 exit 1
 t_done() {
-  local total=$((PASS + FAIL))
+  local total=$((PASS + FAIL + SKIP))
   printf '1..%d\n' "${total}"
-  printf '# PASS: %d FAIL: %d\n' "${PASS}" "${FAIL}"
+  printf '# PASS: %d FAIL: %d SKIP: %d\n' "${PASS}" "${FAIL}" "${SKIP}"
   if [[ "${FAIL}" -gt 0 ]]; then
     printf '# RESULT: FAIL\n'
     exit 1

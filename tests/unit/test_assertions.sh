@@ -74,7 +74,7 @@ done
 
 t_describe "扩展便利接口（T0 追加，非冻结）"
 t_it "扩展函数都已定义"
-for fn in t_pass t_is t_isnt t_contains t_matches t_dies_with t_run t_summary t_file_absent; do
+for fn in t_pass t_is t_isnt t_contains t_matches t_dies_with t_run t_summary t_file_absent t_skip; do
   if declare -F "${fn}" >/dev/null 2>&1; then
     t_ok "定义存在：${fn}"
   else
@@ -226,5 +226,15 @@ t_ok "一条通过"
 PROBE
 t_contains "1..1" "${out}" "t_done 输出 TAP 计划行"
 t_contains "PASS: 1 FAIL: 0" "${out}" "t_done 输出统计行"
+
+t_it "t_skip 计入总数、不算失败且必须带原因"
+probe_passes "t_skip 收尾" <<'PROBE'
+t_skip "环境缺 nc，走等价断言"
+t_ok "另一条通过"
+[[ "${SKIP}" -eq 1 ]] && t_pass "SKIP 计数为 1" || t_fail "SKIP 未计数"
+PROBE
+t_contains "SKIP: 环境缺 nc" "${out}" "t_skip 输出带原因"
+t_contains "SKIP: 1" "${out}" "汇总行包含 SKIP 计数"
+t_contains "FAIL: 0" "${out}" "t_skip 不计入 FAIL"
 
 t_done
