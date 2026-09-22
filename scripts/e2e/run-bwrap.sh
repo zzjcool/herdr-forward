@@ -73,10 +73,16 @@ done
 shopt -u dotglob nullglob
 # /work/test-results 用 bind mount 指向宿主结果目录（结果出口），不预建同名空目录。
 # 宿主额外工具（shellcheck/shfmt 可能装在 ~/.local/bin，宿主 /usr 下没有；宿主也可能没有 nc）。
-# 只拷「需要的几个二进制」到沙箱专用目录，绝不把整个 ~/.local/bin 暴露进沙箱
+# 两种注入方式并用：
+#   1) 拷到沙箱专用目录 /e2etools 并置于 PATH 前，保证沙箱自有副本；
+#      用 -L（解引用）而非 -a，否则拷进来的是悬空 symlink（如 mise/nix 安装）。
+#   2) 把工具所在目录 ro-bind 回原宿主绝对路径：嵌套测试（test_ci_script）会自己
+#      建 symlink 农场指向绝对路径，不 bind 就会悬空。
+# 只处理需要的几个工具，绝不把整个 ~/.local/bin 暴露进沙箱
 # （那里还有 herdr/cloudflared 等，会污染沙箱 PATH 与 herdr 探测）。
 TOOL_BIND=()
 path_prefix="/e2etools"
+TOOL_HOST_DIRS=()
 for tool in shellcheck shfmt nc socat jq; do
   tool_path="$(command -v "${tool}" 2>/dev/null || true)"
   [[ -z "${tool_path}" ]] && continue
@@ -84,10 +90,26 @@ for tool in shellcheck shfmt nc socat jq; do
   /usr/* | /bin/*) continue ;; # 已在只读根里，无需额外注入
   *) ;;
   esac
-  cp -a "${tool_path}" "${SANDBOX}/tools/${tool}"
+  cp -L "${tool_path}" "${SANDBOX}/tools/${tool}"
+  tool_dir="$(cd "$(dirname "${tool_path}")" && pwd)"
+  TOOL_HOST_DIRS+=("${tool_dir}")
   log "注入沙箱工具：${tool}（源 ${tool_path}）"
 done
 TOOL_BIND=(--ro-bind "${SANDBOX}/tools" "${path_prefix}")
+# 去重后把宿主工具目录 bind 回原位（只读）
+if [[ "${#TOOL_HOST_DIRS[@]}" -gt 0 ]]; then
+  declare -A seen_dirs=()
+  for d in "${TOOL_HOST_DIRS[@]}"; do
+    if [[ -z "${seen_dirs[${d}]:-}" ]]; then
+      seen_dirs["${d}"]=1
+      TOOL_BIND+=(--ro-bind "${d}" "${d}")
+      TOOL_BIND_DIRS_NOTE="${TOOL_BIND_DIRS_NOTE:-}${d} "
+    fi
+  done
+fi
+if [[ -n "${TOOL_BIND_DIRS_NOTE:-}" ]]; then
+  log "回绑宿主工具目录（供嵌套测试的绝对路径 symlink 解引用）：${TOOL_BIND_DIRS_NOTE}"
+fi
 for tool in nc shellcheck shfmt; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     log "警告：宿主缺 ${tool}，沙箱内该断言将显式 SKIP（不静默通过）"

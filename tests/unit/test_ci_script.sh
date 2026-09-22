@@ -101,6 +101,30 @@ EOS
   chmod +x "${FAKE_BIN}/docker"
 }
 
+# 假 docker CLI：存在但 `docker info` 失败（模拟 daemon 未启动/权限不足）
+make_docker_daemon_down() {
+  rm -f "${FAKE_BIN}/docker"
+  cat >"${FAKE_BIN}/docker" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo "Cannot connect to the Docker daemon" >&2
+exit 1
+EOS
+  chmod +x "${FAKE_BIN}/docker"
+}
+
+# 假 bwrap：验证 ci.sh 的「docker 不可用 → 降级 bwrap」跳转逻辑
+make_fake_bwrap() {
+  rm -f "${FAKE_BIN}/bwrap"
+  cat >"${FAKE_BIN}/bwrap" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo "fake bwrap $*"
+exit 0
+EOS
+  chmod +x "${FAKE_BIN}/bwrap"
+}
+
 # ---------------------------------------------------------------------------
 # 假仓库
 # ---------------------------------------------------------------------------
@@ -281,6 +305,33 @@ t_isnt 0 "${rc}" "两者都不可用时 rc!=0"
 combined="${out}${err}"
 t_contains "docker" "${combined}" "报错要提到 docker"
 t_contains "bwrap" "${combined}" "报错要提到 bwrap 降级路径"
+
+t_it "docker daemon 不可用但 bwrap 可用 → 降级 bwrap 且 WARN（不静默、不失败）"
+build_base_farm
+install_tool shellcheck shfmt
+make_docker_daemon_down
+make_fake_bwrap
+root="$(fake_repo fallbackbwrap)"
+cat >"${root}/scripts/e2e/run-bwrap.sh" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo "FAKE_E2E_BWRAP_RAN"
+bwrap --unshare-net /usr/bin/bash -c true
+exit 0
+EOS
+run_ci "${root}"
+t_is 0 "${rc}" "docker 不可用但 bwrap 可用时应绿（err=${err}）"
+t_contains "FAKE_E2E_BWRAP_RAN" "${out}" "实际走了 bwrap 降级路径"
+t_contains "bwrap" "${out}${err}" "降级必须显式提示（不静默）"
+
+# 伪造 PATH：把 docker 完全移出农场，验证 ci.sh 「command -v docker 失败 → bwrap」跳转
+build_base_farm
+install_tool shellcheck shfmt
+make_fake_bwrap
+root="$(fake_repo noshadowdocker)"
+run_ci "${root}"
+t_is 0 "${rc}" "无 docker CLI 时降级 bwrap 应绿"
+t_contains "FAKE_E2E_BWRAP_RAN" "${out}" "无 docker 时走了 bwrap"
 
 t_it "两 E2E 脚本都不存在时哨兵必须红（E2E 绝不允许静默跳过）"
 build_base_farm
