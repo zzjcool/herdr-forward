@@ -115,7 +115,7 @@ machine_resolve() {
     fi
   done <"${toml}"
 
-  if ((!found_section)); then
+  if ((! found_section)); then
     local available=""
     available="$(machine_list_labels "${toml}" | paste -sd ',' -)"
     if [[ -z ${available} ]]; then

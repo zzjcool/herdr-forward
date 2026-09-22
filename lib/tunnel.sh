@@ -262,7 +262,13 @@ tunnel_start() {
 
   # atomic_write needs an explicit same-filesystem tmpdir (A.3 signature). Without it
   # the pid file silently never lands and tunnel_stop loses its pid fallback.
-  if ! printf '%s\n' "${master}" | atomic_write "${pid_file}" "${dir}"; then
+  # 不用 `if ! … | atomic_write`：那会命中 SC2310（条件内 set -e 被禁用）。
+  local write_rc=0
+  set +o errexit
+  printf '%s\n' "${master}" | atomic_write "${pid_file}" "${dir}"
+  write_rc=$?
+  set -o errexit
+  if [[ "${write_rc}" -ne 0 ]]; then
     log warn "tunnel_start: could not record pid ${master} in ${pid_file}; tunnel_stop will fall back to the control socket only."
   fi
   printf '%s\n' "${master}"

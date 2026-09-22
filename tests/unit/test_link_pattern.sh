@@ -47,6 +47,13 @@ else
   }
 fi
 
+# 合并缺陷修补（T4）：本文件在 T0 断言库存在时走真库分支，而真库未定义
+# t_fail_note（它只在下面 else 的占位分支里定义）→ 任何真失败会退化成
+# "t_fail_note: command not found" (rc=127)，掩盖真实原因。这里補一个别名。
+if ! declare -F t_fail_note >/dev/null 2>&1; then
+  t_fail_note() { t_fail "$@"; }
+fi
+
 # 一期 link pattern 定稿（与 herdr-plugin.toml 中 [[link_handlers]] 的 pattern 必须一致）
 readonly PATTERN_EXPECTED='^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?(?:[/?#].*)?$'
 # 同构的 bash ERE：Rust `(?:` -> ERE `(`；Rust `\d` -> ERE `[0-9]`（语义等价子集）
@@ -205,13 +212,14 @@ done
 t_eq "0" "${p2_mismatch}" "二期候选 pattern 命中其用例"
 
 t_it "link_handler action 指向 manifest 中已声明的 action id"
-if python3 - "${MANIFEST}" "${manifest_action}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" "${manifest_action}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
 ids = {a.get("id") for a in doc.get("actions", [])}
 sys.exit(0 if sys.argv[2] in ids else 1)
 PY
+then
   t_pass "action '${manifest_action}' 已声明"
 else
   t_fail_note "action '${manifest_action}' 未在 [[actions]] 中声明"
@@ -221,7 +229,7 @@ fi
 t_describe "manifest 结构冒烟（tomllib）"
 
 t_it "顶层必填字段 / 平台 / 版本下限"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -237,13 +245,14 @@ if set(doc["platforms"]) - {"linux", "macos"}:
     sys.exit(1)
 sys.exit(0)
 PY
+then
   t_pass "顶层字段齐全，id/min_herdr_version/platforms 符合冻结声明"
 else
   t_fail_note "manifest 顶层字段不合规"
 fi
 
 t_it "[[actions]] >= 4 且 id 唯一、无点、command 是非空 argv 数组"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -264,13 +273,14 @@ for a in actions:
         sys.exit(1)
 sys.exit(0)
 PY
+then
   t_pass "actions 结构合规（>=4，argv 数组，id 无点）"
 else
   t_fail_note "[[actions]] 结构不合规"
 fi
 
 t_it "[[panes]] 声明 Ports 面板，id 无点、command 是 argv 数组"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -291,13 +301,14 @@ for p in panes:
             sys.exit(1)
 sys.exit(0)
 PY
+then
   t_pass "panes 结构合规（含 ports 面板）"
 else
   t_fail_note "[[panes]] 结构不合规"
 fi
 
 t_it "[[link_handlers]] 结构合规且 action 引用存在"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -314,13 +325,14 @@ for h in handlers:
         sys.exit(1)
 sys.exit(0)
 PY
+then
   t_pass "link_handlers 结构合规，action 引用存在"
 else
   t_fail_note "[[link_handlers]] 结构不合规"
 fi
 
 t_it "所有 command 均不依赖未证实的 %{plugin_root} 模板变量（SCOUT-FACTS §2.2）"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -332,13 +344,14 @@ for key in ("actions", "panes", "startup", "events", "build"):
 bad = [argv for argv in argv_lists if isinstance(argv, list) and any("%{plugin_root}" in a for a in argv)]
 sys.exit(1 if bad else 0)
 PY
+then
   t_pass "command argv 未使用 %{plugin_root}"
 else
   t_fail_note "有 command argv 仍引用未证实的 %{plugin_root}"
 fi
 
 t_it "command argv 均通过 \$HERDR_PLUGIN_ROOT env 解析插件路径（官方注入，SCOUT-FACTS §2.2）"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null; then
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -354,6 +367,7 @@ for key in ("actions", "panes"):
                 needs_root.append(entry.get("id"))
 sys.exit(1 if needs_root else 0)
 PY
+then
   t_pass "调用 bin/forward 的 command 均经 \$HERDR_PLUGIN_ROOT 解析"
 else
   t_fail_note "有 command 直接写死 bin/forward 路径，未经 \$HERDR_PLUGIN_ROOT"

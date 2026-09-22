@@ -54,6 +54,13 @@ else
   }
 fi
 
+# 合并缺陷修补（T4）：本文件在 T0 断言库存在时走真库分支，而真库未定义
+# t_fail_note（它只在下面 else 的占位分支里定义）→ 任何真失败会退化成
+# "t_fail_note: command not found" (rc=127)，掩盖真实原因。这里補一个别名。
+if ! declare -F t_fail_note >/dev/null 2>&1; then
+  t_fail_note() { t_fail "$@"; }
+fi
+
 if [[ ! -f "${ROOT}/lib/common.sh" ]]; then
   echo "RED: lib/common.sh 不存在（common 原语尚未实现）" >&2
   exit 1
@@ -114,6 +121,31 @@ _count() {
   got="$("$@" 2>/dev/null)"
   set -o errexit
   got="${got// /}"
+}
+
+# _free_port：stdout 一个当前空闲的高端 TCP 端口（环境无关，不依赖 22 端口）
+_free_port() {
+  local candidate="" candidates=""
+  candidates="$(shuf -i 32000-39999 -n 50 || true)"
+  while read -r candidate; do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/${candidate}") 2>/dev/null; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done <<<"${candidates}"
+  printf '0\n'
+}
+
+# _wait_port <port> [tries]：轮询等待端口可连，1=就绪（返回 0/1，调用处自行忽略）
+_wait_port() {
+  local port="${1}" tries="${2:-30}" i=0
+  for ((i = 0; i < tries; i++)); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 t_describe "common.sh: state_dir / log"
@@ -214,9 +246,23 @@ t_eq "0" "${got}" "空输入写空文件"
 t_describe "common.sh: probe_tcp"
 
 t_it "probe_tcp 对已监听端口输出 ok"
-_capture probe_tcp 127.0.0.1 22 1
+# 环境无关：自建一个监听 socket，而不是假设宿主/容器在 22 端口有服务
+# （容器内无 sshd 监听 22 → 原写法在 E2E 里必红）。
+PROBE_PORT="$(_free_port)"
+python3 -u -c 'import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(8)
+while True:
+    c,_=s.accept(); c.close()' "${PROBE_PORT}" &
+PROBE_PID=$!
+set +o errexit
+_wait_port "${PROBE_PORT}"
+set -o errexit
+_capture probe_tcp 127.0.0.1 "${PROBE_PORT}" 1
 t_exit_ok 0 "${rc}" "永不 exit"
-t_eq "ok" "${out}" "22 端口 ok"
+t_eq "ok" "${out}" "监听中的端口 ok"
+kill "${PROBE_PID}" 2>/dev/null || true
+wait "${PROBE_PID}" 2>/dev/null || true
 
 t_it "probe_tcp 对关闭端口输出 fail 且仍 return 0"
 _capture probe_tcp 127.0.0.1 1 1

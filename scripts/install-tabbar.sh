@@ -245,7 +245,7 @@ fi
 
 # --- 自检：新内容必须是合法 TOML，且本插件条目恰好 1 条 ---
 printf '%s\n' "${new_content}" >"${tmp_file}" || die "无法写入临时文件"
-if ! python3 - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null; then
+if ! python3 - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null
 import sys
 import tomllib
 
@@ -272,6 +272,7 @@ if not (1 <= int(entry["timeout_seconds"]) <= 3600):
 if raw.count(sys.argv[2]) != 1:
     sys.exit(1)
 PY
+then
   die "内部错误：生成的内容不是合法 TOML 或条目数异常，已中止（原文件未改）"
 fi
 

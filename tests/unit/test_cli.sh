@@ -58,6 +58,13 @@ else
   }
 fi
 
+# 合并缺陷修补（T4）：本文件在 T0 断言库存在时走真库分支，而真库未定义
+# t_fail_note（它只在下面 else 的占位分支里定义）→ 任何真失败会退化成
+# "t_fail_note: command not found" (rc=127)，掩盖真实原因。这里補一个别名。
+if ! declare -F t_fail_note >/dev/null 2>&1; then
+  t_fail_note() { t_fail "$@"; }
+fi
+
 if [[ ! -x "${ROOT}/bin/forward" ]]; then
   echo "RED: bin/forward 不存在或不可执行（CLI 尚未实现）" >&2
   exit 1
