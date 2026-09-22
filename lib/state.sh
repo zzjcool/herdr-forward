@@ -283,14 +283,17 @@ forward_set_status() {
     die 1 "forward_set_status 用法：forward_set_status <id> <status>。status 取 starting|up|down。"
   fi
 
-  local valid=" false"
+  # 用 read -ra + 显式 IFS=' ' 拆分（不依赖调用方 IFS；bin/forward 设了 IFS=$'\n\t'）
+  local valid="false"
+  local -a allowed=()
+  IFS=' ' read -ra allowed <<<"${FORWARD_VALID_STATUS}"
   local candidate=""
-  for candidate in ${FORWARD_VALID_STATUS}; do
+  for candidate in "${allowed[@]}"; do
     if [[ "${candidate}" == "${status}" ]]; then
-      valid=" true"
+      valid="true"
     fi
   done
-  if [[ "${valid}" != " true" ]]; then
+  if [[ "${valid}" != "true" ]]; then
     die 1 "非法状态：${status}。允许值：${FORWARD_VALID_STATUS// /, }。"
   fi
 
