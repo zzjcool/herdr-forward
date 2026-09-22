@@ -1,0 +1,12 @@
+id = "zzjcool:forward"
+name = "forward"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Forward a saved SSH machine's TCP port to localhost, and optionally publish a localhost port to the public internet via a Cloudflare quick tunnel."
+platforms = ["linux", "macos"]
+
+# herdr-forward 插件 manifest —— 立项占位版，字段参考 herdr 0.9 schema
+# （RESEARCH.md §2.2）；实现开工时再填 command/actions。
+
+# Ctrl+click localhost:PORT 链接 → 打开浏览器（一期）
+# [[link_handlers]] / [[actions]] / [[panes]] 具体声明见 docs/PLAN.md
