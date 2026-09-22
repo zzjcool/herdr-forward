@@ -260,7 +260,11 @@ tunnel_start() {
     die 5 "tunnel start failed: ${id} -> 127.0.0.1:${local_port} via ${ssh_target}${tail_out:+ (ssh: ${tail_out})}"
   fi
 
-  printf '%s\n' "${master}" | atomic_write "${pid_file}"
+  # atomic_write needs an explicit same-filesystem tmpdir (A.3 signature). Without it
+  # the pid file silently never lands and tunnel_stop loses its pid fallback.
+  if ! printf '%s\n' "${master}" | atomic_write "${pid_file}" "${dir}"; then
+    log warn "tunnel_start: could not record pid ${master} in ${pid_file}; tunnel_stop will fall back to the control socket only."
+  fi
   printf '%s\n' "${master}"
 }
 
@@ -272,8 +276,12 @@ tunnel_stop() {
   local ctl="${dir}/ctl-${id}"
   local pid_file="${dir}/pid-${id}"
 
+  # Graceful shutdown via the control socket. `timeout` can only exec a *program*,
+  # never a shell function, so the ssh binary is invoked directly here; wrapping
+  # _tunnel_ctl_ssh would exit 127 and silently skip the graceful path.
   if [[ -S "${ctl}" ]]; then
-    timeout 5 _tunnel_ctl_ssh -o "ControlPath=${ctl}" -O exit dummy@dummy >/dev/null 2>&1 || true
+    timeout 5 ssh -F /dev/null -o BatchMode=yes -o "ControlPath=${ctl}" \
+      -O exit dummy@dummy >/dev/null 2>&1 || true
   fi
 
   local pid=""
@@ -289,6 +297,13 @@ tunnel_stop() {
       sleep 0.1
     done
     kill -KILL "${pid}" 2>/dev/null || true
+  fi
+
+  # The master may still be running when neither path above was available (e.g. the
+  # control socket was already gone and the pid file was lost). Report it instead of
+  # pretending the tunnel is down, so callers keep a truthful status.
+  if [[ ${pid} =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+    log warn "tunnel_stop: ssh master ${pid} (${id}) is still alive after TERM/KILL; the tunnel may still be listening."
   fi
 
   rm -f "${ctl}" "${pid_file}" "${dir}/target-${id}"

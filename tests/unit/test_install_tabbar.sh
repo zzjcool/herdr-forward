@@ -209,7 +209,7 @@ after3="$(md5 "${config3}")"
 t_eq "${before3}" "${after3}" "dry-run 未改文件"
 dry_bak="$(find "${WORK}" -maxdepth 1 -name 'dry.toml.bak.*' -print -quit)"
 t_eq "" "${dry_bak}" "dry-run 未生成备份"
-t_ok "${out}" "dry-run 有输出"
+t_eq "yes" "$([[ -n ${out} ]] && printf yes || printf no)" "dry-run 有输出"
 
 t_it "dry-run 对已安装的 config 也 exit 0 且不改文件"
 before4="$(md5 "${config2}")"
@@ -241,7 +241,7 @@ run_installer "${config7}"
 if [[ "${rc}" -ne 0 ]]; then t_pass "非法 TOML 拒绝（rc=${rc}）"; else t_fail_note "非法 TOML 未拒绝"; fi
 after7="$(cat "${config7}")"
 t_eq "${before7}" "${after7}" "原文件未被破坏"
-t_ok "${err}" "错误信息走 stderr"
+t_eq "yes" "$([[ -n ${err} ]] && printf yes || printf no)" "错误信息走 stderr"
 
 t_it "--help 可用且 exit 0（禁交互）"
 rc=0

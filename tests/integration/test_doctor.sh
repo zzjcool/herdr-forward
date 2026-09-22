@@ -380,10 +380,12 @@ t_match "pruned" "${T2_OUT}" "announces the prune"
 t2_run t2_record_count
 t_eq "0" "${T2_OUT}" "record removed"
 t_it "the stale control socket is gone after prune"
+# B.1 的 t_ok 语义是「断言上一条命令成功」。这里位于 if 的 else 分支，$? 是 [[ -e ]]
+# 的 1，用 t_ok 会误判为失败 → 必须用无参条件断言语义的 t_pass。
 if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/ctl-${TUNNEL_ID}" ]]; then
   t_fail "control socket survived prune"
 else
-  t_ok "control socket removed"
+  t_pass "control socket removed"
 fi
 TUNNEL_ID=""
 
