@@ -16,6 +16,12 @@ fi
 if [[ -z ${FORWARD_TCP_TIMEOUT_DEFAULT:-} ]]; then
   readonly FORWARD_TCP_TIMEOUT_DEFAULT=2
 fi
+if [[ -z ${FORWARD_PROBE_TIMEOUT_DEFAULT:-} ]]; then
+  readonly FORWARD_PROBE_TIMEOUT_DEFAULT=2 # 等应用层回包的秒数（A.3.1 review 修正）
+fi
+if [[ -z ${FORWARD_PROBE_PAYLOAD_MARKER:-} ]]; then
+  readonly FORWARD_PROBE_PAYLOAD_MARKER='herdr-forward-probe'
+fi
 
 # state_dir
 #   stdout: 插件状态目录绝对路径（A.2：env 优先，缺失回退 ~/.local/state/herdr-forward）
@@ -27,20 +33,34 @@ state_dir() {
 # log <level:debug|info|warn|error> <msg...>
 #   写 $HERDR_PLUGIN_STATE_DIR/logs/forward.log；env 缺失退 /dev/stderr。
 #   warn/error 额外镜像到 stderr（用户/CI 可见）。永不因日志失败而中断调用方。
+#   review M2：原实现每次调用 fork `date`+`mkdir`+`wc`+`tail`（500 条 ~2.8s）。
+#   现改为纯 builtin：EPOCHSECONDS + `printf %(%…Z)T` 生成 UTC 时间戳；
+#   目录创建用进程内标志去重；轮转阈值用有界 read 取字节数（无 fork）。
+_log_dir_ready="" # 进程内缓存：日志目录已确保存在（每次调用免 fork mkdir）
 log() {
   local level="${1:-info}"
   shift || true
   local msg="$*"
+
   local ts=""
-  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  # TZ=UTC0 只作用于本条 printf（bash 普通 builtin 的临时环境赋值不泄漏）；
+  # EPOCHSECONDS 缺失时回退 -1（printf 语义：取当前时间），故无 date fork。
+  TZ=UTC0 printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' "${EPOCHSECONDS:--1}"
   local line="[${ts}] ${level}: ${msg}"
 
   if [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
     local logdir="${HERDR_PLUGIN_STATE_DIR}/logs"
     local logfile="${logdir}/forward.log"
-    mkdir -p "${logdir}" 2>/dev/null || true
+    if [[ -z "${_log_dir_ready}" || ! -d "${logdir}" ]]; then
+      mkdir -p "${logdir}" 2>/dev/null || true
+      _log_dir_ready=1
+    fi
     _log_rotate "${logfile}"
-    printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null || printf '%s\n' "${line}" >&2
+    if ! printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null; then
+      # 目录被外部删掉等异常：重建一次再重试，仍失败则退 stderr（永不中断调用方）
+      mkdir -p "${logdir}" 2>/dev/null || true
+      printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null || printf '%s\n' "${line}" >&2
+    fi
   else
     printf '%s\n' "${line}" >&2
   fi
@@ -51,17 +71,17 @@ log() {
 }
 
 # _log_rotate <logfile>：>FORWARD_LOG_MAX_BYTES 时保留最后 FORWARD_LOG_KEEP_BYTES 字节
+#   review M2：用有界 read（最多读 MAX+1 字节，以字节计）+ builtin 子串切片，
+#   取代 `wc -c`/`tail -c` 两个 fork。恒定内存/时间上界，大文件也不拖慢调用方。
 _log_rotate() {
   local logfile="${1-}"
   [[ -f "${logfile}" ]] || return 0
-  local size=0
-  size="$(wc -c <"${logfile}" 2>/dev/null || printf '0')"
-  size="${size// /}"
-  [[ "${size}" =~ ^[0-9]+$ ]] || return 0
-  ((size > FORWARD_LOG_MAX_BYTES)) || return 0
-  local keep=""
-  keep="$(tail -c "${FORWARD_LOG_KEEP_BYTES}" "${logfile}" 2>/dev/null || true)"
-  printf '%s\n' "${keep}" >"${logfile}" 2>/dev/null || true
+  local LC_ALL=C # 使 ${#var} / ${var: -n} 按字节而非字符计数（与 wc -c 语义一致）
+  local data=""
+  IFS= read -r -N $((FORWARD_LOG_MAX_BYTES + 1)) -d "" data <"${logfile}" 2>/dev/null || true
+  [[ "${#data}" =~ ^[0-9]+$ ]] || return 0
+  ((${#data} > FORWARD_LOG_MAX_BYTES)) || return 0
+  printf '%s\n' "${data: -FORWARD_LOG_KEEP_BYTES}" >"${logfile}" 2>/dev/null || true
 }
 
 # die <exit_code> <msg...>：log error + exit；用户可见错误必须含下一步建议
@@ -152,6 +172,55 @@ probe_tcp() {
     printf 'ok\n'
   else
     printf 'fail\n'
+  fi
+  return 0
+}
+
+# probe_payload <host> <port> [timeout_s=2]：
+#   A.3.1（review D1 契约修正）：连上后发一行 payload 并等**任意**应用层回包：
+#     up       连接成功且 timeout 内收到至少 1 字节回包（远端应用真的在服务）
+#     degraded 连接成功但无回包（远端端口可连，协议未知/不应答）
+#     down     连接被拒/重置/超时失败或参数为空
+#   恒 return 0（不因失败 exit），stdout 恒单行。
+#   为什么需要它：ssh -L 的本地监听器在 master 活着时**永远**接受本地连接，
+#   TCP-only 探活于是把「远端应用已死」误判为 up（review D1 红线的根因）。
+probe_payload() {
+  local host="${1-}"
+  local port="${2-}"
+  local timeout_s="${3:-${FORWARD_PROBE_TIMEOUT_DEFAULT}}"
+  if [[ -z "${host}" || -z "${port}" ]]; then
+    printf 'down\n'
+    return 0
+  fi
+
+  # 显式构造探测脚本，避免 shellcheck SC2016 误报；退出码即分类依据：
+  #   0   = 读到回包 -> up
+  #   128+= timeout 杀掉的 read（读超时）-> degraded
+  #   其他 = connect/write 失败 -> down
+  local script=""
+  printf -v script 'exec 3<>"%s" 2>/dev/null || exit 2
+printf "%%s\\n" "%s" >&3 2>/dev/null || exit 3
+IFS= read -r -n 1 -t "%s" -u 3 _ 2>/dev/null
+exit $?' \
+    "/dev/tcp/${host}/${port}" "${FORWARD_PROBE_PAYLOAD_MARKER}" "${timeout_s}"
+
+  local rc=0
+  set +o errexit
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$((timeout_s + 2))" bash -c "${script}" >/dev/null 2>&1
+    rc=$?
+  else
+    bash -c "${script}" >/dev/null 2>&1
+    rc=$?
+  fi
+  set -o errexit
+
+  if [[ "${rc}" -eq 0 ]]; then
+    printf 'up\n'
+  elif [[ "${rc}" -ge 128 ]]; then
+    printf 'degraded\n'
+  else
+    printf 'down\n'
   fi
   return 0
 }

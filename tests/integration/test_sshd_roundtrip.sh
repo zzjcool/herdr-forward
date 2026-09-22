@@ -326,7 +326,7 @@ t_it "master pid is alive and the local port is listening"
 t2_run tunnel_alive "${MASTER_PID}"
 t_eq "true" "${T2_OUT}" "master alive"
 t2_run tunnel_probe "${LOCAL_PORT}"
-t_eq "ok" "${T2_OUT}" "local port probes ok"
+t_eq "up" "${T2_OUT}" "local port probes up (payload round-trip)"
 t_it "master pid matches the local listener owner"
 t2_cap_ss="$(ss -ltnp 2>/dev/null | grep ":${LOCAL_PORT} " || true)"
 t_match "pid=${MASTER_PID}" "${t2_cap_ss}" "ss shows the master pid as listener owner"
@@ -344,7 +344,7 @@ tunnel_stop "${TUNNEL_ID}"
 t_it "local port stops accepting connections"
 sleep 0.3
 t2_run tunnel_probe "${LOCAL_PORT}"
-t_eq "fail" "${T2_OUT}" "port closed after stop"
+t_eq "down" "${T2_OUT}" "port closed after stop (down, not just fail)"
 t_it "control socket and pid file are removed"
 # B.1 的 t_ok 语义是「断言上一条命令成功」。这里位于 if 的 else 分支，$? 是 [[ -e ]]
 # 的 1，用 t_ok 会误判为失败 → 必须用无参条件断言语义的 t_pass。
@@ -355,6 +355,20 @@ else
 fi
 t2_run tunnel_alive "${MASTER_PID}"
 t_eq "false" "${T2_OUT}" "master no longer alive"
+
+t_describe "N2: tunnel_stop 清理 log-f-<id>，但保留 known_hosts（刻意行为）"
+t_it "stale per-tunnel log file is removed by tunnel_stop"
+if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/log-${TUNNEL_ID}" ]]; then
+  t_fail "log file survived tunnel_stop"
+else
+  t_pass "log-<id> removed"
+fi
+t_it "known_hosts is intentionally preserved across stops (one-time host key)"
+if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/known_hosts" ]]; then
+  t_pass "known_hosts kept (deliberate)"
+else
+  t_fail "known_hosts should be kept across tunnel_stop"
+fi
 
 t_describe "no residual processes"
 t_it "no ssh process references this test's state dir"

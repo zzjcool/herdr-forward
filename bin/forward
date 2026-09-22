@@ -354,7 +354,8 @@ cmd_list() {
   json)
     local forwards=""
     forwards="$(forward_list_json)"
-    printf '%s' "${forwards}" | jq -S -c --argjson v 1 '{version: $v, forwards: .}'
+    # M3（review）：引用 FORWARD_STATE_VERSION 常量，不硬编码 1（值与 lib/state.sh 单一权威一致）
+    printf '%s' "${forwards}" | jq -S -c --argjson v "${FORWARD_STATE_VERSION:-1}" '{version: $v, forwards: .}'
     ;;
   *)
     _hf_list_table
@@ -466,6 +467,7 @@ cmd_doctor() {
   local count=0
   local up_count=0
   local down_count=0
+  local degraded_count=0
   local fixed_count=0
   local pruned_count=0
 
@@ -488,8 +490,10 @@ cmd_doctor() {
     status="$(printf '%s' "${row}" | jq -r '.status // "down"')"
     pid="$(printf '%s' "${row}" | jq -r '.pid // empty')"
 
+    # A.3.1（review D1）：TCP-only 探活在 master 活着时恒通，会把远端应用已死误报 up；
+    # 改用 probe_payload 经本地转发端口发真 payload，分 up|degraded|down。
     local probe=""
-    probe="$(probe_tcp 127.0.0.1 "${local_port}" 1)"
+    probe="$(probe_payload 127.0.0.1 "${local_port}" 1)"
 
     local live_pid=""
     if [[ -n "${pid}" ]]; then
@@ -500,16 +504,24 @@ cmd_doctor() {
       [[ "${krc}" -eq 0 ]] && live_pid="yes"
     fi
 
-    if [[ "${probe}" == "ok" ]]; then
+    if [[ "${probe}" == "up" ]]; then
       up_count=$((up_count + 1))
-      printf '%s\t%s\tup\t(port %s 可连)\n' "${id}" "${local_port}" "${local_port}"
+      printf '%s\t%s\tup\t(经隧道发 payload 收到回包)\n' "${id}" "${local_port}"
       if [[ -n "${do_fix}" && "${status}" != "up" ]]; then
         forward_set_status "${id}" up
         fixed_count=$((fixed_count + 1))
       fi
+    elif [[ "${probe}" == "degraded" ]]; then
+      # 远端端口可连但无应用层回包：诚实报 degraded，绝不报 up；--fix 保守置 down，不 prune。
+      degraded_count=$((degraded_count + 1))
+      printf '%s\t%s\tdegraded\t(端口 %s 可连但无应用层回包)\n' "${id}" "${local_port}" "${local_port}"
+      if [[ -n "${do_fix}" && "${status}" != "down" ]]; then
+        forward_set_status "${id}" down
+        fixed_count=$((fixed_count + 1))
+      fi
     else
       down_count=$((down_count + 1))
-      printf '%s\t%s\tdown\t(port %s 不可连)\n' "${id}" "${local_port}" "${local_port}"
+      printf '%s\t%s\tdown\t(经隧道无法到达远端：拒绝/重置)\n' "${id}" "${local_port}"
       if [[ -n "${do_fix}" && "${status}" != "down" ]]; then
         forward_set_status "${id}" down
         fixed_count=$((fixed_count + 1))
@@ -521,7 +533,7 @@ cmd_doctor() {
     fi
   done <<<"${rows}"
 
-  log info "doctor 完成：共 ${count} 条，up=${up_count}，down=${down_count}，修正=${fixed_count}，清理=${pruned_count}。"
+  log info "doctor 完成：共 ${count} 条，up=${up_count}，degraded=${degraded_count}，down=${down_count}，修正=${fixed_count}，清理=${pruned_count}。"
   # 诊断成功即 exit 0（即使有 down 记录）——E2E run-inside.sh 用 set -e，不能因 down 中断
   return 0
 }

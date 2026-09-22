@@ -352,6 +352,26 @@ t_match "fixed -> up" "${T2_OUT}" "announces the up-repair"
 t2_run t2_status_of "${TUNNEL_ID}"
 t_eq "up" "${T2_OUT}" "status repaired to up"
 
+t_describe "D1: remote SERVICE death must not be reported as up (payload probe)"
+t_it "doctor --fix no longer claims up once the remote echo app is dead (sshd alive)"
+# 红线（review D1）：本地端口在 sshd master 活着时恒可连，TCP-only 探活会假 up。
+# 杀掉「远端应用」（echo 服务）而**保留 sshd master**，探活必须看穿隧道发现远端不可达。
+t2_kill_tree "${ECHO_PID}"
+ECHO_PID=""
+sleep 0.5
+# 先证伪「这只是 master 死了」的辩解：master 进程仍在
+t2_run kill -0 "${MASTER_PID}"
+t_eq "0" "${T2_RC}" "sshd master pid still alive (so a fake 'up' would be pure TCP)"
+t2_run tunnel_health "${TUNNEL_ID}" "${MASTER_PID}" "${LOCAL_PORT}"
+t_eq "down" "${T2_OUT}" "health down after remote app death (master still alive)"
+t2_run tunnel_doctor --fix
+t_eq "0" "${T2_RC}" "doctor --fix exit"
+t_match "down" "${T2_OUT}" "doctor reports down (never up) after remote app death"
+t2_run t2_status_of "${TUNNEL_ID}"
+t_eq "down" "${T2_OUT}" "status repaired to down"
+# 恢复 up 作为下一段（kill sshd → --fix）的输入前提
+forward_set_status "${TUNNEL_ID}" up
+
 t_describe "remote death: kill sshd listener + full descendant tree"
 t2_kill_tree "${SSHD_PID}"
 SSHD_PID=""

@@ -189,4 +189,31 @@ t_it "true for a live non-zombie pid (own shell)"
 t2_cap tunnel_alive "$$"
 t_eq "true" "${T2_OUT}" "live pid"
 
+t_describe "N2: tunnel_stop 清理每隧道的 log，但刻意保留 known_hosts"
+t_it "tunnel_stop removes log-<id> (stale per-tunnel ssh log)"
+_id="f-n2probe"
+t2_ctldir="$(tunnel_control_dir)"
+: >"${t2_ctldir}/log-${_id}"
+: >"${t2_ctldir}/target-${_id}"
+# 不建 socket / pid 文件：tunnel_stop 只走 rm 分支，零进程
+: >"${t2_ctldir}/known_hosts"
+tunnel_stop "${_id}"
+if [[ -e "${t2_ctldir}/log-${_id}" ]]; then
+  t_fail "log-${_id} survived tunnel_stop"
+else
+  t_pass "log-<id> removed"
+fi
+t_it "tunnel_stop keeps known_hosts (deliberate: one-time host key)"
+if [[ -e "${t2_ctldir}/known_hosts" ]]; then
+  t_pass "known_hosts kept"
+else
+  t_fail "known_hosts must be kept across tunnel_stop"
+fi
+t_it "tunnel_stop also drops target-<id>"
+if [[ -e "${t2_ctldir}/target-${_id}" ]]; then
+  t_fail "target-${_id} survived tunnel_stop"
+else
+  t_pass "target-<id> removed"
+fi
+
 t_done

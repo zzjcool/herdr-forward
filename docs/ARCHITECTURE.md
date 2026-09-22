@@ -96,6 +96,8 @@ require_cmd <name> [hint]                      # command -v 失败即 die 127
 now_unix                                       # stdout: epoch 秒
 atomic_write <file> <tmpdir>                   # stdin 内容 -> 同分区 mktemp -> mv -f
 probe_tcp <host> <port> [timeout_s=2]          # bash /dev/tcp 探活，stdout: ok|fail，不因失败 exit
+probe_payload <host> <port> [timeout_s=2]      # 连上后发一行 payload 并等任意回包，见下方 review 修正
+                                              # stdout: up|degraded|down，恒 return 0（不因失败 exit）
 tcp_serve_once <port>                          # 调试用回显：nc 变体探测/bash coproc 兜底，读一行回 'pong'
 
 # state.sh
@@ -123,7 +125,8 @@ tunnel_start <id> <local_port> <remote_host:remote_port> <ssh_target>
                                               # stdout: pid；失败 die 5
 tunnel_stop <id>                               # ssh -O exit 经 control socket 优雅关 + kill pid 兜底
 tunnel_alive <pid>                             # stdout: true|false（kill -0 且非 zombie）
-tunnel_probe <local_port>                      # probe_tcp 127.0.0.1 <port> 封装
+tunnel_probe <local_port>                      # stdout: up|degraded|down（见下方 review 修正——不再是 ok|fail）
+                                              # 经隧道发真 payload 验证上游可达（probe_payload 127.0.0.1 <port> 封装）
 
 # notify.sh
 notify_toast <title> <body>                    # herdr socket API / notification show；不可用降级 log info，永不阻塞>1s
@@ -145,6 +148,41 @@ notify_toast <title> <body>                    # herdr socket API / notification
 
 **退出码表冻结**：`0 ok / 2 重复端口 / 3 记录不存在 / 4 machine 无法解析 /
 5 隧道启动失败 / 9 未实现 / 127 依赖缺失`
+
+### A.3.1 review 后的契约修正 — D1：探活必须验证「远端可达」
+
+> **背景（留痕）**：最终对抗式 review 判定 CONDITIONAL PASS，其中 **[major] D1**：
+> 原 `tunnel_probe` 只是 `probe_tcp 127.0.0.1 <local_port>`（一次 TCP 三次握手），
+> 而 `ssh -L` 的本地监听器**无论远端是否可连都会先接受本地连接**（sshd master 活着
+> 时永远可连）——远端应用被打死后 `doctor --fix` 仍报 `up`（假阳性）。本小节是
+> 该 review 后的**契约修正**，实现与测试同步升级。
+
+**`probe_payload <host> <port> [timeout_s=2]`（新，common.sh）**
+- 语义：连上后**发一行 payload**并等待**任意应用层回包**，用回包/连接状态把「本地
+  可连」与「远端可达」区分开；恒 `return 0`，stdout 恒单行。
+- stdout ∈ `up | degraded | down`：
+  - `up`：连接成功 **且** 在 timeout 内收到至少 1 字节应用层回包；
+  - `degraded`：连接成功但 timeout 内无回包（远端端口可连，只是协议未知/不应答）；
+  - `down`：连接被拒/重置/超时失败，或参数为空。
+- 超时契约：读回包超时默认 `2s`（`FORWARD_PROBE_TIMEOUT_DEFAULT`），外层再套
+  `timeout (timeout_s+2)` 兜底，保证单个探测**有界**、绝不挂住 doctor/CI。
+
+**`tunnel_probe <local_port>`（语义升级，签名不变）**
+- 原：`probe_tcp 127.0.0.1 <port>` → `ok|fail`（**废弃**：只看本地握手，会假阳性）。
+- 新：`probe_payload 127.0.0.1 <port>` → `up|degraded|down`（经隧道发真 payload）。
+
+**`tunnel_health <id> <pid> <local_port>`（输出扩展为三级）**
+- stdout ∈ `up | degraded | down`：master 不活 → `down`；否则取 `tunnel_probe` 结果。
+
+**`tunnel_doctor` 的诚实分级（A.2 `status` 仍只允许 `starting|up|down`）**
+- `up`（应用层有回包）→ 报告 `up`；`--fix` 置 `status=up`。
+- `degraded`（远端端口可连但无回包）→ 报告 `degraded`，**绝不报 up**；`--fix` 保守置
+  `status=down`（`status` 是「已验证可达」的声明，无回包即无验证）；**不 prune**
+  （master 可能仍在，删记录会误伤活隧道）。
+- `down`（连接被拒/重置）→ 报告 `down`；`--fix` 置 `down`；仅当 master 也不活且
+  `--prune` 才 reap + 删记录。
+- 诚实性代价（显式声明）：对「连上但从不应答」的远端协议（如裸 TCP/二进制协议），
+  `status` 会保守地读作 `down`；`--fix` **只改状态字段，不动活隧道**，故转发本身不受影响。
 
 ### A.4 herdr-plugin.toml 冻结声明（开工时填入）
 

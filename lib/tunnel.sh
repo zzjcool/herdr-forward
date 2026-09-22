@@ -4,75 +4,23 @@
 #   tunnel_start <id> <local_port> <remote_host:remote_port> <ssh_target>  -> stdout pid; die 5
 #   tunnel_stop  <id>
 #   tunnel_alive <pid>        -> stdout true|false (kill -0 and not zombie)
-#   tunnel_probe <local_port> -> stdout ok|fail (probe_tcp wrapper)
+#   tunnel_probe <local_port> -> stdout up|degraded|down (payload probe; see A.3.1)
 # Extra liveness primitives used by `forward doctor` (T1 cmd layer delegates here):
-#   tunnel_health <id> <pid> <local_port> -> up|down
+#   tunnel_health <id> <pid> <local_port> -> up|degraded|down
 #   tunnel_reap   <id> [pid]              -> stop + remove socket/pidfile (idempotent)
 #   tunnel_doctor [--fix|--prune]         -> reconcile status against liveness
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
-# common.sh bridge: when T1's lib/common.sh is present it wins; otherwise fall
-# back to a minimal, behaviour-compatible subset so this library loads and is
-# unit-testable on its own (tests/unit + tests/integration before T1 merges).
+# common.sh bridge: log/die/require_cmd/now_unix/atomic_write/probe_tcp 一律来自 T1
+# 的 lib/common.sh（唯一权威）。N3（review nit）：此前的「缺 common.sh 就自带一份
+# 同构回退实现」副本已删除——它与 common.sh 平行漂移，且让唯一 writer 契约失效。
+# 本库必须与 lib/common.sh 一起发布；tests 若需独立 source 本库，common.sh 就
+# 在本目录旁边，会被下面的 source 自动加载。
 # ---------------------------------------------------------------------------
 _TUNNEL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${_TUNNEL_LIB_DIR}/common.sh" ]]; then
-  # shellcheck source=/dev/null
-  source "${_TUNNEL_LIB_DIR}/common.sh"
-fi
-
-if ! declare -F log >/dev/null 2>&1; then
-  log() {
-    local level="${1}"
-    shift
-    local ts
-    ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf '[%s] %s %s\n' "${ts}" "${level}" "${*}" >&2
-  }
-fi
-if ! declare -F die >/dev/null 2>&1; then
-  die() {
-    local code="${1}"
-    shift
-    log error "${*}"
-    exit "${code}"
-  }
-fi
-if ! declare -F require_cmd >/dev/null 2>&1; then
-  require_cmd() {
-    local name="${1}"
-    local hint="${2:-}"
-    if ! command -v "${name}" >/dev/null 2>&1; then
-      die 127 "missing dependency: ${name}${hint:+ (${hint})}"
-    fi
-  }
-fi
-if ! declare -F now_unix >/dev/null 2>&1; then
-  now_unix() { date +%s; }
-fi
-if ! declare -F atomic_write >/dev/null 2>&1; then
-  atomic_write() {
-    local file="${1}"
-    local tmpdir="${2:-$(dirname "${file}")}"
-    local tmp
-    tmp="$(mktemp "${tmpdir}/.atomic.XXXXXX")"
-    cat >"${tmp}"
-    mv -f "${tmp}" "${file}"
-  }
-fi
-if ! declare -F probe_tcp >/dev/null 2>&1; then
-  probe_tcp() {
-    local host="${1}"
-    local port="${2}"
-    local timeout_s="${3:-2}"
-    if timeout "${timeout_s}" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-      printf 'ok\n'
-    else
-      printf 'fail\n'
-    fi
-  }
-fi
+# shellcheck source=./common.sh disable=SC1091
+source "${_TUNNEL_LIB_DIR}/common.sh"
 
 # ---------------------------------------------------------------------------
 # Control dir / socket / ssh_target parsing
@@ -175,25 +123,28 @@ tunnel_alive() {
   printf 'true\n'
 }
 
-# tunnel_probe <local_port> -> stdout: ok|fail (A.3: probe_tcp 127.0.0.1 <port>).
+# tunnel_probe <local_port> -> stdout: up|degraded|down
+# A.3.1（review D1 契约修正）：不再只做本地 TCP 握手（那样在 master 活着时恒 ok，
+# 会把远端应用已死误报为 up），改为经隧道发真 payload 看远端是否可达。
 tunnel_probe() {
   local local_port="${1}"
-  probe_tcp 127.0.0.1 "${local_port}"
+  probe_payload 127.0.0.1 "${local_port}"
 }
 
-# tunnel_health <id> <pid> <local_port> -> stdout: up|down
+# tunnel_health <id> <pid> <local_port> -> stdout: up|degraded|down
+# A.3.1：master 不活一律 down；否则透传 tunnel_probe 的三级结果（语义见契约）。
 tunnel_health() {
   local id="${1}"
   local pid="${2:-}"
   local local_port="${3}"
   local alive probe
   alive="$(tunnel_alive "${pid}")"
-  probe="$(tunnel_probe "${local_port}")"
-  if [[ ${alive} == 'true' && ${probe} == 'ok' ]]; then
-    printf 'up\n'
-  else
+  if [[ ${alive} != 'true' ]]; then
     printf 'down\n'
+    return 0
   fi
+  probe="$(tunnel_probe "${local_port}")"
+  printf '%s\n' "${probe}"
 }
 
 # ---------------------------------------------------------------------------
@@ -312,7 +263,10 @@ tunnel_stop() {
     log warn "tunnel_stop: ssh master ${pid} (${id}) is still alive after TERM/KILL; the tunnel may still be listening."
   fi
 
-  rm -f "${ctl}" "${pid_file}" "${dir}/target-${id}"
+  # N2（review nit）：一并清掉本隧道的 ssh 日志 log-<id>（每隧道一份，停后即无用）。
+  # 刻意**不删** known_hosts：它是跨隧道共用的沙箱 host key 缓存（StrictHostKeyChecking=accept-new 只信任一次），
+  # 删掉会让下一次 start 重新 accept-new——保留它是有意行为，不是遗漏。
+  rm -f "${ctl}" "${pid_file}" "${dir}/target-${id}" "${dir}/log-${id}"
 }
 
 # tunnel_reap <id> [pid] — stop + hard-kill leftover pid + drop stale files.
@@ -325,7 +279,7 @@ tunnel_reap() {
   if [[ ${pid} =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
     kill -KILL "${pid}" 2>/dev/null || true
   fi
-  rm -f "${dir}/ctl-${id}" "${dir}/pid-${id}" "${dir}/target-${id}"
+  rm -f "${dir}/ctl-${id}" "${dir}/pid-${id}" "${dir}/target-${id}" "${dir}/log-${id}"
 }
 
 # ---------------------------------------------------------------------------
@@ -360,14 +314,30 @@ tunnel_doctor() {
     alive="$(tunnel_alive "${pid}")"
     probe="$(tunnel_probe "${local_port}")"
 
-    if [[ ${alive} == 'true' && ${probe} == 'ok' ]]; then
+    # A.3.1 诚实分级：up=应用层有回包；degraded=远端端口可连但无回包；down=连不上。
+    # status 字段仅允许 up|down，故 degraded 报告为 degraded 但 --fix 保守置 down（不 prune）。
+    local effective="${probe}"
+    [[ ${alive} == 'true' ]] || effective='down'
+    local report="${effective}"
+    local new_status="${effective}"
+    [[ ${effective} == 'degraded' ]] && new_status='down'
+
+    if [[ ${effective} == 'up' ]]; then
       if ((fix)) && [[ ${status} != 'up' ]]; then
         forward_set_status "${id}" up
         printf '%s: fixed -> up\n' "${id}"
       else
         printf '%s: up\n' "${id}"
       fi
-    elif ((prune)); then
+    elif [[ ${effective} == 'degraded' ]]; then
+      # 绝不自作主张报 up；也不 prune（master 可能还在，删记录会误伤活隧道）。
+      if ((fix)) && [[ ${status} != "${new_status}" ]]; then
+        forward_set_status "${id}" "${new_status}"
+        printf '%s: degraded (no application-layer reply) -> fixed -> %s\n' "${id}" "${new_status}"
+      else
+        printf '%s: %s (no application-layer reply; status=%s)\n' "${id}" "${report}" "${status}"
+      fi
+    elif ((prune)) && [[ ${alive} != 'true' ]]; then
       tunnel_reap "${id}" "${pid}"
       forward_remove_record "${id}"
       printf '%s: pruned\n' "${id}"

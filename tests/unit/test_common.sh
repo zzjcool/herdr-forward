@@ -188,6 +188,43 @@ t_eq "yes" "${ROT_FLAG}" "轮转后体积 ${SIZE} < 800KB"
 _readfile "${LOGFILE}"
 t_match "after-rotate-probe" "${got}" "轮转保留新日志"
 
+# --- M2（review minor）：log 不得每次调用 fork 5+ 进程（500 条原需 ~2.4s） ---
+t_describe "common.sh: log 性能（M2 review——不得 fork date/wc/tail 链）"
+
+t_it "500 条 log 在 0.5s 内完成（EPOCHSECONDS + printf 内建）"
+: >"${LOGFILE}" # 清空，让本轮不受轮转影响
+M2_START="${EPOCHREALTIME}"
+for ((i = 0; i < 500; i++)); do
+  log info "m2-perf-${i}"
+done
+M2_END="${EPOCHREALTIME}"
+M2_ELAPSED="$(awk -v a="${M2_START}" -v b="${M2_END}" 'BEGIN{printf "%.3f", b-a}')"
+M2_OK="no"
+if awk -v e="${M2_ELAPSED}" 'BEGIN{exit !(e < 0.5)}'; then
+  M2_OK="yes"
+fi
+t_eq "yes" "${M2_OK}" "500 条 log 耗时 ${M2_ELAPSED}s < 0.5s"
+
+# 正确性反例：性能优化不得静默丢行
+t_it "优化后 500 条仍全部落盘（无丢行）"
+_count grep -c 'm2-perf-' "${LOGFILE}"
+t_eq "500" "${got}" "500 条日志全部写入"
+t_it "优化后时间戳仍为 UTC 且格式不变 [<ts>] <level>: <msg>"
+_readfile "${LOGFILE}"
+M2_LINE="$(printf '%s\n' "${got}" | grep -m1 'm2-perf-499')"
+t_match '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] info: m2-perf-499$' "${M2_LINE}" "行格式与 UTC 时间戳不变"
+t_it "优化后日期为真实 UTC（不随 TZ 漂移）"
+M2_EPOCH="$(printf '%s\n' "${got}" | grep -m1 'm2-perf-499' | sed -E 's/^\[([^]]+)\].*/\1/')"
+M2_EXPECT="$(TZ=UTC0 date -u -d "@${EPOCHSECONDS}" +%Y-%m-%dT%H:%M:%SZ)"
+t_match '^[0-9]{4}-' "${M2_EPOCH}" "时间戳形状合法"
+M2_TZ_SHIFT="no"
+if [[ "${M2_EPOCH:0:10}" == "${M2_EXPECT:0:10}" ]]; then
+  M2_TZ_SHIFT="no"
+else
+  M2_TZ_SHIFT="yes"
+fi
+t_eq "no" "${M2_TZ_SHIFT}" "UTC 日期与 date -u 一致（epoch=${EPOCHSECONDS}, ts=${M2_EPOCH}, exp=${M2_EXPECT}）"
+
 t_describe "common.sh: die / require_cmd / now_unix"
 
 t_it "die 以给定退出码退出"
@@ -276,6 +313,64 @@ t_eq "fail" "${out}" "空参数 fail"
 
 t_it "probe_tcp 输出恒为单行"
 _capture probe_tcp 127.0.0.1 1 1
+LINES="$(printf '%s' "${out}" | grep -c '')"
+t_eq "1" "${LINES}" "单行输出"
+
+t_describe "common.sh: probe_payload（A.3.1 review D1 契约修正）"
+
+t_it "probe_payload 对拒绝连接输出 down 且恒 return 0"
+_capture probe_payload 127.0.0.1 1 1
+t_exit_ok 0 "${rc}" "拒绝也 return 0"
+t_eq "down" "${out}" "端口 1 -> down"
+
+t_it "probe_payload 空参数输出 down 不崩"
+_capture probe_payload "" ""
+t_exit_ok 0 "${rc}" "空参数不 exit"
+t_eq "down" "${out}" "空参数 down"
+
+t_it "probe_payload 对回包服务输出 up（应用层真实可达）"
+EchoPort="$(_free_port)"
+python3 -u -c 'import socket,sys,threading
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(8)
+def h(c):
+    try:
+        f=c.makefile("rwb")
+        for _l in f: f.write(b"pong\\n"); f.flush()
+    except Exception: pass
+    finally: c.close()
+while True:
+    c,_=s.accept(); threading.Thread(target=h,args=(c,),daemon=True).start()' "${EchoPort}" &
+EPROBE_PID=$!
+set +o errexit
+_wait_port "${EchoPort}"
+set -o errexit
+_capture probe_payload 127.0.0.1 "${EchoPort}" 1
+t_exit_ok 0 "${rc}" "回包服务也恒 return 0"
+t_eq "up" "${out}" "有应用层回包 -> up"
+kill "${EPROBE_PID}" 2>/dev/null || true
+wait "${EPROBE_PID}" 2>/dev/null || true
+
+t_it "probe_payload 对「可连但不应答」输出 degraded（不谎报 up）"
+SilentPort="$(_free_port)"
+python3 -u -c 'import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(8)
+held=[]
+while True:
+    c,_=s.accept(); held.append(c)' "${SilentPort}" &
+SPROBE_PID=$!
+set +o errexit
+_wait_port "${SilentPort}"
+set -o errexit
+_capture probe_payload 127.0.0.1 "${SilentPort}" 1
+t_exit_ok 0 "${rc}" "静默服务也恒 return 0"
+t_eq "degraded" "${out}" "可连但无回包 -> degraded（不是 up）"
+kill "${SPROBE_PID}" 2>/dev/null || true
+wait "${SPROBE_PID}" 2>/dev/null || true
+
+t_it "probe_payload 输出恒为单行且不因失败 exit"
+_capture probe_payload 127.0.0.1 1 1
 LINES="$(printf '%s' "${out}" | grep -c '')"
 t_eq "1" "${LINES}" "单行输出"
 
