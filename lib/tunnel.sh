@@ -12,67 +12,15 @@
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
-# common.sh bridge: when T1's lib/common.sh is present it wins; otherwise fall
-# back to a minimal, behaviour-compatible subset so this library loads and is
-# unit-testable on its own (tests/unit + tests/integration before T1 merges).
+# common.sh bridge: log/die/require_cmd/now_unix/atomic_write/probe_tcp 一律来自 T1
+# 的 lib/common.sh（唯一权威）。N3（review nit）：此前的「缺 common.sh 就自带一份
+# 同构回退实现」副本已删除——它与 common.sh 平行漂移，且让唯一 writer 契约失效。
+# 本库必须与 lib/common.sh 一起发布；tests 若需独立 source 本库，common.sh 就
+# 在本目录旁边，会被下面的 source 自动加载。
 # ---------------------------------------------------------------------------
 _TUNNEL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${_TUNNEL_LIB_DIR}/common.sh" ]]; then
-  # shellcheck source=/dev/null
-  source "${_TUNNEL_LIB_DIR}/common.sh"
-fi
-
-if ! declare -F log >/dev/null 2>&1; then
-  log() {
-    local level="${1}"
-    shift
-    local ts
-    ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf '[%s] %s %s\n' "${ts}" "${level}" "${*}" >&2
-  }
-fi
-if ! declare -F die >/dev/null 2>&1; then
-  die() {
-    local code="${1}"
-    shift
-    log error "${*}"
-    exit "${code}"
-  }
-fi
-if ! declare -F require_cmd >/dev/null 2>&1; then
-  require_cmd() {
-    local name="${1}"
-    local hint="${2:-}"
-    if ! command -v "${name}" >/dev/null 2>&1; then
-      die 127 "missing dependency: ${name}${hint:+ (${hint})}"
-    fi
-  }
-fi
-if ! declare -F now_unix >/dev/null 2>&1; then
-  now_unix() { date +%s; }
-fi
-if ! declare -F atomic_write >/dev/null 2>&1; then
-  atomic_write() {
-    local file="${1}"
-    local tmpdir="${2:-$(dirname "${file}")}"
-    local tmp
-    tmp="$(mktemp "${tmpdir}/.atomic.XXXXXX")"
-    cat >"${tmp}"
-    mv -f "${tmp}" "${file}"
-  }
-fi
-if ! declare -F probe_tcp >/dev/null 2>&1; then
-  probe_tcp() {
-    local host="${1}"
-    local port="${2}"
-    local timeout_s="${3:-2}"
-    if timeout "${timeout_s}" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-      printf 'ok\n'
-    else
-      printf 'fail\n'
-    fi
-  }
-fi
+# shellcheck source=./common.sh disable=SC1091
+source "${_TUNNEL_LIB_DIR}/common.sh"
 
 # ---------------------------------------------------------------------------
 # Control dir / socket / ssh_target parsing

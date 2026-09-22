@@ -4,21 +4,11 @@
 #   notify_toast <title> <body>   # herdr socket API; unavailable -> log info, never block >1s
 set -Eeuo pipefail
 
+# common.sh bridge: log 一律来自 T1 的 lib/common.sh（唯一权威）。
+# N3（review nit）：此前的回退副本已删除；本库必须与 lib/common.sh 一起发布。
 _TUNNEL_NOTIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${_TUNNEL_NOTIFY_LIB_DIR}/common.sh" ]]; then
-  # shellcheck source=/dev/null
-  source "${_TUNNEL_NOTIFY_LIB_DIR}/common.sh"
-fi
-
-if ! declare -F log >/dev/null 2>&1; then
-  log() {
-    local level="${1}"
-    shift
-    local ts
-    ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf '[%s] %s %s\n' "${ts}" "${level}" "${*}" >&2
-  }
-fi
+# shellcheck source=./common.sh disable=SC1091
+source "${_TUNNEL_NOTIFY_LIB_DIR}/common.sh"
 
 # notify_payload <title> <body> -> stdout: one JSON line for the herdr socket.
 notify_payload() {
