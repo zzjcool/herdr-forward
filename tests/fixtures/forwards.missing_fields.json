@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "forwards": [
+    {
+      "id": "f-8080",
+      "local_port": 8080,
+      "status": "up"
+    },
+    {
+      "local_port": 9090,
+      "remote_port": 9090
+    }
+  ]
+}

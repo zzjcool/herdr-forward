@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "forwards": [
+    {
+      "id": "f-3000",
+      "local_port": 3000,
+      "remote_host": "127.0.0.1",
+      "remote_port": 3000,
+      "machine": "gpu-box",
+      "ssh_target": "user@gpu-box.example.com:22",
+      "pid": 12345,
+      "control_socket": "/home/u/.local/state/herdr-forward/ssh-ctl/ctl-f-3000",
+      "status": "up",
+      "created_unix": 1790000000,
+      "publish": { "pid": null, "url": null, "started_unix": null }
+    }
+  ]
+}

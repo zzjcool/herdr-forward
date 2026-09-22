@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+# bin/forward — herdr-forward CLI 入口（唯一可执行文件，纯 dispatch）
+# A.3 子命令：
+#   forward add <local:remote> [--machine LABEL] [--ssh-target TARGET]
+#   forward list [--oneline] [--json]
+#   forward remove <id|--pick|--all>
+#   forward doctor [--fix|--prune]
+#   forward publish <port>     # 二期占位：exit 9
+#   forward unpublish          # 二期占位：exit 9
+#   forward watch              # pane 入口
+# 退出码表（A.3 冻结）：0 ok / 2 重复端口 / 3 记录不存在 / 4 machine 无法解析 /
+#   5 隧道启动失败 / 9 未实现 / 127 依赖缺失；用法错误用 64（EX_USAGE，见 --help）。
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# FRONT_EXIT_USAGE：用法/参数错误（A.3 未列，取 EX_USAGE；报告已标注）
+readonly EXIT_USAGE=64
+
+# --- 定位插件根 + 载入模块 ---
+_resolve_root() {
+  local src="${BASH_SOURCE[0]}"
+  local dir=""
+  while [[ -L "${src}" ]]; do
+    dir="$(cd -P "$(dirname "${src}")" && pwd)"
+    src="$(readlink "${src}")"
+    [[ "${src}" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "${src}")/.." && pwd
+}
+
+FORWARD_ROOT="$(_resolve_root)"
+FORWARD_LIB="${FORWARD_ROOT}/lib"
+
+# T1 自有模块：硬依赖
+# shellcheck source=../lib/common.sh disable=SC1091
+source "${FORWARD_LIB}/common.sh"
+# shellcheck source=../lib/state.sh disable=SC1091
+source "${FORWARD_LIB}/state.sh"
+
+# T2/T3 模块：松散耦合（缺失不报错，功能按降级路径走）
+_hf_optional_source() {
+  local path="${1-}"
+  if [[ -f "${path}" ]]; then
+    # shellcheck source=/dev/null
+    source "${path}"
+  fi
+}
+_hf_optional_source "${FORWARD_LIB}/machine.sh"
+_hf_optional_source "${FORWARD_LIB}/tunnel.sh"
+_hf_optional_source "${FORWARD_LIB}/notify.sh"
+_hf_optional_source "${FORWARD_LIB}/render.sh"
+
+# _hf_has_func <name>：stdout "yes" 表示函数已定义（输出式，避免 SC2310；恒 return 0）
+_hf_has_func() {
+  if declare -F "${1-}" >/dev/null 2>&1; then
+    printf 'yes\n'
+  fi
+  return 0
+}
+
+# _hf_require_port <port> <label>：1-65535 整数校验；非法 -> die 64
+_hf_require_port() {
+  local port="${1-}"
+  local label="${2:-端口}"
+  if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+    die "${EXIT_USAGE}" "${label}必须是整数：${port}。请用 <local>:<remote> 形式（如 3000:9443）。"
+  fi
+  if ((port < 1 || port > 65535)); then
+    die "${EXIT_USAGE}" "${label}越界（1-65535）：${port}。请修正端口后重试。"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+forward — herdr 端口转发管理（一期：ssh -L）
+
+用法：
+  forward add <local>:<remote> [--machine LABEL] [--ssh-target TARGET]
+      新增映射并把远端端口拉到本地 localhost:<local>。
+      --ssh-target 优先（跳过 machine 解析）；否则用 --machine 经 machines.toml 解析。
+
+  forward list [--oneline] [--json]
+      默认表格；--oneline 给 tab bar（仅 up，⇅端口）；--json 输出状态文档。
+
+  forward remove <id>
+      删除映射（id 形如 f-3000），存在隧道模块时会一并停隧道。
+
+  forward doctor [--fix] [--prune]
+      探活并报告；--fix 按探活结果修正 status；--prune 清理死进程记录。
+
+  forward publish <port>    # 二期（Cloudflare quick tunnel），当前 exit 9
+  forward unpublish         # 二期，当前 exit 9
+  forward watch             # pane 入口：watch -n 3 forward list
+
+退出码：0 成功 / 2 端口重复 / 3 记录不存在 / 4 machine 无法解析 /
+        5 隧道启动失败 / 9 未实现 / 64 用法错误 / 127 依赖缺失
+EOF
+}
+
+# --- add ---
+
+# _hf_resolve_target <machine> <ssh_target>：决定 ssh_target；失败 die 4
+_hf_resolve_target() {
+  local machine="${1-}"
+  local ssh_target="${2-}"
+
+  if [[ -n "${ssh_target}" ]]; then
+    printf '%s\n' "${ssh_target}"
+    return 0
+  fi
+  if [[ -z "${machine}" ]]; then
+    die 4 "缺少目标机器：请传 --machine LABEL（走 machines.toml 解析）或 --ssh-target user@host:22。"
+  fi
+
+  local has_resolver=""
+  has_resolver="$(_hf_has_func machine_resolve)"
+  if [[ -z "${has_resolver}" ]]; then
+    die 4 "machine 解析模块不可用（lib/machine.sh 缺失），无法解析 '${machine}'。请改用 --ssh-target user@host:22，或安装完整插件。"
+  fi
+
+  local resolved=""
+  local rc=0
+  set +o errexit
+  resolved="$(machine_resolve "${machine}" 2>/dev/null)"
+  rc=$?
+  set -o errexit
+  if [[ "${rc}" -ne 0 || -z "${resolved}" ]]; then
+    die 4 "无法解析 machine '${machine}'。请检查 \$HERDR_PLUGIN_CONFIG_DIR/machines.toml 中是否存在 [machines.${machine}]，或用 --ssh-target user@host:22 直连。"
+  fi
+  printf '%s\n' "${resolved}"
+}
+
+cmd_add() {
+  local spec=""
+  local machine=""
+  local ssh_target=""
+
+  while (($# > 0)); do
+    case "$1" in
+    --machine)
+      (($# >= 2)) || die "${EXIT_USAGE}" "--machine 需要一个 LABEL 值。用法：forward add <local>:<remote> --machine LABEL"
+      machine="$2"
+      shift 2
+      ;;
+    --machine=*)
+      machine="${1#*=}"
+      shift
+      ;;
+    --ssh-target)
+      (($# >= 2)) || die "${EXIT_USAGE}" "--ssh-target 需要一个 TARGET 值（如 user@host:22）。"
+      ssh_target="$2"
+      shift 2
+      ;;
+    --ssh-target=*)
+      ssh_target="${1#*=}"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。请运行 'forward --help' 查看用法。"
+      ;;
+    *)
+      if [[ -n "${spec}" ]]; then
+        die "${EXIT_USAGE}" "只接受一个 <local>:<remote> 参数（收到额外：$1）。请运行 'forward --help' 查看用法。"
+      fi
+      spec="$1"
+      shift
+      ;;
+    esac
+  done
+
+  if [[ -z "${spec}" ]]; then
+    die "${EXIT_USAGE}" "缺少 <local>:<remote> 参数。用法：forward add 3000:9443 --ssh-target user@host:22"
+  fi
+
+  local local_port=""
+  local remote_port=""
+  if [[ "${spec}" =~ ^([0-9]+):([0-9]+)$ ]]; then
+    local_port="${BASH_REMATCH[1]}"
+    remote_port="${BASH_REMATCH[2]}"
+  else
+    die "${EXIT_USAGE}" "端口对格式非法：${spec}。应为 <local>:<remote>（如 3000:9443，两段数字）。"
+  fi
+
+  _hf_require_port "${local_port}" "本地端口"
+  _hf_require_port "${remote_port}" "远端端口"
+
+  local target=""
+  target="$(_hf_resolve_target "${machine}" "${ssh_target}")"
+
+  local id="f-${local_port}"
+  local control_socket=""
+  control_socket="$(state_dir)/ssh-ctl/ctl-${id}"
+
+  local record=""
+  record="$(jq -c -n \
+    --argjson lp "${local_port}" \
+    --argjson rp "${remote_port}" \
+    --arg machine "${machine}" \
+    --arg target "${target}" \
+    --arg sock "${control_socket}" \
+    '{local_port: $lp, remote_host: "127.0.0.1", remote_port: $rp,
+      machine: $machine, ssh_target: $target, control_socket: $sock,
+      status: "starting"}')"
+
+  forward_add_record "${record}"
+
+  # 隧道钩子（松散耦合）：无 tunnel_start 时记 down + warn，不阻断
+  local has_tunnel=""
+  has_tunnel="$(_hf_has_func tunnel_start)"
+
+  if [[ -z "${has_tunnel}" ]]; then
+    forward_set_status "${id}" down
+    log warn "已写入映射 ${id}（localhost:${local_port} -> ${target} 的 ${remote_port}），但未找到隧道模块（lib/tunnel.sh），当前 status=down。"
+    log warn "请先手动建立隧道：ssh -N -L ${local_port}:127.0.0.1:${remote_port} ${target}，随后用 'forward doctor --fix' 校正状态。"
+    printf '%s\n' "${id}"
+    return 0
+  fi
+
+  local pid=""
+  local rc=0
+  set +o errexit
+  pid="$(tunnel_start "${id}" "${local_port}" "127.0.0.1:${remote_port}" "${target}" 2>"${TMPDIR:-/tmp}/.hf_tunnel_err.$$")"
+  rc=$?
+  set -o errexit
+  if [[ "${rc}" -ne 0 || -z "${pid}" ]]; then
+    forward_set_status "${id}" down
+    local tunnel_err=""
+    tunnel_err="$(cat "${TMPDIR:-/tmp}/.hf_tunnel_err.$$" 2>/dev/null || true)"
+    rm -f "${TMPDIR:-/tmp}/.hf_tunnel_err.$$"
+    die 5 "隧道启动失败（${id}）：${tunnel_err:-tunnel_start 返回 ${rc}}。记录已保留并标记 down；请检查 ssh 连通性后用 'forward doctor --fix' 或 'forward remove ${id}' 处理。"
+  fi
+  rm -f "${TMPDIR:-/tmp}/.hf_tunnel_err.$$"
+
+  forward_set_pid "${id}" "${pid}"
+  forward_set_status "${id}" up
+  printf '%s\n' "${id}"
+}
+
+# --- list ---
+
+_hf_oneline() {
+  local forwards=""
+  forwards="$(forward_list_json)"
+
+  # 优先复用 T3 的纯函数（A.3 扩展）
+  local has_render=""
+  has_render="$(_hf_has_func render_oneline)"
+  if [[ -n "${has_render}" ]]; then
+    render_oneline "${forwards}"
+    return 0
+  fi
+
+  # 内置降级实现（契约同 A.3 tab bar：仅 up、端口升序、>6 截断 +N、publish 后加 🌐）
+  local ports=""
+  set +o errexit
+  ports="$(printf '%s' "${forwards}" | jq -r '
+    [.[] | select(.status == "up")] | sort_by(.local_port) | .[].local_port
+  ' 2>/dev/null)"
+  set -o errexit
+  [[ -z "${ports}" ]] && return 0
+
+  local total=0
+  set +o errexit
+  total="$(printf '%s' "${forwards}" | jq -r '[.[] | select(.status == "up")] | length' 2>/dev/null)"
+  set -o errexit
+  [[ "${total}" =~ ^[0-9]+$ ]] || total=0
+
+  local out=""
+  local shown=0
+  local port=""
+  while IFS= read -r port; do
+    [[ -z "${port}" ]] && continue
+    ((shown < 6)) || break
+    out+="⇅${port}"
+    shown=$((shown + 1))
+  done <<<"${ports}"
+
+  if ((total > 6)); then
+    out+="+$((total - 6))"
+  fi
+
+  # 二期 publish 后加 🌐
+  local published=""
+  set +o errexit
+  published="$(printf '%s' "${forwards}" | jq -r '[.[] | select(.status == "up" and (.publish.url != null))] | length' 2>/dev/null)"
+  set -o errexit
+  if [[ "${published}" =~ ^[0-9]+$ ]] && ((published > 0)); then
+    out+="🌐"
+  fi
+
+  printf '%s' "${out}"
+}
+
+_hf_list_table() {
+  local forwards=""
+  forwards="$(forward_list_json)"
+  printf '%-10s %-14s %-12s %-10s %-8s %s\n' "LOCAL" "REMOTE" "MACHINE" "STATUS" "PID" "SSH_TARGET"
+  local rows=""
+  set +o errexit
+  rows="$(printf '%s' "${forwards}" | jq -r '
+    sort_by(.local_port)[] |
+    [ (.local_port | tostring),
+      ((.remote_host // "127.0.0.1") + ":" + (.remote_port | tostring)),
+      (if (.machine // "") == "" then "-" else .machine end),
+      (.status // "-"),
+      (if .pid == null then "-" else (.pid | tostring) end),
+      (if (.ssh_target // "") == "" then "-" else .ssh_target end)
+    ] | @tsv
+  ')"
+  set -o errexit
+
+  local row=""
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    printf '%s\n' "${row}" | awk -F'\t' '{printf "%-10s %-14s %-12s %-10s %-8s %s\n", $1, $2, $3, $4, $5, $6}'
+  done <<<"${rows}"
+}
+
+cmd_list() {
+  local mode="table"
+  while (($# > 0)); do
+    case "$1" in
+    --oneline)
+      if [[ "${mode}" == "json" ]]; then
+        die "${EXIT_USAGE}" "--oneline 与 --json 互斥，请只选一个。"
+      fi
+      mode="oneline"
+      shift
+      ;;
+    --json)
+      if [[ "${mode}" == "oneline" ]]; then
+        die "${EXIT_USAGE}" "--oneline 与 --json 互斥，请只选一个。"
+      fi
+      mode="json"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward list [--oneline] [--json]"
+      ;;
+    *)
+      die "${EXIT_USAGE}" "list 不接受位置参数：$1。用法：forward list [--oneline] [--json]"
+      ;;
+    esac
+  done
+
+  case "${mode}" in
+  oneline)
+    local line=""
+    line="$(_hf_oneline)"
+    if [[ -n "${line}" ]]; then
+      printf '%s\n' "${line}"
+    fi
+    ;;
+  json)
+    local forwards=""
+    forwards="$(forward_list_json)"
+    printf '%s' "${forwards}" | jq -S -c --argjson v 1 '{version: $v, forwards: .}'
+    ;;
+  *)
+    _hf_list_table
+    ;;
+  esac
+}
+
+# --- remove ---
+
+cmd_remove() {
+  local id=""
+  if (($# == 0)); then
+    die "${EXIT_USAGE}" "缺少 <id>。用法：forward remove f-3000（用 'forward list' 查看 id）。"
+  fi
+
+  case "$1" in
+  --pick)
+    die 9 "forward remove --pick 交互选择为一期未实现（二期）。请用 'forward list' 查看 id 后执行 forward remove <id>。"
+    ;;
+  --all)
+    die 9 "forward remove --all 为二期未实现（防误删）。请用 'forward list' 查看 id 后逐个 forward remove <id>。"
+    ;;
+  -*)
+    die "${EXIT_USAGE}" "未知参数：$1。用法：forward remove <id>"
+    ;;
+  *)
+    id="$1"
+    shift
+    ;;
+  esac
+
+  if (($# > 0)); then
+    die "${EXIT_USAGE}" "remove 只接受一个 <id>（收到额外：$1）。"
+  fi
+
+  # 先确认存在（不存在 die 3，且不动隧道）
+  local record=""
+  record="$(forward_get "${id}")"
+
+  local has_stop=""
+  has_stop="$(_hf_has_func tunnel_stop)"
+  if [[ -n "${has_stop}" ]]; then
+    local stop_rc=0
+    set +o errexit
+    tunnel_stop "${id}" >/dev/null 2>&1
+    stop_rc=$?
+    set -o errexit
+    if [[ "${stop_rc}" -ne 0 ]]; then
+      log warn "停隧道 ${id} 返回 ${stop_rc}，已继续删除状态记录。请用 'ps' 检查是否有残留 ssh 进程。"
+    fi
+  else
+    local pid=""
+    pid="$(printf '%s' "${record}" | jq -r '.pid // empty')"
+    if [[ -n "${pid}" ]]; then
+      log warn "未找到隧道模块（lib/tunnel.sh），无法自动停进程 pid=${pid}。请手动 kill ${pid} 后再确认。"
+    fi
+  fi
+
+  forward_remove_record "${id}"
+}
+
+# --- doctor ---
+
+cmd_doctor() {
+  local do_fix=""
+  local do_prune=""
+  while (($# > 0)); do
+    case "$1" in
+    --fix)
+      do_fix="yes"
+      shift
+      ;;
+    --prune)
+      do_prune="yes"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward doctor [--fix] [--prune]"
+      ;;
+    *)
+      die "${EXIT_USAGE}" "doctor 不接受位置参数：$1。"
+      ;;
+    esac
+  done
+
+  # 有 T2 的 doctor_run 就委托（松散耦合）
+  local has_doctor=""
+  has_doctor="$(_hf_has_func doctor_run)"
+  if [[ -n "${has_doctor}" ]]; then
+    local args=()
+    [[ -n "${do_fix}" ]] && args+=(--fix)
+    [[ -n "${do_prune}" ]] && args+=(--prune)
+    doctor_run ${args[@]+"${args[@]}"}
+    return 0
+  fi
+
+  # 内置最小实现：只用冻结 API + probe_tcp
+  local forwards=""
+  forwards="$(forward_list_json)"
+
+  local count=0
+  local up_count=0
+  local down_count=0
+  local fixed_count=0
+  local pruned_count=0
+
+  local rows=""
+  set +o errexit
+  rows="$(printf '%s' "${forwards}" | jq -c '.[]')"
+  set -o errexit
+
+  local row=""
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    count=$((count + 1))
+
+    local id=""
+    local local_port=""
+    local status=""
+    local pid=""
+    id="$(printf '%s' "${row}" | jq -r '.id')"
+    local_port="$(printf '%s' "${row}" | jq -r '.local_port')"
+    status="$(printf '%s' "${row}" | jq -r '.status // "down"')"
+    pid="$(printf '%s' "${row}" | jq -r '.pid // empty')"
+
+    local probe=""
+    probe="$(probe_tcp 127.0.0.1 "${local_port}" 1)"
+
+    local live_pid=""
+    if [[ -n "${pid}" ]]; then
+      set +o errexit
+      kill -0 "${pid}" 2>/dev/null
+      local krc=$?
+      set -o errexit
+      [[ "${krc}" -eq 0 ]] && live_pid="yes"
+    fi
+
+    if [[ "${probe}" == "ok" ]]; then
+      up_count=$((up_count + 1))
+      printf '%s\t%s\tup\t(port %s 可连)\n' "${id}" "${local_port}" "${local_port}"
+      if [[ -n "${do_fix}" && "${status}" != "up" ]]; then
+        forward_set_status "${id}" up
+        fixed_count=$((fixed_count + 1))
+      fi
+    else
+      down_count=$((down_count + 1))
+      printf '%s\t%s\tdown\t(port %s 不可连)\n' "${id}" "${local_port}" "${local_port}"
+      if [[ -n "${do_fix}" && "${status}" != "down" ]]; then
+        forward_set_status "${id}" down
+        fixed_count=$((fixed_count + 1))
+      fi
+      if [[ -n "${do_prune}" && -z "${live_pid}" ]]; then
+        forward_remove_record "${id}"
+        pruned_count=$((pruned_count + 1))
+      fi
+    fi
+  done <<<"${rows}"
+
+  log info "doctor 完成：共 ${count} 条，up=${up_count}，down=${down_count}，修正=${fixed_count}，清理=${pruned_count}。"
+  # 诊断成功即 exit 0（即使有 down 记录）——E2E run-inside.sh 用 set -e，不能因 down 中断
+  return 0
+}
+
+# --- 二期占位 ---
+
+cmd_publish() {
+  die 9 "forward publish 为二期（Cloudflare quick tunnel）未实现。一期请用 'forward add' 建立 ssh -L 本地转发。"
+}
+
+cmd_unpublish() {
+  die 9 "forward unpublish 为二期未实现。"
+}
+
+# --- watch ---
+
+cmd_watch() {
+  require_cmd watch "watch 命令缺失。请安装 procps/util-linux，或直接运行 'forward list'。"
+  exec watch -n 3 "${FORWARD_ROOT}/bin/forward" list
+}
+
+# --- dispatch ---
+
+main() {
+  if (($# == 0)); then
+    usage >&2
+    die "${EXIT_USAGE}" "缺少子命令。请从 add / list / remove / doctor 中选择（'forward --help' 查看全部）。"
+  fi
+
+  local subcmd="$1"
+  shift
+
+  case "${subcmd}" in
+  add) cmd_add "$@" ;;
+  list) cmd_list "$@" ;;
+  remove) cmd_remove "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  publish) cmd_publish "$@" ;;
+  unpublish) cmd_unpublish "$@" ;;
+  watch) cmd_watch "$@" ;;
+  help | --help | -h)
+    usage
+    return 0
+    ;;
+  *)
+    usage >&2
+    die "${EXIT_USAGE}" "未知子命令：${subcmd}。请运行 'forward --help' 查看可用子命令。"
+    ;;
+  esac
+}
+
+main "$@"
