@@ -335,6 +335,23 @@ t_match "up" "${T2_OUT}" "reports up"
 t2_run t2_status_of "${TUNNEL_ID}"
 t_eq "up" "${T2_OUT}" "status unchanged by report"
 
+t_it "doctor --prune keeps a live tunnel (only dead records are cleared)"
+t2_run tunnel_doctor --prune
+t_eq "0" "${T2_RC}" "doctor --prune exit"
+t_match "up" "${T2_OUT}" "live tunnel reported up, not pruned"
+t2_run t2_record_count
+t_eq "1" "${T2_OUT}" "live record survives --prune"
+
+t_it "doctor --fix repairs a stale 'down' status back to 'up'"
+forward_set_status "${TUNNEL_ID}" down
+t2_run t2_status_of "${TUNNEL_ID}"
+t_eq "down" "${T2_OUT}" "status forced stale"
+t2_run tunnel_doctor --fix
+t_eq "0" "${T2_RC}" "doctor --fix exit"
+t_match "fixed -> up" "${T2_OUT}" "announces the up-repair"
+t2_run t2_status_of "${TUNNEL_ID}"
+t_eq "up" "${T2_OUT}" "status repaired to up"
+
 t_describe "remote death: kill sshd listener + full descendant tree"
 t2_kill_tree "${SSHD_PID}"
 SSHD_PID=""
