@@ -60,11 +60,46 @@ mkdir -p "${RESULTS_DIR}"
 
 log "运行容器（模式 ${HERDR_PROBE_MODE}）"
 # 注意：不 --publish、不 --network host；源码只读挂载，结果目录可写挂载。
+
+# ---------------------------------------------------------------------------
+# 红线自检（ARCHITECTURE §C.2.1，任务书要求脚本自带）
+#   挂载参数（--volume/-v/--bind）的**字面量**里绝不允许出现 `$HOME` / `${HOME}`，
+#   否则等于把真实用户 HOME 或其下配置暴露给容器。
+#   注意：只检未展开的字面量 token，不检展开后的家目录路径 —— 仓库本身就可能住在
+#   $HOME 下（C.3 冻结设计就是要挂 $PROJ），拿展开值判定会假阳性。
+#   ci.sh 第 6 段另有静态 grep 看守，这里是运行期双保险。
+# ---------------------------------------------------------------------------
+redline_check_mounts() { # redline_check_mounts <mount_arg...>
+  local arg="" bad=0
+  for arg in "$@"; do
+    case "${arg}" in
+    -v | --volume | --bind | -v=* | --volume=* | --bind=*) continue ;;
+    *)
+      # shellcheck disable=SC2016  # 单引号内的 $HOME 就是要匹配的字面量
+      if [[ "${arg}" == *'$HOME'* || "${arg}" == *'${HOME}'* ]]; then
+        printf '[e2e-docker] RED LINE：挂载参数含 $HOME 字面量：%s\n' "${arg}" >&2
+        bad=1
+      fi
+      ;;
+    esac
+  done
+  if [[ "${bad}" -ne 0 ]]; then
+    echo '[e2e-docker] 拒绝启动：挂载参数命中红线（ARCHITECTURE §C.2.1）' >&2
+    exit 1
+  fi
+  return 0
+}
+
+MOUNT_ARGS=(
+  "${HERDR_MOUNT[@]}"
+  -v "${PROJ}":/plugin-src:ro
+  -v "${RESULTS_DIR}":/work/test-results
+)
+redline_check_mounts "${MOUNT_ARGS[@]}"
+
 set +e
 timeout 600 docker run --rm \
-  "${HERDR_MOUNT[@]}" \
-  -v "${PROJ}":/plugin-src:ro \
-  -v "${RESULTS_DIR}":/work/test-results \
+  "${MOUNT_ARGS[@]}" \
   -e HERDR_E2E_MODE="${HERDR_PROBE_MODE}" \
   "${IMAGE}"
 rc=$?

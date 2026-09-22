@@ -273,7 +273,11 @@ tab_bar_right = ["hello", { type = "text", text = "x" }]
 EOF
 run_installer "${config8}"
 t_exit_ok 0 "${rc}" "退出 0"
-if python3 - "${config8}" <<'PY'
+# shfmt 3.10（宿主）与 3.14（容器）对 `if python3 - <<'PY' … PY then` 的 then
+# 位置处理相反 → 改为先落 rc 再判（两版都稳定）。
+py_rc=0
+set +o errexit
+python3 - "${config8}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -284,7 +288,9 @@ assert entries[1] == {"type": "text", "text": "x"}, entries
 assert entries[2]["type"] == "command", entries
 assert "bin/forward" in entries[2]["command"], entries
 PY
-then
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
   t_pass "原有 2 条保留，我们的条目追加为第 3 条"
 else
   t_fail_note "原有条目被破坏或追加位置不对"
@@ -302,14 +308,18 @@ config9="${WORK}/drypar.toml"
 printf 'theme = "dark"\n' >"${config9}"
 run_installer "${config9}" --dry-run
 printf '%s\n' "${out}" | awk '/^---$/{f=!f; next} f' >"${WORK}/dry-out.toml"
-if python3 - "${WORK}/dry-out.toml" <<'PY'
+py_rc=0
+set +o errexit
+python3 - "${WORK}/dry-out.toml" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
 assert doc["theme"] == "dark"
 assert len(doc["ui"]["tab_bar_right"]) == 1
 PY
-then
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
   t_pass "dry-run 输出可直接被 tomllib 解析"
 else
   t_fail_note "dry-run 输出不是合法 TOML"

@@ -244,8 +244,13 @@ if [[ "${rc}" -ne 0 ]]; then
 fi
 
 # --- 自检：新内容必须是合法 TOML，且本插件条目恰好 1 条 ---
+# 不用 `if ! python3 - <<'PY' … PY then` 形式：shfmt 3.10（宿主）与 3.14（容器）
+# 对该 heredoc 后的 `then` 位置处理相反。改为先落 rc 再判（两版都稳定，
+# 且不触发 SC2310：条件内 set -e 被禁用）。
 printf '%s\n' "${new_content}" >"${tmp_file}" || die "无法写入临时文件"
-if ! python3 - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null
+selfcheck_rc=0
+set +o errexit
+python3 - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null
 import sys
 import tomllib
 
@@ -272,7 +277,9 @@ if not (1 <= int(entry["timeout_seconds"]) <= 3600):
 if raw.count(sys.argv[2]) != 1:
     sys.exit(1)
 PY
-then
+selfcheck_rc=$?
+set -o errexit
+if [[ "${selfcheck_rc}" -ne 0 ]]; then
   die "内部错误：生成的内容不是合法 TOML 或条目数异常，已中止（原文件未改）"
 fi
 
