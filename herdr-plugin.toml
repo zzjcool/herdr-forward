@@ -1,3 +1,11 @@
+# herdr-forward 插件 manifest —— herdr 0.9.x schema（RESEARCH.md §2.2 / SCOUT-FACTS §2.2）
+#
+# 路径解析策略（SCOUT-FACTS §2.2 裁决）：
+#   `%{plugin_root}` 模板变量**不存在**（已证实），因此 command 一律用
+#   `/bin/sh -c` 包装读取官方注入的 `$HERDR_PLUGIN_ROOT` env 后再 exec。
+#   command 本身是 argv 数组、不经 shell —— 这里的 sh -c 是我们显式写出来的。
+#
+# TOML 注意：payload 里含双引号，故用 literal string（单引号）避免二次转义。
 id = "zzjcool:forward"
 name = "forward"
 version = "0.1.0"
@@ -5,8 +13,61 @@ min_herdr_version = "0.8.0"
 description = "Forward a saved SSH machine's TCP port to localhost, and optionally publish a localhost port to the public internet via a Cloudflare quick tunnel."
 platforms = ["linux", "macos"]
 
-# herdr-forward 插件 manifest —— 立项占位版，字段参考 herdr 0.9 schema
-# （RESEARCH.md §2.2）；实现开工时再填 command/actions。
+# ---------------------------------------------------------------------------
+# actions —— herdr command palette / keybinding / link_handler 的落点
+# id 规则：ASCII letters/digits/`: . _ -`；action id 不能含点（SCOUT-FACTS §2.2）
+# ---------------------------------------------------------------------------
 
-# Ctrl+click localhost:PORT 链接 → 打开浏览器（一期）
-# [[link_handlers]] / [[actions]] / [[panes]] 具体声明见 docs/PLAN.md
+[[actions]]
+id = "add"
+title = "Port Forward: Add…"
+# 交互式添加在 Port Forward pane 里完成（CLI 的 add 需要 <local:remote> 参数，
+# 而 herdr action invoke 不传 argv），故 add action 直接打开面板。
+command = ["/bin/sh", "-c", 'exec "${HERDR_BIN_PATH:-herdr}" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup']
+
+[[actions]]
+id = "list"
+title = "Port Forward: List"
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" list']
+
+[[actions]]
+id = "remove"
+title = "Port Forward: Remove…"
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" remove --pick']
+
+[[actions]]
+id = "doctor"
+title = "Port Forward: Doctor (check tunnels)"
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" doctor']
+
+# link_handler 的 action 必须指向本插件已声明的 action（SCOUT-FACTS §2.2），
+# 故单独声明 open-url（一期语义：Ctrl+click localhost 链接 → 打开浏览器）。
+[[actions]]
+id = "open-url"
+title = "Port Forward: Open link in browser"
+command = ["/bin/sh", "-c", 'url="$HERDR_PLUGIN_CLICKED_URL"; if [ -z "$url" ]; then exit 1; fi; if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$url"; elif command -v open >/dev/null 2>&1; then exec open "$url"; else exit 1; fi']
+
+# ---------------------------------------------------------------------------
+# panes —— Port Forward 面板（表格 + 交互式增删）
+# ---------------------------------------------------------------------------
+
+[[panes]]
+id = "ports"
+title = "Port Forward"
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" watch']
+
+# ---------------------------------------------------------------------------
+# link_handlers —— Ctrl+click 本地链接打开浏览器
+#
+# pattern 是 **Rust regex**，匹配 clicked URL；herdr 的 URL 检测只认 http:// / https://
+# （SCOUT-FACTS §2.3）—— 无 scheme 的 `localhost:3000` 不命中，故 pattern 必须带 scheme。
+# 定稿（与 tests/unit/test_link_pattern.sh 冻结常量一致）：
+#   ^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?(?:[/?#].*)?$
+# 用 TOML literal string：basic string 会吞掉 `\d` / `\.`。
+# ---------------------------------------------------------------------------
+
+[[link_handlers]]
+id = "local-url"
+title = "Open localhost URL in browser"
+pattern = '^https?://(?:localhost|127\.0\.0\.1)(?::\d{1,5})?(?:[/?#].*)?$'
+action = "open-url"
