@@ -356,6 +356,20 @@ fi
 t2_run tunnel_alive "${MASTER_PID}"
 t_eq "false" "${T2_OUT}" "master no longer alive"
 
+t_describe "N2: tunnel_stop 清理 log-f-<id>，但保留 known_hosts（刻意行为）"
+t_it "stale per-tunnel log file is removed by tunnel_stop"
+if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/log-${TUNNEL_ID}" ]]; then
+  t_fail "log file survived tunnel_stop"
+else
+  t_pass "log-<id> removed"
+fi
+t_it "known_hosts is intentionally preserved across stops (one-time host key)"
+if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/known_hosts" ]]; then
+  t_pass "known_hosts kept (deliberate)"
+else
+  t_fail "known_hosts should be kept across tunnel_stop"
+fi
+
 t_describe "no residual processes"
 t_it "no ssh process references this test's state dir"
 sleep 0.5

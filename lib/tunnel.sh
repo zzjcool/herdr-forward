@@ -315,7 +315,10 @@ tunnel_stop() {
     log warn "tunnel_stop: ssh master ${pid} (${id}) is still alive after TERM/KILL; the tunnel may still be listening."
   fi
 
-  rm -f "${ctl}" "${pid_file}" "${dir}/target-${id}"
+  # N2（review nit）：一并清掉本隧道的 ssh 日志 log-<id>（每隧道一份，停后即无用）。
+  # 刻意**不删** known_hosts：它是跨隧道共用的沙箱 host key 缓存（StrictHostKeyChecking=accept-new 只信任一次），
+  # 删掉会让下一次 start 重新 accept-new——保留它是有意行为，不是遗漏。
+  rm -f "${ctl}" "${pid_file}" "${dir}/target-${id}" "${dir}/log-${id}"
 }
 
 # tunnel_reap <id> [pid] — stop + hard-kill leftover pid + drop stale files.
@@ -328,7 +331,7 @@ tunnel_reap() {
   if [[ ${pid} =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
     kill -KILL "${pid}" 2>/dev/null || true
   fi
-  rm -f "${dir}/ctl-${id}" "${dir}/pid-${id}" "${dir}/target-${id}"
+  rm -f "${dir}/ctl-${id}" "${dir}/pid-${id}" "${dir}/target-${id}" "${dir}/log-${id}"
 }
 
 # ---------------------------------------------------------------------------
