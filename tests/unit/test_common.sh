@@ -279,6 +279,64 @@ _capture probe_tcp 127.0.0.1 1 1
 LINES="$(printf '%s' "${out}" | grep -c '')"
 t_eq "1" "${LINES}" "单行输出"
 
+t_describe "common.sh: probe_payload（A.3.1 review D1 契约修正）"
+
+t_it "probe_payload 对拒绝连接输出 down 且恒 return 0"
+_capture probe_payload 127.0.0.1 1 1
+t_exit_ok 0 "${rc}" "拒绝也 return 0"
+t_eq "down" "${out}" "端口 1 -> down"
+
+t_it "probe_payload 空参数输出 down 不崩"
+_capture probe_payload "" ""
+t_exit_ok 0 "${rc}" "空参数不 exit"
+t_eq "down" "${out}" "空参数 down"
+
+t_it "probe_payload 对回包服务输出 up（应用层真实可达）"
+EchoPort="$(_free_port)"
+python3 -u -c 'import socket,sys,threading
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(8)
+def h(c):
+    try:
+        f=c.makefile("rwb")
+        for _l in f: f.write(b"pong\\n"); f.flush()
+    except Exception: pass
+    finally: c.close()
+while True:
+    c,_=s.accept(); threading.Thread(target=h,args=(c,),daemon=True).start()' "${EchoPort}" &
+EPROBE_PID=$!
+set +o errexit
+_wait_port "${EchoPort}"
+set -o errexit
+_capture probe_payload 127.0.0.1 "${EchoPort}" 1
+t_exit_ok 0 "${rc}" "回包服务也恒 return 0"
+t_eq "up" "${out}" "有应用层回包 -> up"
+kill "${EPROBE_PID}" 2>/dev/null || true
+wait "${EPROBE_PID}" 2>/dev/null || true
+
+t_it "probe_payload 对「可连但不应答」输出 degraded（不谎报 up）"
+SilentPort="$(_free_port)"
+python3 -u -c 'import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(8)
+held=[]
+while True:
+    c,_=s.accept(); held.append(c)' "${SilentPort}" &
+SPROBE_PID=$!
+set +o errexit
+_wait_port "${SilentPort}"
+set -o errexit
+_capture probe_payload 127.0.0.1 "${SilentPort}" 1
+t_exit_ok 0 "${rc}" "静默服务也恒 return 0"
+t_eq "degraded" "${out}" "可连但无回包 -> degraded（不是 up）"
+kill "${SPROBE_PID}" 2>/dev/null || true
+wait "${SPROBE_PID}" 2>/dev/null || true
+
+t_it "probe_payload 输出恒为单行且不因失败 exit"
+_capture probe_payload 127.0.0.1 1 1
+LINES="$(printf '%s' "${out}" | grep -c '')"
+t_eq "1" "${LINES}" "单行输出"
+
 t_describe "common.sh: tcp_serve_once"
 
 t_it "tcp_serve_once 缺参 -> die 1 且提示用法"

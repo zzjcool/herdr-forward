@@ -16,6 +16,12 @@ fi
 if [[ -z ${FORWARD_TCP_TIMEOUT_DEFAULT:-} ]]; then
   readonly FORWARD_TCP_TIMEOUT_DEFAULT=2
 fi
+if [[ -z ${FORWARD_PROBE_TIMEOUT_DEFAULT:-} ]]; then
+  readonly FORWARD_PROBE_TIMEOUT_DEFAULT=2 # 等应用层回包的秒数（A.3.1 review 修正）
+fi
+if [[ -z ${FORWARD_PROBE_PAYLOAD_MARKER:-} ]]; then
+  readonly FORWARD_PROBE_PAYLOAD_MARKER='herdr-forward-probe'
+fi
 
 # state_dir
 #   stdout: 插件状态目录绝对路径（A.2：env 优先，缺失回退 ~/.local/state/herdr-forward）
@@ -152,6 +158,55 @@ probe_tcp() {
     printf 'ok\n'
   else
     printf 'fail\n'
+  fi
+  return 0
+}
+
+# probe_payload <host> <port> [timeout_s=2]：
+#   A.3.1（review D1 契约修正）：连上后发一行 payload 并等**任意**应用层回包：
+#     up       连接成功且 timeout 内收到至少 1 字节回包（远端应用真的在服务）
+#     degraded 连接成功但无回包（远端端口可连，协议未知/不应答）
+#     down     连接被拒/重置/超时失败或参数为空
+#   恒 return 0（不因失败 exit），stdout 恒单行。
+#   为什么需要它：ssh -L 的本地监听器在 master 活着时**永远**接受本地连接，
+#   TCP-only 探活于是把「远端应用已死」误判为 up（review D1 红线的根因）。
+probe_payload() {
+  local host="${1-}"
+  local port="${2-}"
+  local timeout_s="${3:-${FORWARD_PROBE_TIMEOUT_DEFAULT}}"
+  if [[ -z "${host}" || -z "${port}" ]]; then
+    printf 'down\n'
+    return 0
+  fi
+
+  # 显式构造探测脚本，避免 shellcheck SC2016 误报；退出码即分类依据：
+  #   0   = 读到回包 -> up
+  #   128+= timeout 杀掉的 read（读超时）-> degraded
+  #   其他 = connect/write 失败 -> down
+  local script=""
+  printf -v script 'exec 3<>"%s" 2>/dev/null || exit 2
+printf "%%s\\n" "%s" >&3 2>/dev/null || exit 3
+IFS= read -r -n 1 -t "%s" -u 3 _ 2>/dev/null
+exit $?' \
+    "/dev/tcp/${host}/${port}" "${FORWARD_PROBE_PAYLOAD_MARKER}" "${timeout_s}"
+
+  local rc=0
+  set +o errexit
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$((timeout_s + 2))" bash -c "${script}" >/dev/null 2>&1
+    rc=$?
+  else
+    bash -c "${script}" >/dev/null 2>&1
+    rc=$?
+  fi
+  set -o errexit
+
+  if [[ "${rc}" -eq 0 ]]; then
+    printf 'up\n'
+  elif [[ "${rc}" -ge 128 ]]; then
+    printf 'degraded\n'
+  else
+    printf 'down\n'
   fi
   return 0
 }

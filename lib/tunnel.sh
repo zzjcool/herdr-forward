@@ -4,9 +4,9 @@
 #   tunnel_start <id> <local_port> <remote_host:remote_port> <ssh_target>  -> stdout pid; die 5
 #   tunnel_stop  <id>
 #   tunnel_alive <pid>        -> stdout true|false (kill -0 and not zombie)
-#   tunnel_probe <local_port> -> stdout ok|fail (probe_tcp wrapper)
+#   tunnel_probe <local_port> -> stdout up|degraded|down (payload probe; see A.3.1)
 # Extra liveness primitives used by `forward doctor` (T1 cmd layer delegates here):
-#   tunnel_health <id> <pid> <local_port> -> up|down
+#   tunnel_health <id> <pid> <local_port> -> up|degraded|down
 #   tunnel_reap   <id> [pid]              -> stop + remove socket/pidfile (idempotent)
 #   tunnel_doctor [--fix|--prune]         -> reconcile status against liveness
 set -Eeuo pipefail
@@ -175,25 +175,28 @@ tunnel_alive() {
   printf 'true\n'
 }
 
-# tunnel_probe <local_port> -> stdout: ok|fail (A.3: probe_tcp 127.0.0.1 <port>).
+# tunnel_probe <local_port> -> stdout: up|degraded|down
+# A.3.1（review D1 契约修正）：不再只做本地 TCP 握手（那样在 master 活着时恒 ok，
+# 会把远端应用已死误报为 up），改为经隧道发真 payload 看远端是否可达。
 tunnel_probe() {
   local local_port="${1}"
-  probe_tcp 127.0.0.1 "${local_port}"
+  probe_payload 127.0.0.1 "${local_port}"
 }
 
-# tunnel_health <id> <pid> <local_port> -> stdout: up|down
+# tunnel_health <id> <pid> <local_port> -> stdout: up|degraded|down
+# A.3.1：master 不活一律 down；否则透传 tunnel_probe 的三级结果（语义见契约）。
 tunnel_health() {
   local id="${1}"
   local pid="${2:-}"
   local local_port="${3}"
   local alive probe
   alive="$(tunnel_alive "${pid}")"
-  probe="$(tunnel_probe "${local_port}")"
-  if [[ ${alive} == 'true' && ${probe} == 'ok' ]]; then
-    printf 'up\n'
-  else
+  if [[ ${alive} != 'true' ]]; then
     printf 'down\n'
+    return 0
   fi
+  probe="$(tunnel_probe "${local_port}")"
+  printf '%s\n' "${probe}"
 }
 
 # ---------------------------------------------------------------------------
@@ -360,14 +363,30 @@ tunnel_doctor() {
     alive="$(tunnel_alive "${pid}")"
     probe="$(tunnel_probe "${local_port}")"
 
-    if [[ ${alive} == 'true' && ${probe} == 'ok' ]]; then
+    # A.3.1 诚实分级：up=应用层有回包；degraded=远端端口可连但无回包；down=连不上。
+    # status 字段仅允许 up|down，故 degraded 报告为 degraded 但 --fix 保守置 down（不 prune）。
+    local effective="${probe}"
+    [[ ${alive} == 'true' ]] || effective='down'
+    local report="${effective}"
+    local new_status="${effective}"
+    [[ ${effective} == 'degraded' ]] && new_status='down'
+
+    if [[ ${effective} == 'up' ]]; then
       if ((fix)) && [[ ${status} != 'up' ]]; then
         forward_set_status "${id}" up
         printf '%s: fixed -> up\n' "${id}"
       else
         printf '%s: up\n' "${id}"
       fi
-    elif ((prune)); then
+    elif [[ ${effective} == 'degraded' ]]; then
+      # 绝不自作主张报 up；也不 prune（master 可能还在，删记录会误伤活隧道）。
+      if ((fix)) && [[ ${status} != "${new_status}" ]]; then
+        forward_set_status "${id}" "${new_status}"
+        printf '%s: degraded (no application-layer reply) -> fixed -> %s\n' "${id}" "${new_status}"
+      else
+        printf '%s: %s (no application-layer reply; status=%s)\n' "${id}" "${report}" "${status}"
+      fi
+    elif ((prune)) && [[ ${alive} != 'true' ]]; then
       tunnel_reap "${id}" "${pid}"
       forward_remove_record "${id}"
       printf '%s: pruned\n' "${id}"
