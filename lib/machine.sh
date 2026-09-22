@@ -115,7 +115,9 @@ machine_resolve() {
     fi
   done <"${toml}"
 
-  if ((!found_section)); then
+  # 写成 ==0 而非 ((! x))：shfmt 3.10（宿主）与 3.14（容器）对 `((! x))`
+  # 的空格处理相反，写作 `== 0` 两个版本都稳定（ci.sh 在两处环境都要过）。
+  if ((found_section == 0)); then
     local available=""
     available="$(machine_list_labels "${toml}" | paste -sd ',' -)"
     if [[ -z ${available} ]]; then

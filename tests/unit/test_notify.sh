@@ -147,7 +147,7 @@ t2_run notify_toast 'Title A' 'Body A'
 t_exit_ok 0 "${T2_RC}" "exit 0"
 t2_logged 'Title A'
 if ((T2_LOGGED)); then
-  t_ok "degraded to log"
+  t_pass "degraded to log"
 else
   t_fail "degrade message not found on stderr or forward.log"
 fi
@@ -178,13 +178,13 @@ if command -v mkfifo >/dev/null 2>&1; then
   t2_elapsed=$((SECONDS - t2_start))
   t_exit_ok 0 "${t2_rc_fifo}" "exit 0"
   if ((t2_elapsed <= 2)); then
-    t_ok "bounded"
+    t_pass "bounded"
   else
     t_fail "blocked for ${t2_elapsed}s"
   fi
 else
   t_it "mkfifo absent: bounded-sink case skipped (no mkfifo)"
-  t_ok "skipped"
+  t_pass "skipped"
 fi
 
 t_describe "notify_send watchdog (never block >1s)"
@@ -202,7 +202,7 @@ set -e
 t2_elapsed=$((SECONDS - t2_start))
 t_exit_ok 1 "${t2_slow_rc}" "watchdog reports failure"
 if ((t2_elapsed <= 2)); then
-  t_ok "bounded (${t2_elapsed}s)"
+  t_pass "bounded (${t2_elapsed}s)"
 else
   t_fail "watchdog let the caller block for ${t2_elapsed}s"
 fi
@@ -258,7 +258,7 @@ PY
   fi
 else
   t_it "python3 absent: positive socket case skipped"
-  t_ok "skipped"
+  t_pass "skipped"
 fi
 
 t_done

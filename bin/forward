@@ -440,14 +440,22 @@ cmd_doctor() {
     esac
   done
 
-  # 有 T2 的 doctor_run 就委托（松散耦合）
+  # 有 T2 的隧道层 doctor（tunnel_doctor）就委托（松散耦合）。
+  # 归因：原先探测的函数名 doctor_run 在 lib/tunnel.sh 里并不存在，委托分支是死
+  # 代码 → doctor 实际走下面的内置降级实现，从不调用 tunnel_reap，死记录的
+  # control socket 文件会残留（集成测试用 kill -9 留下 stale socket 可复现）。
   local has_doctor=""
-  has_doctor="$(_hf_has_func doctor_run)"
+  has_doctor="$(_hf_has_func tunnel_doctor)"
   if [[ -n "${has_doctor}" ]]; then
-    local args=()
-    [[ -n "${do_fix}" ]] && args+=(--fix)
-    [[ -n "${do_prune}" ]] && args+=(--prune)
-    doctor_run ${args[@]+"${args[@]}"}
+    # tunnel_doctor 只接受一个 mode 参数（report / --fix / --prune）；
+    # --fix 与 --prune 互斥策略与 A.3 一致：prune 优先。
+    if [[ -n "${do_prune}" ]]; then
+      tunnel_doctor --prune
+    elif [[ -n "${do_fix}" ]]; then
+      tunnel_doctor --fix
+    else
+      tunnel_doctor
+    fi
     return 0
   fi
 

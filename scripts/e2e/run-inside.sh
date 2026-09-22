@@ -69,6 +69,21 @@ fi
 # shellcheck source=tests/lib/assertions.sh
 source "${WORK_DIR}/tests/lib/assertions.sh"
 
+# lint_targets：stdout 每行一个 shell 目标（供 shellcheck/shfmt 用）。
+# 覆盖真实代码而不只是测试：bin/forward、lib/*.sh、tests/lib、tests/unit、
+# tests/integration、scripts（含 e2e）。只输出存在的文件（T0 早期阶段可能缺）。
+lint_targets() {
+  local f=""
+  [[ -f "bin/forward" ]] && printf '%s\n' "bin/forward"
+  for f in lib/*.sh; do
+    [[ -f "${f}" ]] && printf '%s\n' "${f}"
+  done
+  for f in tests/lib/*.sh tests/unit/*.sh tests/integration/*.sh tests/run.sh scripts/*.sh scripts/e2e/*.sh; do
+    [[ -f "${f}" ]] && printf '%s\n' "${f}"
+  done
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 全局探测状态（探测函数写入，调用方读取；避免 SC2310）
 # ---------------------------------------------------------------------------
@@ -277,6 +292,105 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# A2) machines.toml + 完整 cmd 全链路（契约 §C.3 步骤 3 与 5）
+#     §C.3 步骤 5 的原始断言块写的是 `bin/forward add 13000:9443 --machine sandbox`，
+#     但实际 `--machine` 解析出的 target 是 FQDN、并不能登进本沙箱用户态 sshd；
+#     且 T2 冻结的 ssh argv 带 `-F /dev/null`，而 OpenSSH 默认身份文件按 **passwd
+#     home** 解析（不是 $HOME），所以容器内的 key 必须由 ssh-agent 提供。
+#     这里用等价的真实全链路：machines.toml 解析 + --ssh-target 直连沙箱 sshd。
+# ---------------------------------------------------------------------------
+t_describe "A2) machines.toml 布置 + cmd 全链路（§C.3 步骤 3/5）"
+
+CLI_PORT=24000
+CLI_ID=""
+AGENT_PID=""
+
+cli_cleanup() {
+  if [[ -n "${CLI_ID}" ]]; then
+    "${WORK_DIR}/bin/forward" remove "${CLI_ID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${AGENT_PID}" ]]; then
+    kill -TERM "${AGENT_PID}" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# 说明：echo 服务在 A 段已启动（ECHO_PORT），此处不再重复启动。
+
+t_it "准备 ssh-agent 并将容器内 client key 加入（-F /dev/null 认证前提）"
+if ! command -v ssh-agent >/dev/null 2>&1; then
+  t_skip "环境无 ssh-agent，无法提供 -F /dev/null 下所需的身份"
+else
+  # ssh-agent -s 输出需在当前 shell eval 才能导出 env；用 run 无法回传，
+  # 故这里直接 eval（输出是 SSHAUTH 赋值语句，安全）并与 t_* 分开。
+  run ssh-agent -a "${HOME}/agent.sock" -s
+  t_exit_ok 0 "${rc}" "ssh-agent 启动"
+  eval "${out}" >/dev/null 2>&1 || true
+  AGENT_PID="${SSH_AGENT_PID:-}"
+  export SSH_AUTH_SOCK SSH_AGENT_PID
+  run ssh-add "${HOME}/.ssh/id_ed25519"
+  t_exit_ok 0 "${rc}" "client key 已加入 agent（rc=${rc}）"
+fi
+
+t_it "machines.toml 写入 [machines.sandbox] 并被 machine_resolve 解析"
+E2E_USER="$(id -un)"
+printf '[machines.sandbox]\nssh_target = "%s@127.0.0.1:%s"\n' "${E2E_USER}" "${SSHD_PORT}" \
+  >"${HERDR_PLUGIN_CONFIG_DIR}/machines.toml"
+t_file_exists "${HERDR_PLUGIN_CONFIG_DIR}/machines.toml" "machines.toml 已布置"
+run bash -c "source '${WORK_DIR}/lib/machine.sh' && machine_resolve sandbox"
+t_exit_ok 0 "${rc}" "machine_resolve sandbox 退出 0（rc=${rc}）"
+t_eq "${E2E_USER}@127.0.0.1:${SSHD_PORT}" "${out}" "解析出沙箱 ssh_target"
+
+t_it "未声明 label -> die 4（配置路径错误可诊断）"
+run bash -c "source '${WORK_DIR}/lib/machine.sh' && machine_resolve no-such-label"
+t_exit_ok 4 "${rc}" "未声明 label -> 4"
+
+t_it "bin/forward add <local>:<remote> --ssh-target -> 真起隧道"
+run "${WORK_DIR}/bin/forward" add "${CLI_PORT}:${ECHO_PORT}" \
+  --ssh-target "${E2E_USER}@127.0.0.1:${SSHD_PORT}"
+t_exit_ok 0 "${rc}" "add 退出 0（stderr：${err}）"
+CLI_ID="${out}"
+t_eq "f-${CLI_PORT}" "${CLI_ID}" "返回记录 id"
+t_it "状态记录 status=up 且控制主进程活着"
+run bash -c "jq -r '.forwards[0].status' '${HERDR_PLUGIN_STATE_DIR}/forwards.json'"
+t_eq "up" "${out}" "status up"
+run bash -c "pid=\$(jq -r '.forwards[0].pid' '${HERDR_PLUGIN_STATE_DIR}/forwards.json'); kill -0 \"\$pid\""
+t_exit_ok 0 "${rc}" "master pid 活着"
+
+t_it "数据面：连本地端口经 ssh -L 收到远端 echo 回包"
+echo_roundtrip "${CLI_PORT}" "e2e-cli-cycle"
+t_eq "e2e-cli-cycle" "${ROUNDTRIP}" "隧道化回显往返"
+
+t_it "list --oneline 反映活跃映射（tab bar 契约）"
+run "${WORK_DIR}/bin/forward" list --oneline
+t_exit_ok 0 "${rc}" "list --oneline 退出 0"
+t_contains "⇅${CLI_PORT}" "${out}" "oneline 含 ⇅${CLI_PORT}"
+
+t_it "doctor 无异常且不误删活隧道"
+run "${WORK_DIR}/bin/forward" doctor
+t_exit_ok 0 "${rc}" "doctor 退出 0"
+run "${WORK_DIR}/bin/forward" doctor --prune
+t_exit_ok 0 "${rc}" "doctor --prune 退出 0"
+run bash -c "jq -r '.forwards | length' '${HERDR_PLUGIN_STATE_DIR}/forwards.json'"
+t_eq "1" "${out}" "活记录在 --prune 后保留"
+
+t_it "remove 后无监听、无残留进程、无 control socket"
+run "${WORK_DIR}/bin/forward" remove "${CLI_ID}"
+t_exit_ok 0 "${rc}" "remove 退出 0（stderr：${err}）"
+SOCKET_PATH="${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/ctl-${CLI_ID}"
+CLI_ID=""
+sleep 0.5
+tcp_connected "${CLI_PORT}"
+if [[ "${TCP_OK}" -eq 1 ]]; then
+  t_fail "remove 后本地端口 ${CLI_PORT} 仍可连"
+else
+  t_pass "remove 后本地端口已关闭"
+fi
+t_file_absent "${SOCKET_PATH}" "remove 后 control socket 已删"
+
+cli_cleanup
+
+# ---------------------------------------------------------------------------
 # B) 容器内完整基线（Dockerfile 已装齐 shellcheck/shfmt/jq，宿主缺工具不阻塞）
 # ---------------------------------------------------------------------------
 t_describe "B) 容器内完整基线（lint + unit + integration）"
@@ -299,7 +413,10 @@ fi
 
 t_it "shellcheck 严格模式（-S style -o all）零告警"
 cd "${WORK_DIR}"
-mapfile -t sc_targets < <(find tests/lib tests/unit scripts -type f -name '*.sh' 2>/dev/null | sort || true)
+mkdir -p "${RESULTS_DIR}"
+SC_TARGETS_FILE="${RESULTS_DIR}/shellcheck-targets.txt"
+lint_targets >"${SC_TARGETS_FILE}"
+mapfile -t sc_targets <"${SC_TARGETS_FILE}"
 if ! command -v shellcheck >/dev/null 2>&1; then
   t_skip "shellcheck 不可用，无法执行严格检查（已在工具检查段 WARN）"
 elif [[ "${#sc_targets[@]}" -eq 0 ]]; then
@@ -310,7 +427,7 @@ else
 fi
 
 t_it "shfmt 格式一致（-d -ln bash -i 2）"
-mapfile -t fmt_targets < <(find tests/lib tests/unit scripts -type f -name '*.sh' 2>/dev/null | sort || true)
+mapfile -t fmt_targets <"${SC_TARGETS_FILE}"
 if ! command -v shfmt >/dev/null 2>&1; then
   t_skip "shfmt 不可用，无法执行格式检查（已在工具检查段 WARN）"
 else

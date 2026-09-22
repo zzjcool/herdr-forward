@@ -57,6 +57,13 @@ else
   }
 fi
 
+# 合并缺陷修补（T4）：本文件在 T0 断言库存在时走真库分支，而真库未定义
+# t_fail_note（它只在下面 else 的占位分支里定义）→ 任何真失败会退化成
+# "t_fail_note: command not found" (rc=127)，掩盖真实原因。这里補一个别名。
+if ! declare -F t_fail_note >/dev/null 2>&1; then
+  t_fail_note() { t_fail "$@"; }
+fi
+
 if [[ ! -x "${INSTALLER}" ]]; then
   echo "RED: ${INSTALLER} 不存在或不可执行" >&2
   exit 1
@@ -209,7 +216,7 @@ after3="$(md5 "${config3}")"
 t_eq "${before3}" "${after3}" "dry-run 未改文件"
 dry_bak="$(find "${WORK}" -maxdepth 1 -name 'dry.toml.bak.*' -print -quit)"
 t_eq "" "${dry_bak}" "dry-run 未生成备份"
-t_ok "${out}" "dry-run 有输出"
+if [[ -n "${out}" ]]; then t_pass "dry-run 有输出"; else t_fail_note "dry-run 无输出"; fi
 
 t_it "dry-run 对已安装的 config 也 exit 0 且不改文件"
 before4="$(md5 "${config2}")"
@@ -241,7 +248,7 @@ run_installer "${config7}"
 if [[ "${rc}" -ne 0 ]]; then t_pass "非法 TOML 拒绝（rc=${rc}）"; else t_fail_note "非法 TOML 未拒绝"; fi
 after7="$(cat "${config7}")"
 t_eq "${before7}" "${after7}" "原文件未被破坏"
-t_ok "${err}" "错误信息走 stderr"
+if [[ -n "${err}" ]]; then t_pass "错误信息走 stderr"; else t_fail_note "错误信息未走 stderr"; fi
 
 t_it "--help 可用且 exit 0（禁交互）"
 rc=0
@@ -266,7 +273,11 @@ tab_bar_right = ["hello", { type = "text", text = "x" }]
 EOF
 run_installer "${config8}"
 t_exit_ok 0 "${rc}" "退出 0"
-if python3 - "${config8}" <<'PY'; then
+# shfmt 3.10（宿主）与 3.14（容器）对 `if python3 - <<'PY' … PY then` 的 then
+# 位置处理相反 → 改为先落 rc 再判（两版都稳定）。
+py_rc=0
+set +o errexit
+python3 - "${config8}" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
@@ -277,6 +288,9 @@ assert entries[1] == {"type": "text", "text": "x"}, entries
 assert entries[2]["type"] == "command", entries
 assert "bin/forward" in entries[2]["command"], entries
 PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
   t_pass "原有 2 条保留，我们的条目追加为第 3 条"
 else
   t_fail_note "原有条目被破坏或追加位置不对"
@@ -294,13 +308,18 @@ config9="${WORK}/drypar.toml"
 printf 'theme = "dark"\n' >"${config9}"
 run_installer "${config9}" --dry-run
 printf '%s\n' "${out}" | awk '/^---$/{f=!f; next} f' >"${WORK}/dry-out.toml"
-if python3 - "${WORK}/dry-out.toml" <<'PY'; then
+py_rc=0
+set +o errexit
+python3 - "${WORK}/dry-out.toml" <<'PY' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     doc = tomllib.load(fh)
 assert doc["theme"] == "dark"
 assert len(doc["ui"]["tab_bar_right"]) == 1
 PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
   t_pass "dry-run 输出可直接被 tomllib 解析"
 else
   t_fail_note "dry-run 输出不是合法 TOML"

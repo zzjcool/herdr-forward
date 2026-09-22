@@ -346,10 +346,12 @@ sleep 0.3
 t2_run tunnel_probe "${LOCAL_PORT}"
 t_eq "fail" "${T2_OUT}" "port closed after stop"
 t_it "control socket and pid file are removed"
+# B.1 的 t_ok 语义是「断言上一条命令成功」。这里位于 if 的 else 分支，$? 是 [[ -e ]]
+# 的 1，用 t_ok 会误判为失败 → 必须用无参条件断言语义的 t_pass。
 if [[ -e "${HERDR_PLUGIN_STATE_DIR}/ssh-ctl/ctl-${TUNNEL_ID}" ]]; then
   t_fail "control socket still present after stop"
 else
-  t_ok "control socket removed"
+  t_pass "control socket removed"
 fi
 t2_run tunnel_alive "${MASTER_PID}"
 t_eq "false" "${T2_OUT}" "master no longer alive"

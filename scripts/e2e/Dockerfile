@@ -8,23 +8,24 @@ FROM docker.io/library/archlinux:latest
 
 # openssh      sshd + ssh 客户端（用户态 sshd 回环）
 # jq           状态文件断言（断言库 t_json_valid 依赖）
-# python3      T1/T2/T3 单测集成测试的硬依赖（固定 TOML/tomllib 解析、Rust regex 代理）
+# python       T1/T2/T3 单测集成测试的硬依赖（tomllib/TOML 解析、Rust regex 代理、
+#              echo 服务、test_common 日志轮转）；arch 包名为 python，提供 python3 二进制
 # openbsd-netcat  nc：客户端与端口探活（archlinux 无 gnu-netcat 包）
 # socat        echo 服务承载进程：openbsd nc 无 -e/-c，不能自己回显；
 #              socat 的 EXEC:/bin/cat（或 while-read 脚本）fork-per-conn 提供真回显，
 #              即契约 §C.3 里「同容器后台 echo 进程」的可靠落地
-# shellcheck/shfmt  容器内完整 ci 基线（宿主可能缺）
 # coreutils/util-linux  timeout/pgrep/ss 等测试原语
+# shellcheck/shfmt 不用 pacman 版：下方用二进制固定版本覆盖（见注释）
 RUN pacman -Sy --noconfirm \
   openssh jq python openbsd-netcat socat bash coreutils util-linux \
   iproute2 \
   && pacman -Scc --noconfirm \
-  && command -v shellcheck jq nc socat sshd ssh-keygen bash python3
+  && command -v jq nc socat sshd ssh-keygen bash python3
 
 # shellcheck 与 shfmt 用二进制固定版本覆盖 pacman 版：
-# pacman 的 shfmt 是滚动更新（本容器 3.14.x），与宿主/开发者常用 3.10 对同一构造
-# （`if ! cmd <<HEREDOC ... then`）会给出不同格式 —— 同一份源码在 CI 与本地得出
-# 不同结论是基线拦截最忌讳的。固定到与项目声明一致的版本，保证“格式化结果唯一”。
+# pacman 的 shfmt 是滚动更新（实测 3.14.x），与宿主/开发者常用 3.10 对同一构造
+# 会给出不同格式 —— 同一份源码在 CI 与本地得出不同结论是基线拦截最忌讳的。
+# 固定到与项目声明一致的版本，保证“格式化结果唯一”。
 ARG SHFMT_VERSION=3.10.0
 ARG SHELLCHECK_VERSION=0.10.0
 RUN curl -fsSL -o /usr/local/bin/shfmt \
