@@ -187,6 +187,30 @@ else
   t_ok "skipped"
 fi
 
+t_describe "notify_send watchdog (never block >1s)"
+t_it "a wedged transport is killed and reported as failure within ~2s"
+t2_slow_sock="${T2_TMP}/slow.sock"
+# Override the transport seam with one that hangs far beyond the watchdog.
+_notify_send_python() {
+  sleep 30
+}
+t2_start="${SECONDS}"
+set +e
+(notify_send "${t2_slow_sock}" '{}') >/dev/null 2>&1
+t2_slow_rc=$?
+set -e
+t2_elapsed=$((SECONDS - t2_start))
+t_exit_ok 1 "${t2_slow_rc}" "watchdog reports failure"
+if ((t2_elapsed <= 2)); then
+  t_ok "bounded (${t2_elapsed}s)"
+else
+  t_fail "watchdog let the caller block for ${t2_elapsed}s"
+fi
+
+# Restore the real transport (defined in lib/notify.sh) before the positive case.
+# shellcheck source=/dev/null
+source "${T2_NOTIFY}"
+
 t_describe "notify_toast positive path on a real unix socket (guarded)"
 if command -v python3 >/dev/null 2>&1; then
   t_it "JSON line delivered to a listening AF_UNIX socket"

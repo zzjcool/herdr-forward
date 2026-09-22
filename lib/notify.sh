@@ -56,7 +56,9 @@ _notify_send_nc() {
 }
 
 # notify_send <socket_path> <payload> -> 0 on delivery, 1 otherwise. Bounded by a
-# 1s watchdog so a wedged sink can never hang the caller.
+# 1s watchdog so a wedged sink can never hang the caller. The transport runs in
+# its own session so the watchdog can kill the whole process group (a transport
+# that spawns helpers must not leave orphans behind).
 notify_send() {
   local sock="${1}"
   local payload="${2}"
@@ -71,7 +73,13 @@ notify_send() {
     return 1
   fi
 
-  "${fn}" "${sock}" "${payload}" >/dev/null 2>&1 &
+  if command -v setsid >/dev/null 2>&1; then
+    local def=""
+    def="$(declare -f "${fn}")"
+    setsid bash -c "${def}"$'\n'"${fn} \"\$@\"" _ "${sock}" "${payload}" >/dev/null 2>&1 &
+  else
+    "${fn}" "${sock}" "${payload}" >/dev/null 2>&1 &
+  fi
   local pid=$!
   local waits=0
   while ((waits < 10)); do
@@ -82,7 +90,7 @@ notify_send() {
     sleep 0.1
   done
   if kill -0 "${pid}" 2>/dev/null; then
-    kill -KILL "${pid}" 2>/dev/null || true
+    kill -KILL "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     return 1
   fi
