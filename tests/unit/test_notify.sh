@@ -84,7 +84,7 @@ t2_run() {
   out_file="$(mktemp)"
   err_file="$(mktemp)"
   set +e
-  ( "$@" ) >"${out_file}" 2>"${err_file}"
+  ("$@") >"${out_file}" 2>"${err_file}"
   T2_RC=$?
   set -e
   T2_OUT="$(<"${out_file}")"
@@ -172,7 +172,7 @@ if command -v mkfifo >/dev/null 2>&1; then
   mkfifo "${HERDR_SOCKET_PATH}"
   t2_start="${SECONDS}"
   set +e
-  ( notify_toast 'Fifo' 'Body' ) >/dev/null 2>&1
+  (notify_toast 'Fifo' 'Body') >/dev/null 2>&1
   t2_rc_fifo=$?
   set -e
   t2_elapsed=$((SECONDS - t2_start))
