@@ -354,7 +354,8 @@ cmd_list() {
   json)
     local forwards=""
     forwards="$(forward_list_json)"
-    printf '%s' "${forwards}" | jq -S -c --argjson v 1 '{version: $v, forwards: .}'
+    # M3（review）：引用 FORWARD_STATE_VERSION 常量，不硬编码 1（值与 lib/state.sh 单一权威一致）
+    printf '%s' "${forwards}" | jq -S -c --argjson v "${FORWARD_STATE_VERSION:-1}" '{version: $v, forwards: .}'
     ;;
   *)
     _hf_list_table

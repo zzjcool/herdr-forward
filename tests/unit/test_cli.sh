@@ -294,6 +294,22 @@ t_exit_ok 0 "${rc}" "空状态 exit 0"
 got="$(printf '%s' "${out}" | jq -r '.forwards | length' 2>/dev/null)"
 t_eq "0" "${got}" "空数组"
 
+# --- M3（review minor）：list --json 不得硬编码 version=1，必须引用常量 ---
+t_it "list --json 的 version 引用 FORWARD_STATE_VERSION（注入 2 时应输出 2，非硬编码 1）"
+_stage
+FORWARD_STATE_VERSION=2 _fw list --json
+t_exit_ok 0 "${rc}" "注入 version=2 时 exit 0"
+got="$(printf '%s' "${out}" | jq -r '.version' 2>/dev/null)"
+t_eq "2" "${got}" "list --json version 跟随常量（硬编码 1 会在此红）"
+t_it "list --json 的 version 与 state 文件 version 一致（单一权威）"
+_stage
+FORWARD_STATE_VERSION=2 _fw add 3000:9443 --ssh-target "u@h:22"
+_jq_state '.version'
+t_eq "2" "${got}" "state 文件 version=2"
+FORWARD_STATE_VERSION=2 _fw list --json
+got="$(printf '%s' "${out}" | jq -r '.version' 2>/dev/null)"
+t_eq "2" "${got}" "list --json version 与 state 文件一致"
+
 t_it "list 默认输出表格（含表头/端口）"
 _stage
 _fw add 3000:9443 --ssh-target "u@h:22"
