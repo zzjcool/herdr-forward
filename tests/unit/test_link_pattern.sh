@@ -457,20 +457,24 @@ else
 fi
 
 t_it "remove action 的 manifest 注释声明「移除经 pane/list 交互完成」"
-if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+# 避免 heredoc-in-if（shfmt 3.10 与 3.14 对该构造的 `; then` 归位不一致）：
+# 先捕获到变量，再用 [[ ]] 判定，格式在两种 shfmt 版本下都唯一。
+remove_comment_ok="no"
+set +o errexit
+remove_comment_out="$(
+  python3 - "${MANIFEST}" <<'PY' 2>/dev/null
 import sys, re
 src = open(sys.argv[1], encoding="utf-8").read()
 # 取 remove action 声明块之前的注释段（含 id 行）
 m = re.search(r'((?:^#.*\n)+)\[\[actions\]\]\s*\nid = "remove"', src, re.M)
-if not m:
-    sys.exit(1)
-body = m.group(1)
-sys.exit(0 if ("pane" in body and "移除" in body) else 1)
+if m and "pane" in m.group(1) and "移除" in m.group(1):
+    print("ok")
 PY
-then
-  t_pass "注释说明了 pane/list 交互路径"
-else
-  t_fail_note "remove action 块前缺少「移除经 pane/list 交互完成」注释"
+)"
+set -o errexit
+if [[ "${remove_comment_out}" == "ok" ]]; then
+  remove_comment_ok="yes"
 fi
+t_eq "yes" "${remove_comment_ok}" "remove action 块前声明了 pane/list 交互路径"
 
 t_done
