@@ -33,20 +33,34 @@ state_dir() {
 # log <level:debug|info|warn|error> <msg...>
 #   写 $HERDR_PLUGIN_STATE_DIR/logs/forward.log；env 缺失退 /dev/stderr。
 #   warn/error 额外镜像到 stderr（用户/CI 可见）。永不因日志失败而中断调用方。
+#   review M2：原实现每次调用 fork `date`+`mkdir`+`wc`+`tail`（500 条 ~2.8s）。
+#   现改为纯 builtin：EPOCHSECONDS + `printf %(%…Z)T` 生成 UTC 时间戳；
+#   目录创建用进程内标志去重；轮转阈值用有界 read 取字节数（无 fork）。
+_log_dir_ready="" # 进程内缓存：日志目录已确保存在（每次调用免 fork mkdir）
 log() {
   local level="${1:-info}"
   shift || true
   local msg="$*"
+
   local ts=""
-  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  # TZ=UTC0 只作用于本条 printf（bash 普通 builtin 的临时环境赋值不泄漏）；
+  # EPOCHSECONDS 缺失时回退 -1（printf 语义：取当前时间），故无 date fork。
+  TZ=UTC0 printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' "${EPOCHSECONDS:--1}"
   local line="[${ts}] ${level}: ${msg}"
 
   if [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
     local logdir="${HERDR_PLUGIN_STATE_DIR}/logs"
     local logfile="${logdir}/forward.log"
-    mkdir -p "${logdir}" 2>/dev/null || true
+    if [[ -z "${_log_dir_ready}" || ! -d "${logdir}" ]]; then
+      mkdir -p "${logdir}" 2>/dev/null || true
+      _log_dir_ready=1
+    fi
     _log_rotate "${logfile}"
-    printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null || printf '%s\n' "${line}" >&2
+    if ! printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null; then
+      # 目录被外部删掉等异常：重建一次再重试，仍失败则退 stderr（永不中断调用方）
+      mkdir -p "${logdir}" 2>/dev/null || true
+      printf '%s\n' "${line}" >>"${logfile}" 2>/dev/null || printf '%s\n' "${line}" >&2
+    fi
   else
     printf '%s\n' "${line}" >&2
   fi
@@ -57,17 +71,17 @@ log() {
 }
 
 # _log_rotate <logfile>：>FORWARD_LOG_MAX_BYTES 时保留最后 FORWARD_LOG_KEEP_BYTES 字节
+#   review M2：用有界 read（最多读 MAX+1 字节，以字节计）+ builtin 子串切片，
+#   取代 `wc -c`/`tail -c` 两个 fork。恒定内存/时间上界，大文件也不拖慢调用方。
 _log_rotate() {
   local logfile="${1-}"
   [[ -f "${logfile}" ]] || return 0
-  local size=0
-  size="$(wc -c <"${logfile}" 2>/dev/null || printf '0')"
-  size="${size// /}"
-  [[ "${size}" =~ ^[0-9]+$ ]] || return 0
-  ((size > FORWARD_LOG_MAX_BYTES)) || return 0
-  local keep=""
-  keep="$(tail -c "${FORWARD_LOG_KEEP_BYTES}" "${logfile}" 2>/dev/null || true)"
-  printf '%s\n' "${keep}" >"${logfile}" 2>/dev/null || true
+  local LC_ALL=C # 使 ${#var} / ${var: -n} 按字节而非字符计数（与 wc -c 语义一致）
+  local data=""
+  IFS= read -r -N $((FORWARD_LOG_MAX_BYTES + 1)) -d "" data <"${logfile}" 2>/dev/null || true
+  [[ "${#data}" =~ ^[0-9]+$ ]] || return 0
+  ((${#data} > FORWARD_LOG_MAX_BYTES)) || return 0
+  printf '%s\n' "${data: -FORWARD_LOG_KEEP_BYTES}" >"${logfile}" 2>/dev/null || true
 }
 
 # die <exit_code> <msg...>：log error + exit；用户可见错误必须含下一步建议
