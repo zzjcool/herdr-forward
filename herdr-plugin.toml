@@ -31,10 +31,13 @@ id = "list"
 title = "Port Forward: List"
 command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" list']
 
+# remove：一期没有 `--pick` 交互实现（`forward remove --pick` 返回 exit 9），直接把它写成
+# action 会是用户可见的「死按钮」。移除经 Port Forward 面板（pane/list）交互完成，故与 add
+# 共用同一条 pane open 路径（打开 ports pane，用户在里面选中后按提示 remove <id>）。
 [[actions]]
 id = "remove"
 title = "Port Forward: Remove…"
-command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" remove --pick']
+command = ["/bin/sh", "-c", 'if [ -n "${HERDR_BIN_PATH:-}" ] && command -v "$HERDR_BIN_PATH" >/dev/null 2>&1; then exec "$HERDR_BIN_PATH" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup; else exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" list; fi']
 
 [[actions]]
 id = "doctor"

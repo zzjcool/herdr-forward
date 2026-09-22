@@ -401,4 +401,76 @@ else
   t_fail_note "有 command 直接写死 bin/forward 路径，未经 \$HERDR_PLUGIN_ROOT"
 fi
 
+# --- M1（review minor）：remove action 不得指向一期未实现的 --pick（用户可见死按钮） ---
+t_describe "M1: remove action 是一期可达路径，不复用未实现的 --pick"
+
+manifest_remove_cmd="$(
+  python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+for a in doc.get("actions", []):
+    if a.get("id") == "remove":
+        print(" ".join(a.get("command", [])))
+        break
+PY
+)"
+manifest_add_cmd="$(
+  python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+for a in doc.get("actions", []):
+    if a.get("id") == "add":
+        print(" ".join(a.get("command", [])))
+        break
+PY
+)"
+
+t_it "remove action 已声明且非空"
+if [[ -n "${manifest_remove_cmd}" ]]; then
+  t_pass "remove command: ${manifest_remove_cmd:0:80}..."
+else
+  t_fail_note "manifest 未声明 remove action 或 command 为空"
+fi
+
+t_it "remove action 不再调用 forward remove --pick（一期 dead button）"
+if [[ "${manifest_remove_cmd}" == *"remove --pick"* || "${manifest_remove_cmd}" == *"remove' '--pick"* ]]; then
+  t_fail_note "remove action 指向一期未实现的 --pick（应改为打开 ports pane）"
+else
+  t_pass "未指向 --pick"
+fi
+
+t_it "remove action 走 pane open 路径（同 add）以在面板内完成交互式移除"
+if [[ "${manifest_remove_cmd}" == *"plugin pane open"* && "${manifest_remove_cmd}" == *"--entrypoint ports"* ]]; then
+  t_pass "remove 打开 ports pane"
+else
+  t_fail_note "remove action 必须打开 ports pane（plugin pane open --entrypoint ports）"
+fi
+
+t_it "add 与 remove 复用同一 pane open 路径（--plugin/--entrypoint/--placement 一致）"
+pane_substr='plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup'
+if [[ "${manifest_add_cmd}" == *"${pane_substr}"* && "${manifest_remove_cmd}" == *"${pane_substr}"* ]]; then
+  t_pass "add/remove 的 pane open 片段一致"
+else
+  t_fail_note "add/remove 的 pane open 路径不一致（add=[${manifest_add_cmd:0:60}] remove=[${manifest_remove_cmd:0:60}]）"
+fi
+
+t_it "remove action 的 manifest 注释声明「移除经 pane/list 交互完成」"
+if python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, re
+src = open(sys.argv[1], encoding="utf-8").read()
+# 取 remove action 声明块之前的注释段（含 id 行）
+m = re.search(r'((?:^#.*\n)+)\[\[actions\]\]\s*\nid = "remove"', src, re.M)
+if not m:
+    sys.exit(1)
+body = m.group(1)
+sys.exit(0 if ("pane" in body and "移除" in body) else 1)
+PY
+then
+  t_pass "注释说明了 pane/list 交互路径"
+else
+  t_fail_note "remove action 块前缺少「移除经 pane/list 交互完成」注释"
+fi
+
 t_done
