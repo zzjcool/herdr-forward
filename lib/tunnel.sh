@@ -111,6 +111,8 @@ tunnel_parse_ssh_target() {
   elif [[ ${target} =~ ^(.*):([0-9]+)$ ]]; then
     dest="${BASH_REMATCH[1]}"
     port="${BASH_REMATCH[2]}"
+  elif [[ ${target} == *: ]]; then
+    dest="${target%:}"
   fi
   printf '%s\n' "${port}" "${dest}"
 }

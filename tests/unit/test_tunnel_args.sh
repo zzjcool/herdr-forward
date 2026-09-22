@@ -144,6 +144,10 @@ t_it "no user, no port"
 t2_lines tunnel_parse_ssh_target 'host.local'
 t_eq "22" "${T2_LINES[0]}" "default port"
 t_eq "host.local" "${T2_LINES[1]}" "bare host destination"
+t_it "trailing colon with no port digits is stripped (malformed but tolerated)"
+t2_lines tunnel_parse_ssh_target 'user@host:'
+t_eq "22" "${T2_LINES[0]}" "default port"
+t_eq "user@host" "${T2_LINES[1]}" "destination has no dangling colon"
 
 t_describe "tunnel_ssh_args (A.3 frozen option set)"
 t_it "assembles -N -L then the frozen -o set, -F /dev/null, -p, destination"
