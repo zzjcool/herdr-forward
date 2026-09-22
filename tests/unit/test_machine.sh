@@ -77,7 +77,7 @@ t2_run() {
   out_file="$(mktemp)"
   err_file="$(mktemp)"
   set +e
-  "$@" >"${out_file}" 2>"${err_file}"
+  ("$@") >"${out_file}" 2>"${err_file}"
   T2_RC=$?
   set -e
   T2_OUT="$(<"${out_file}")"
@@ -90,7 +90,6 @@ t2_run() {
 # ---------------------------------------------------------------------------
 T2_TMP="$(mktemp -d "${TMPDIR:-/tmp}/t2-machine.XXXXXX")"
 trap 'rm -rf "${T2_TMP}"' EXIT
-export HERDR_PLUGIN_STATE_DIR="${T2_TMP}/state"
 export HERDR_PLUGIN_CONFIG_DIR="${T2_TMP}/config"
 mkdir -p "${HERDR_PLUGIN_CONFIG_DIR}"
 
