@@ -37,6 +37,17 @@ run_bootstrap() {
 
 md5() { md5sum "$1" | awk '{print $1}'; }
 
+# backup_md5 <path>：备份文件的 md5；**文件缺失时输出空串且不报错**。
+# 存在的意义：红态（安装器还没实现升级）下备份不会产生，此时测试必须能继续跑完
+# 并如实报告后续断言，而不是被 set -e + md5sum(1) 的非零退出直接打断。
+backup_md5() {
+  if [[ -f "${1-}" ]]; then
+    md5sum "$1" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
 # sh_squote / expected_cmd / cmd_part / state_dir_of / exe_path_of：与
 # tests/unit/test_install_tabbar.sh 同构（防漂移靠这里的显式断言，而非共享 helper）。
 sh_squote() {
@@ -432,7 +443,7 @@ noenv_now="$(tabbar_command "${configNoEnv}")"
 t_eq "${expectedNoEnv}" "${noenv_now}" "command 升级为 env 前缀形态（重跑即修）"
 noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env-legacy.toml.bak.*' -print -quit)"
 t_file_exists "${noenv_bak}"
-noenv_bak_md5="$(md5 "${noenv_bak}")"
+noenv_bak_md5="$(backup_md5 "${noenv_bak}")"
 t_eq "${noenv_before}" "${noenv_bak_md5}" "备份 = 升级前内容"
 run_bootstrap --config "${configNoEnv}" --no-keys
 t_exit_ok 0 "${rc}" "再跑退出 0"

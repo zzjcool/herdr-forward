@@ -94,6 +94,17 @@ run_installer() {
 # md5 <path> -> 内容散列
 md5() { md5sum "$1" | awk '{print $1}'; }
 
+# backup_md5 <path>：备份文件的 md5；**文件缺失时输出空串且不报错**。
+# 存在的意义：红态（安装器还没实现升级）下备份不会产生，此时测试必须能继续跑完
+# 并如实报告后续断言，而不是被 set -e + md5sum(1) 的非零退出直接打断。
+backup_md5() {
+  if [[ -f "${1-}" ]]; then
+    md5sum "$1" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
 # count_entries <toml_path> -> tab_bar_right 条目数（解析失败记 0）
 count_entries() {
   python3 - "$1" <<'PY'
@@ -650,7 +661,7 @@ ne_timeout="$(entry_field "${configNoEnv}" timeout_seconds)"
 t_eq "4" "${ne_timeout}" "保留用户改过的 timeout_seconds"
 noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env.toml.bak.*' -print -quit)"
 t_file_exists "${noenv_bak}"
-ne_bak_md5="$(md5 "${noenv_bak}")"
+ne_bak_md5="$(backup_md5 "${noenv_bak}")"
 t_eq "${noenv_before}" "${ne_bak_md5}" "备份 = 升级前内容"
 # 再跑：幂等
 run_installer "${configNoEnv}"

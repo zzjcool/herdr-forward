@@ -48,6 +48,17 @@ run_hook() {
 
 md5() { md5sum "$1" | awk '{print $1}'; }
 
+# backup_md5 <path>：备份文件的 md5；**文件缺失时输出空串且不报错**。
+# 存在的意义：红态（安装器还没实现升级）下备份不会产生，此时测试必须能继续跑完
+# 并如实报告后续断言，而不是被 set -e + md5sum(1) 的非零退出直接打断。
+backup_md5() {
+  if [[ -f "${1-}" ]]; then
+    md5sum "$1" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
 # sh_squote / expected_cmd / cmd_part：与 tests/unit/test_install_tabbar.sh 同构。
 # 生成形态：env HERDR_PLUGIN_STATE_DIR='<state>' "<root>/bin/forward" list --oneline
 sh_squote() {
@@ -225,7 +236,7 @@ noenv_interval="$(entry_field_of "${configNoEnvF}" interval_seconds)"
 t_eq "6" "${noenv_interval}" "保留用户改过的 interval_seconds"
 noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env-hook.toml.bak.*' -print -quit)"
 t_file_exists "${noenv_bak}"
-noenv_bak_md5="$(md5 "${noenv_bak}")"
+noenv_bak_md5="$(backup_md5 "${noenv_bak}")"
 t_eq "${noenv_before}" "${noenv_bak_md5}" "备份 = 升级前内容"
 run_hook --config "${configNoEnvF}"
 t_exit_ok 0 "${rc}" "再跑退出 0"
