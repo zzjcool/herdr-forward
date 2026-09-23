@@ -16,9 +16,10 @@
 #   A 上的任何进程都无法*本地*枚举 B 的插件安装状态（herdr socket API 没有 machine/plugin
 #   枚举，插件也不跨机执行）。但 A attach B 走的就是 **SSH** —— 所以当用户给出
 #   `--server-host <ssh target>` 时，本脚本会**通过 ssh 真实探测 B**（timeout 15，
-#   BatchMode 只读）：探到插件 → 自动推导 B 的插件根 + state 目录（用户连 --server-root
-#   都不用传）；没探到 → 把可直接复制的安装命令递到手上（**不自动装**，尊重用户）；
-#   探测失败（连不上/没权限）→ 降级成本机尽力探测 + 手工 checklist，绝不阻塞安装。
+#   BatchMode 只读，`ssh -n`）：探到插件 → 自动推导 B 的插件根 + state 目录（用户连
+#   --server-root 都不用传）；没探到 → 把可直接复制的安装命令递到手上（**不自动装**，
+#   尊重用户）；探测失败（连不上/没权限）→ 降级成本机尽力探测 + 手工 checklist，
+#   绝不阻塞安装。
 #   不传 --server-host 时行为不变（本机尽力探测 + checklist，向后兼容）。
 #
 # 用法（A 上，无需 A 安装插件）：
@@ -175,7 +176,9 @@ ssh_probe() {
   if [[ -n "${SSH_TIMER_BIN}" ]]; then
     cmd+=("${SSH_TIMER_BIN}" "${SSH_PROBE_TIMEOUT}")
   fi
-  cmd+=(ssh -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}")
+  # `-n`：ssh 会读 stdin，而 `curl … | bash -s` 形态下 stdin 就是**脚本本体** ——
+  # 不加 -n 时 ssh 会把还没执行的剩余脚本读走，脚本静默半途而废（exit 0，配置没写）。
+  cmd+=(ssh -n -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}")
   if [[ -n "${ssh_port}" ]]; then
     cmd+=(-p "${ssh_port}")
   fi
@@ -186,7 +189,8 @@ ssh_probe() {
 }
 
 # --- ssh 探测 B（仅当给了 --server-host）：只读、超时、失败降级，绝不阻塞安装 ---
-# 每次探测都是 `timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`
+# 每次探测都是 `timeout 15 ssh -n -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`
+# （`-n` 必需：curl|bash -s 时 stdin 是脚本本体，ssh 不读它就等于吃掉剩余脚本）
 # （本机没有 `timeout` 时至少仍有 ConnectTimeout=8 兜底建连阶段；不静默降级）。
 readonly SSH_PROBE_TIMEOUT=15
 readonly SSH_CONNECT_TIMEOUT=8

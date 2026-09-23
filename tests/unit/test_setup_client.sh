@@ -481,6 +481,13 @@ for a in "$@"; do printf ' <%s>' "$a" >>"${SSH_SHIM_LOG}"; done
 printf '\n' >>"${SSH_SHIM_LOG}"
 cmd=""
 for a in "$@"; do cmd="$a"; done
+# 真 ssh 会读 stdin —— `curl … | bash -s` 形态下这是**脚本本体**，会被吃掉！
+# 这里按需复现该行为（只在专门用例里开，避免在普通用例中阻塞在测试自身的 stdin 上）。
+shim_has_n=0
+for a in "$@"; do [[ "$a" == "-n" ]] && shim_has_n=1; done
+if [[ "${SSH_SHIM_DRAIN_STDIN:-0}" == "1" && "${shim_has_n}" == "0" ]]; then
+  cat >/dev/null 2>&1 || true
+fi
 scenario="${SSH_SHIM_SCENARIO:-installed}"
 if [[ "${scenario}" == "unreachable" ]]; then
   printf 'ssh: connect to host %s port 22: Connection refused\n' "${SSH_SHIM_HOST:-fake-host}" >&2
@@ -667,6 +674,34 @@ t_match "ssh|探测" "${err}" "stderr 说明 ssh 探测失败"
 t_it "--server-host 为空值：退出 2（参数校验）"
 run_setup_shim installed --config "${WORK}/ssh-empty.toml" --server-host ""
 t_isnt "0" "${rc}" "空值被拒"
+
+t_describe "setup-client.sh — 真 stdin 形态（curl|bash -s）+ ssh 探测（回归：ssh 不得吃掉脚本）"
+
+t_it "stdin 形态 + --server-host（shim 模拟 ssh 读 stdin）：脚本必须跑完，配置必须装上"
+stdin_cfg="${WORK}/stdin-ssh.toml"
+new_config "${stdin_cfg}" >/dev/null
+: >"${SSH_SHIM_LOG}"
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR \
+  "HOME=${WORK}/home" "XDG_CONFIG_HOME=${WORK}/xdg-config" "XDG_STATE_HOME=${WORK}/xdg-state" \
+  "PATH=${SSH_SHIM_DIR}:${BASE_PATH}" "SSH_SHIM_LOG=${SSH_SHIM_LOG}" \
+  "SSH_SHIM_SCENARIO=installed" "SSH_SHIM_DRAIN_STDIN=1" \
+  "HF_RAW_BASE=file://${ROOT}/scripts" \
+  bash -s -- --config "${stdin_cfg}" --server-host b-user@b-host <"${SETUP}" 2>"${WORK}/stderr")" || rc=$?
+err="$(cat "${WORK}/stderr")"
+t_exit_ok 0 "${rc}" "退出 0"
+if [[ "${err}" == *"unbound variable"* ]]; then
+  t_fail_note "崩溃：unbound variable"
+else
+  t_pass "无 unbound variable"
+fi
+stdin_keys="$(keys_count "${stdin_cfg}")"
+t_eq "3" "${stdin_keys}" "脚本跑到底（3 条键位都装上）——未被 ssh 吃掉剩余脚本"
+stdin_tb="$(tabbar_count "${stdin_cfg}")"
+t_eq "1" "${stdin_tb}" "tab bar 也装上（探测后的自动推导路径走通）"
+t_contains "✅" "${out}" "仍打印 ssh 探测结论（探测之后还有输出）"
+shim_calls_stdin="$(cat "${SSH_SHIM_LOG}")"
+t_contains "<-n>" "${shim_calls_stdin}" "ssh 用 -n（不读脚本本身）"
 
 t_describe "setup-client.sh — 静态检查与文档防漂移"
 

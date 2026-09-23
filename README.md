@@ -92,7 +92,9 @@ oversight. In that case:
   `<B 的 ssh target>` is what you would pass to `ssh`, e.g. `me@b-host` or
   `me@b-host:2222`. That is the whole command — the plugin root and the state
   directory are derived from B over SSH. The probe is read-only
-  (`timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8`), and:
+  (`timeout 15 ssh -n -o BatchMode=yes -o ConnectTimeout=8` — `-n` matters because
+  in the `curl … | bash -s` form the script itself arrives on stdin and `ssh` would
+  otherwise swallow the rest of it), and:
 
   - **B has the plugin** → ✅ plus B's real `plugin_root` and state dir, which
     are then used for A's config automatically (`--server-root` /
