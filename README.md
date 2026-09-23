@@ -80,48 +80,73 @@ process on B cannot reach A's filesystem — a physical boundary, not an
 oversight. In that case:
 
 - On B (the server), the startup hook only logs a hint; nothing is written to A.
-- On **A**, run the one-shot client setup — no plugin install needed on A, just
-  the two config entries (the keybindings invoke the plugin that lives on B, and
-  the tab-bar command is executed by herdr on B):
+- On **A**, run the one-shot client setup. A attaches to B *over SSH*, so the
+  installer can use that same channel to probe B for real — you do not even need
+  to look up B's paths:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/zzjcool/herdr-forward/main/scripts/setup-client.sh \
-    | bash -s -- --server-root <B 的插件根>
+    | bash -s -- --server-host <B 的 ssh target>
   ```
 
-  (Prefer a local copy? `git clone` the repo and run the same script from the
+  `<B 的 ssh target>` is what you would pass to `ssh`, e.g. `me@b-host` or
+  `me@b-host:2222`. That is the whole command — the plugin root and the state
+  directory are derived from B over SSH. The probe is read-only
+  (`timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8`), and:
+
+  - **B has the plugin** → ✅ plus B's real `plugin_root` and state dir, which
+    are then used for A's config automatically (`--server-root` /
+    `--server-state-dir` are not needed). B's state dir is taken from B (its
+    `$XDG_STATE_HOME`/`$HOME`), *not* derived from A's home — that is what keeps
+    the tab bar reading the same `forwards.json` your panel writes.
+  - **B does not have the plugin** → prints the command to run, and does not run
+    it for you (we will not install software on your server behind your back):
+    `ssh <B 的 ssh target> 'herdr plugin install zzjcool/herdr-forward --yes'`.
+    Install it there, then re-run this command. If tab-bar setup cannot continue
+    without the root, the installer exits 2 *after* printing that command.
+  - **Cannot reach B** (no passwordless SSH, wrong host/port, `herdr` not on the
+    non-interactive `PATH`) → degrades to the local best-effort probe plus the
+    hand checklist below, prints the reason, and still installs whatever it can
+    from the arguments you did pass. A failed probe never blocks the install.
+
+  Prefer a local copy? `git clone` the repo and run the same script from the
   checkout — it then uses the installers sitting next to it and needs no network:
 
   ```sh
   git clone https://github.com/zzjcool/herdr-forward
+  ./herdr-forward/scripts/setup-client.sh --server-host <B 的 ssh target>
+  ```
+
+  Omitting `--server-host` keeps the old behaviour: no SSH probing, you pass
+  `--server-root` yourself and the script prints the checklist to confirm by hand:
+
+  ```sh
   ./herdr-forward/scripts/setup-client.sh --server-root <B 的插件根>
   ```
 
-  )
-
   `<B 的插件根>` is the path to this plugin's checkout on the **server (B)** —
   find it with `herdr plugin list` on B, or read `plugin_root` in B's
-  `~/.config/herdr/plugins.json`. The script:
+  `~/.config/herdr/plugins.json`. Either way the script:
 
   - validates the arguments, then calls `install-tabbar.sh` (writing B's plugin
     root + B's state dir into A's `tab_bar_right` command) and `install-keys.sh`
     (the three `[[keys.command]]` plugin-action bindings); both are idempotent and
     back up A's config first,
-  - derives B's state dir from the `id` in B's `herdr-plugin.toml` when you omit
-    `--server-state-dir` (override with `--server-state-dir <B 的 state 目录>`; it
-    defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward`
+  - derives B's state dir from the `id` in B's `herdr-plugin.toml` when it cannot
+    probe B and you omit `--server-state-dir` (override with
+    `--server-state-dir <B 的 state 目录>`; it defaults to
+    `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward`
     *on B*),
-  - prints the reload hint plus a **B-side checklist** — whether B has the plugin,
-    whether `jq`/`ssh` exist there, whether A→B is passwordless. None of that can
-    be probed from A (herdr's socket API exposes no machine/plugin enumeration and
-    plugins never run cross-machine), so it is a checklist to confirm by hand. A
-    best-effort local probe prints ✅ when this machine *does* have the plugin
-    installed; a failed probe never fails the script.
+  - prints the reload hint plus a **B-side checklist** — whether B has `jq`/`ssh`
+    and whether A→B is passwordless. Without `--server-host` nothing can be probed
+    from A (herdr's socket API exposes no machine/plugin enumeration and plugins
+    never run cross-machine), so it is a checklist to confirm by hand; with
+    `--server-host` the plugin question is answered for real over SSH.
 
   Options: `--config PATH` (A's config, default
   `$XDG_CONFIG_HOME/herdr/config.toml` → `~/.config/herdr/config.toml`),
-  `--server-root PATH`, `--server-state-dir PATH`, `--no-keys`, `--no-tabbar`,
-  `--dry-run`.
+  `--server-host TARGET` (`user@host[:port]`), `--server-root PATH`,
+  `--server-state-dir PATH`, `--no-keys`, `--no-tabbar`, `--dry-run`.
 
   Press `prefix+q` (or `herdr server reload-config`) on A afterwards to apply it.
 
@@ -206,7 +231,7 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 | `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--command CMD`, `--dry-run` |
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
 | `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
-| `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A | `--config PATH`, `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
+| `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A | `--config PATH`, `--server-host TARGET` (SSH probe of B: auto-derives B's root/state dir), `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
 | `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
