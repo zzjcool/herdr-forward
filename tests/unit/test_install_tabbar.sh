@@ -126,6 +126,38 @@ print("ok")
 PY
 }
 
+# command_of <toml_path> -> 第一条 tab_bar_right 条目的 command 字符串（失败时输出空串）
+command_of() {
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    print(doc["ui"]["tab_bar_right"][0]["command"])
+except Exception:
+    print("")
+PY
+}
+
+# entry_field <toml_path> <field> -> 第一条目的某个字段（失败时输出空串）
+entry_field() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    print(doc["ui"]["tab_bar_right"][0][sys.argv[2]])
+except Exception:
+    print("")
+PY
+}
+
+# exe_path_of <command 字符串> -> 取双引号内的可执行文件路径
+exe_path_of() {
+  local c="${1#\"}"
+  printf '%s\n' "${c%%\"*}"
+}
+
 # check_ui_preserved <toml_path> -> 打印 ok/bad
 check_ui_preserved() {
   python3 - "$1" <<'PY'
@@ -147,7 +179,10 @@ count_ui_segments() {
   grep -c '^\[ui\]' "$1" 2>/dev/null || true
 }
 
-marker_lines() { grep -c 'herdr-forward' "$1" 2>/dev/null || true; }
+# marker_lines <toml> -> 本插件的标记注释行数
+# 不能用子串 'herdr-forward' 计数：command 里的绝对路径（插件根）本身可能
+# 包含 'herdr-forward'（详见 README 的 checkout 目录名）。只匹配标记注释本身。
+marker_lines() { grep -c '^[[:space:]]*# herdr-forward: tab bar status entry' "$1" 2>/dev/null || true; }
 
 t_describe "install-tabbar.sh"
 
@@ -325,28 +360,136 @@ else
   t_fail_note "dry-run 输出不是合法 TOML"
 fi
 
-t_it "生成的 command 可在 /bin/sh -lc 下执行并返回 oneline（SCOUT-FACTS §2.4）"
+t_it "生成的 command 可在 env -i 的 /bin/sh -lc 下真实执行（无任何 env 依赖）"
+# tab_bar_right 的 command 由 herdr 直接经 /bin/sh -lc 执行，env 里 **没有**
+# HERDR_PLUGIN_ROOT（该 env 只在插件 action/pane/startup 命令里注入，SCOUT-FACTS §2.2
+# 被误用到了 tab bar 场景；§2.4 才是 tab bar 的正确事实）。因此 command 必须是绝对路径。
 plug="${WORK}/plug"
 mkdir -p "${plug}/bin"
 cat >"${plug}/bin/forward" <<'SH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/sh
 printf '⇅3000⇅5173\n'
 SH
 chmod +x "${plug}/bin/forward"
 config10="${WORK}/shc.toml"
 printf 'theme = "dark"\n' >"${config10}"
-run_installer "${config10}"
+run_installer "${config10}" --plugin-root "${plug}"
+t_exit_ok 0 "${rc}" "退出 0（--plugin-root 覆盖）"
+cmd="$(command_of "${config10}")"
+sh_out="$(env -i /bin/sh -lc "${cmd}" | tail -1)"
+t_eq "⇅3000⇅5173" "${sh_out}" "env -i /bin/sh -lc 执行并取最后一行"
+
+t_it "回归锚点：旧格式（\$HERDR_PLUGIN_ROOT 字面量）在 env -i 下确实失败"
+# shellcheck disable=SC2016  # 单引号内就是要保留的字面量，正是待复现的 bug 形态
+old_cmd='"$HERDR_PLUGIN_ROOT/bin/forward" list --oneline'
+old_rc=0
+set +o errexit
+env -i /bin/sh -c "${old_cmd}" >/dev/null 2>&1
+old_rc=$?
+set -o errexit
+if [[ "${old_rc}" -ne 0 ]]; then
+  t_pass "旧 command 在干净 env 下非 0（rc=${old_rc}）：证明必须改为绝对路径"
+else
+  t_fail_note "旧 command 竟然执行成功——本测试的前提事实需要重新核实"
+fi
+
+t_describe "install-tabbar.sh（tab bar command = server 上的绝对路径）"
+
+ROOT_PHYS="$(cd -P "${ROOT}" && pwd)"
+
+t_it "默认 command 是本检出的**绝对**路径，且不含 \$HERDR_PLUGIN_ROOT 字面量"
+configA="${WORK}/abs.toml"
+printf 'theme = "dark"\n' >"${configA}"
+run_installer "${configA}"
 t_exit_ok 0 "${rc}" "退出 0"
-cmd="$(
-  python3 - "${config10}" <<'PY'
-import sys, tomllib
-with open(sys.argv[1], "rb") as fh:
-    doc = tomllib.load(fh)
-print(doc["ui"]["tab_bar_right"][0]["command"])
-PY
-)"
-sh_out="$(HERDR_PLUGIN_ROOT="${plug}" /bin/sh -lc "${cmd}" | tail -1)"
-t_eq "⇅3000⇅5173" "${sh_out}" "/bin/sh -lc 执行并取最后一行"
+cmdA="$(command_of "${configA}")"
+t_match '^"[^"]+/bin/forward" list --oneline$' "${cmdA}" "command 形状 = \"<abs>/bin/forward\" list --oneline"
+# 只在字符串模式下匹配字面量，不用 *'$HERDR_PLUGIN_ROOT'* 模式（后者触发 SC2016 提示）
+if [[ "${cmdA}" == *"\$HERDR_PLUGIN_ROOT"* ]]; then
+  t_fail_note "command 仍含 \$HERDR_PLUGIN_ROOT 字面量：${cmdA}"
+else
+  t_pass "command 不含 \$HERDR_PLUGIN_ROOT 字面量"
+fi
+exe_path="$(exe_path_of "${cmdA}")"
+t_eq "${ROOT_PHYS}/bin/forward" "${exe_path}" "默认解析到本检出的 bin/forward（物理路径）"
+if [[ -x "${exe_path}" ]]; then t_pass "该路径可执行"; else t_fail_note "该路径不可执行：${exe_path}"; fi
+
+t_it "--plugin-root 覆盖：写入给定绝对路径（跨机时 = server B 上的路径，A 上可不存在）"
+configB="${WORK}/cross.toml"
+printf 'theme = "dark"\n' >"${configB}"
+run_installer "${configB}" --plugin-root "/opt/on-server-b/herdr-forward"
+t_exit_ok 0 "${rc}" "退出 0（路径在本机不存在也不报错）"
+cmdB="$(command_of "${configB}")"
+t_eq '"/opt/on-server-b/herdr-forward/bin/forward" list --oneline' "${cmdB}" "command 用 B 上的绝对路径"
+
+if [[ -e "/opt/on-server-b/herdr-forward" ]]; then
+  t_skip "本机恰好存在 /opt/on-server-b/herdr-forward，跳过「不存在也接受」断言"
+else
+  t_pass "跨机路径（本机不存在）被原样写入"
+fi
+
+t_it "--plugin-root 相对路径 → 非 0（command 在 server 的 shell 里执行，相对路径不可靠）"
+configC="${WORK}/rel.toml"
+printf 'theme = "dark"\n' >"${configC}"
+run_installer "${configC}" --plugin-root "relative/plugin"
+if [[ "${rc}" -ne 0 ]]; then t_pass "相对路径被拒绝（rc=${rc}）"; else t_fail_note "相对路径被静默接受"; fi
+if [[ -n "${err}" ]]; then t_pass "错误信息走 stderr"; else t_fail_note "无错误信息"; fi
+# 先取值再断言（避免 SC2312：命令替换的退出码被 t_eq 调用掩盖）
+cC_after="$(cat "${configC}")"
+t_eq "theme = \"dark\"" "${cC_after}" "被拒绝时原文件未改"
+
+t_it "--help 提到 --plugin-root"
+rc=0
+out="$(bash "${INSTALLER}" --help 2>/dev/null)" || rc=$?
+t_exit_ok 0 "${rc}" "--help 退出 0"
+t_match "plugin-root" "${out}" "--help 提到 --plugin-root"
+
+t_it "幂等升级：旧格式（\$HERDR_PLUGIN_ROOT 字面量）自动替换为绝对路径 + 备份"
+configL="${WORK}/legacy.toml"
+cat >"${configL}" <<'EOF'
+theme = "dark"
+
+[ui]
+tab_bar_position = "top"
+tab_bar_right = [
+  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
+  { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 7, timeout_seconds = 3 },
+]
+EOF
+legacy_before="$(md5 "${configL}")"
+run_installer "${configL}"
+t_exit_ok 0 "${rc}" "升级退出 0（不再是 no-op）"
+cmdL="$(command_of "${configL}")"
+cmdL_exe="$(exe_path_of "${cmdL}")"
+t_eq "${ROOT_PHYS}/bin/forward" "${cmdL_exe}" "升级为绝对路径"
+legacy_n="$(marker_lines "${configL}")"
+t_eq "1" "${legacy_n}" "升级后仍恰好 1 条本插件条目"
+n_entriesL="$(count_entries "${configL}")"
+t_eq "1" "${n_entriesL}" "tab_bar_right 条目数 1"
+if grep -q 'HERDR_PLUGIN_ROOT' "${configL}"; then
+  t_fail_note "升级后仍残留 \$HERDR_PLUGIN_ROOT"
+else
+  t_pass "升级后文件中不再有 \$HERDR_PLUGIN_ROOT"
+fi
+preserved_ui="$(check_ui_preserved "${configL}")"
+t_eq "ok" "${preserved_ui}" "原有 [ui] 字段（tab_bar_position）保留"
+legacy_interval="$(entry_field "${configL}" interval_seconds)"
+t_eq "7" "${legacy_interval}" "升级保留用户自定义 interval_seconds"
+legacy_timeout="$(entry_field "${configL}" timeout_seconds)"
+t_eq "3" "${legacy_timeout}" "升级保留用户自定义 timeout_seconds"
+legacy_bak="$(find "${WORK}" -maxdepth 1 -name 'legacy.toml.bak.*' -print -quit)"
+t_file_exists "${legacy_bak}"
+legacy_bak_md5="$(md5 "${legacy_bak}")"
+t_eq "${legacy_before}" "${legacy_bak_md5}" "备份内容 = 升级前的旧文件"
+
+t_it "升级后再次运行 → 幂等：不改文件、不新增备份、输出 already"
+beforeL="$(md5 "${configL}")"
+run_installer "${configL}"
+t_exit_ok 0 "${rc}" "退出 0"
+afterL="$(md5 "${configL}")"
+t_eq "${beforeL}" "${afterL}" "文件未变"
+t_match "already" "${out}" "输出含 already"
+bak_count="$(find "${WORK}" -maxdepth 1 -name 'legacy.toml.bak.*' | wc -l)"
+t_eq "1" "${bak_count}" "没有新增备份"
 
 t_done

@@ -95,7 +95,7 @@ oversight. In that case:
   [ui]
   tab_bar_right = [
     # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-    { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
+    { type = "command", command = "\"<server-plugin-root>/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
   ]
   ```
 
@@ -122,6 +122,24 @@ oversight. In that case:
   description = "Port Forward: Doctor (probe tunnels)"
   ```
 
+  **`<server-plugin-root>` is the path to this plugin's checkout on the *server*
+  (B)** — not on A. The tab-bar `command` is executed by herdr *on the server*,
+  under `/bin/sh -lc`, in an environment that does **not** contain
+  `HERDR_PLUGIN_ROOT` (that variable is only injected for plugin actions, panes
+  and startup commands). So the command must be a literal absolute path that
+  exists on B. Replace `<server-plugin-root>` by hand, or let the installer do
+  it:
+
+  ```sh
+  # on A, pointing at B's plugin checkout
+  <plugin-root>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
+    --plugin-root <server-plugin-root>
+  ```
+
+  If it is already installed with the old `$HERDR_PLUGIN_ROOT` form, just re-run
+  the command above: the installer detects the legacy entry and rewrites it in
+  place (keeping your `interval_seconds`/`timeout_seconds`).
+
 If you are already in a herdr session on the server, the same one-shot install is
 available as a plugin action (useful right after `herdr plugin link`):
 
@@ -133,14 +151,16 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 
 | Script | Adds | Notes |
 |---|---|---|
-| `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--command CMD`, `--dry-run` |
+| `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--command CMD`, `--dry-run` |
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
-| `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
+| `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
 | `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
-the original to `config.toml.bak.<epoch>` before any real change. When installed
-from GitHub, use the copy inside the managed checkout:
+the original to `config.toml.bak.<epoch>` before any real change. Re-running
+`install-tabbar.sh` also upgrades a legacy entry (one whose `command` still
+contains the unexpandable `$HERDR_PLUGIN_ROOT` literal) to the absolute-path form.
+When installed from GitHub, use the copy inside the managed checkout:
 `"$HERDR_PLUGIN_ROOT/scripts/bootstrap.sh"`.
 
 #### Default keys
@@ -173,9 +193,11 @@ bin/forward doctor                            # probe tunnels, report status
 bin/forward bootstrap                         # (re)install the UI / print next steps
 ```
 
-Run it from the plugin checkout (or as `"$HERDR_PLUGIN_ROOT/bin/forward"` when
-installed from GitHub). In a herdr session the same commands are reachable as
-plugin actions — `Port Forward: Add…`, `List`, `Doctor`, and `Setup UI`
+Run it from the plugin checkout (or as `"$HERDR_PLUGIN_ROOT/bin/forward"` in a
+herdr plugin context — note that this env var is **not** set for tab-bar
+commands, which is why the installer writes an absolute path there). In a herdr
+session the same commands are reachable as plugin actions — `Port Forward:
+Add…`, `List`, `Doctor`, and `Setup UI`
 (`herdr plugin action invoke bootstrap --plugin zzjcool:forward`).
 
 ## Related work
