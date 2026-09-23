@@ -1,0 +1,43 @@
+{
+  "name": "herdr-forward",
+  "version": "0.1.0",
+  "description": "Port forwarding for herdr saved SSH machines — forward remote TCP ports to localhost (ssh -L) and optionally publish local ports to the public internet (Cloudflare quick tunnel). The herdr plugin itself installs from GitHub: herdr plugin install zzjcool/herdr-forward",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zzjcool/herdr-forward.git"
+  },
+  "homepage": "https://github.com/zzjcool/herdr-forward#readme",
+  "bugs": {
+    "url": "https://github.com/zzjcool/herdr-forward/issues"
+  },
+  "keywords": [
+    "herdr",
+    "port-forwarding",
+    "ssh",
+    "tunnel",
+    "cloudflared",
+    "cli",
+    "terminal"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/install-tabbar.sh",
+    "scripts/install-keys.sh",
+    "scripts/bootstrap.sh",
+    "scripts/startup-hook.sh",
+    "herdr-plugin.toml",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "herdr-forward": "./bin/cli.js"
+  },
+  "scripts": {
+    "postinstall": "node bin/cli.js --postinstall-hint || true"
+  }
+}
