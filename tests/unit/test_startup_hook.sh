@@ -33,9 +33,11 @@ out=""
 err=""
 
 # run_hook [args...] —— 在干净的 env 下跑 hook（默认隔离 HOME，绝不碰真实 ~/.config）
+# env -u HERDR_CONFIG_PATH：宿主若设了它，会盖过 XDG/HOME 默认，破坏「默认路径」用例
 run_hook() {
   rc=0
-  out="$(HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+  out="$(env -u HERDR_CONFIG_PATH \
+    HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
     HERDR_PLUGIN_ROOT="${ROOT}" HERDR_PLUGIN_STATE_DIR="${WORK}/state" \
     HERDR_PLUGIN_EVENT=startup \
     bash "${HOOK}" "$@" 2>"${WORK}/stderr")" || rc=$?
@@ -149,7 +151,7 @@ fi
 
 t_it "无法确定 config 路径（HOME 未设且无 XDG）→ 降级 exit 0 + 说明"
 rc=0
-out="$(env -u HOME -u XDG_CONFIG_HOME HERDR_PLUGIN_ROOT="${ROOT}" \
+out="$(env -u HOME -u XDG_CONFIG_HOME -u HERDR_CONFIG_PATH HERDR_PLUGIN_ROOT="${ROOT}" \
   HERDR_PLUGIN_STATE_DIR="${WORK}/state2" HERDR_PLUGIN_EVENT=startup \
   bash "${HOOK}" 2>"${WORK}/stderr")" || rc=$?
 err="$(cat "${WORK}/stderr")"
@@ -169,6 +171,35 @@ tb5="$(tabbar_count "${config5}")"
 t_eq "1" "${tb5}" "写的是被显式指定的文件"
 tb_def="$(tabbar_count "${DEFAULT_CONFIG}")"
 t_eq "1" "${tb_def}" "默认 config 未被再次改动（仍 1 条）"
+
+t_it "HERDR_CONFIG_PATH 优先于 XDG/HOME 默认（herdr 注入路径）"
+cfg_env="${WORK}/from-env.toml"
+printf 'theme = "dark"\n' >"${cfg_env}"
+rc=0
+out="$(env HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+  HERDR_CONFIG_PATH="${cfg_env}" HERDR_PLUGIN_ROOT="${ROOT}" \
+  HERDR_PLUGIN_STATE_DIR="${WORK}/state3" HERDR_PLUGIN_EVENT=startup \
+  bash "${HOOK}" 2>"${WORK}/stderr")" || rc=$?
+err="$(cat "${WORK}/stderr")"
+t_exit_ok 0 "${rc}" "退出 0"
+tb_env="$(tabbar_count "${cfg_env}")"
+t_eq "1" "${tb_env}" "写的是 HERDR_CONFIG_PATH 指定的文件"
+
+t_it "--config 显式参数优先于 HERDR_CONFIG_PATH"
+cfg_env2="${WORK}/env2.toml"
+cfg_exp="${WORK}/explicit2.toml"
+printf 'theme = "dark"\n' >"${cfg_env2}"
+printf 'theme = "dark"\n' >"${cfg_exp}"
+rc=0
+out="$(env HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+  HERDR_CONFIG_PATH="${cfg_env2}" HERDR_PLUGIN_ROOT="${ROOT}" \
+  HERDR_PLUGIN_STATE_DIR="${WORK}/state3" HERDR_PLUGIN_EVENT=startup \
+  bash "${HOOK}" --config "${cfg_exp}" 2>/dev/null)" || rc=$?
+t_exit_ok 0 "${rc}" "退出 0"
+explicit_tb="$(tabbar_count "${cfg_exp}")"
+env2_tb="$(tabbar_count "${cfg_env2}")"
+t_eq "1" "${explicit_tb}" "--config 指定的文件被写入"
+t_eq "0" "${env2_tb}" "HERDR_CONFIG_PATH 的文件未被触碰"
 
 t_it "输出含跨机说明（提醒 client 侧需自行 bootstrap）"
 run_hook --config "${config5}"
