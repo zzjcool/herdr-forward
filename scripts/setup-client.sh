@@ -84,11 +84,8 @@ die() {
 
 note() { printf '%s: %s\n' "${PROG_NAME}" "$*"; }
 
-# kv_get <多行文本> <KEY> -> 第一个 KEY= 的值（无则空）
-kv_get() {
-  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1 || true
-}
-
+# kv_get（多行文本 + KEY -> 值）与探测实现由 lib/ssh-probe.sh 提供（单一权威，脚本只是消费方）。
+# 见下方 load_ssh_probe_lib：checkout 形态 source 同仓库的 lib/，curl|bash 形态按需下载。
 # --- 安装器定位：优先同目录（git clone / 插件检出场景），否则按需下载（curl | bash 场景） ---
 
 # --- 参数解析（禁交互：未知参数直接报错，绝不等确认） ---
@@ -149,87 +146,98 @@ done
 if ((do_tabbar == 0 && do_keys == 0)); then
   die 2 "--no-tabbar 与 --no-keys 同时指定：没有可执行的安装步骤，请去掉其一。"
 fi
-ssh_host=""
-ssh_port=""
-SSH_TIMER_BIN=""
-if [[ -n "${server_host}" ]]; then
-  ssh_host="${server_host}"
-  if [[ "${server_host}" == *:* ]]; then
-    ssh_host="${server_host%%:*}"
-    ssh_port="${server_host#*:}"
-    if [[ ! "${ssh_port}" =~ ^[0-9]+$ ]]; then
-      die 2 "--server-host 端口非法: '${ssh_port}'（期望 user@host[:port]）"
-    fi
-    [[ -n "${ssh_host}" ]] || die 2 "--server-host 缺少主机名: '${server_host}'"
-  fi
-  if command -v timeout >/dev/null 2>&1; then
-    SSH_TIMER_BIN="timeout"
-  fi
-fi
 
-# ssh_probe <远端命令> -> 第一行 `HF_SSH_RC=<rc>`，其后是远端 stdout+stderr。恒返回 0。
-ssh_probe() {
-  local remote="$1"
-  local rc=0
-  local merged=""
-  local -a cmd=()
-  if [[ -n "${SSH_TIMER_BIN}" ]]; then
-    cmd+=("${SSH_TIMER_BIN}" "${SSH_PROBE_TIMEOUT}")
+# ⚠ `curl … | bash -s` 时脚本从 stdin 读入，`BASH_SOURCE[0]` **未定义**，
+# 在 set -u 下直接展开会 "unbound variable" 把自己打死 —— 故用 `${BASH_SOURCE[0]:-}`，
+# 空值表示 stdin 形态（此时一定走下载分支）。
+SELF_PATH="${BASH_SOURCE[0]:-}"
+SELF_DIR=""
+if [[ -n "${SELF_PATH}" ]]; then
+  SELF_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
+fi
+readonly SELF_PATH SELF_DIR
+
+# 下载暂存目录：安装器与 ssh 探测库**共用**一个，退出时统一清理（用完即弃，不落用户磁盘）。
+download_dir=""
+ensure_download_dir() {
+  if [[ -z "${download_dir}" ]]; then
+    download_dir="$(mktemp -d)"
   fi
-  # `-n`：ssh 会读 stdin，而 `curl … | bash -s` 形态下 stdin 就是**脚本本体** ——
-  # 不加 -n 时 ssh 会把还没执行的剩余脚本读走，脚本静默半途而废（exit 0，配置没写）。
-  cmd+=(ssh -n -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}")
-  if [[ -n "${ssh_port}" ]]; then
-    cmd+=(-p "${ssh_port}")
-  fi
-  cmd+=("${ssh_host}" "${remote}")
-  merged="$("${cmd[@]}" 2>&1)" || rc=$?
-  printf 'HF_SSH_RC=%d\n%s\n' "${rc}" "${merged}"
-  return 0
 }
+cleanup() {
+  if [[ -n "${download_dir}" ]]; then
+    rm -rf "${download_dir}"
+  fi
+}
+trap cleanup EXIT
 
 # --- ssh 探测 B（仅当给了 --server-host）：只读、超时、失败降级，绝不阻塞安装 ---
+# 探测策略（超时秒数）由本脚本拥有：lib/ssh-probe.sh 幂等复用同值，不覆盖调用方设定。
 # 每次探测都是 `timeout 15 ssh -n -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`
 # （`-n` 必需：curl|bash -s 时 stdin 是脚本本体，ssh 不读它就等于吃掉剩余脚本）
 # （本机没有 `timeout` 时至少仍有 ConnectTimeout=8 兜底建连阶段；不静默降级）。
 readonly SSH_PROBE_TIMEOUT=15
-readonly SSH_CONNECT_TIMEOUT=8
-# shellcheck disable=SC2016  # 单引号是有意的：$HOME/$PATH 必须由 **远端** shell 展开
-readonly REMOTE_LIST_CMD='if command -v herdr >/dev/null 2>&1; then herdr plugin list; else PATH="$HOME/.local/bin:$PATH" herdr plugin list 2>/dev/null || echo HF_NO_HERDR; fi'
-# 远端路径探测：plugins.json 的 plugin_root → 退回 plugins/github/*forward* glob →
-# state 目录按远端 HOME/XDG 推导（HF_STATE_DIR=已存在 / HF_DEFAULT_STATE=默认位置）。
-# 注意：这里是**单引号本地字符串**（整体作为一个 ssh 实参），内部一律不用 '。
-# shellcheck disable=SC2016  # 同上：整段是远端脚本，变量必须留给远端展开
-readonly REMOTE_PATHS_CMD='
-cfg="${XDG_CONFIG_HOME:-$HOME/.config}/herdr"
-root=""
-if [ -f "$cfg/plugins.json" ] && command -v python3 >/dev/null 2>&1; then
-  root=$(python3 -c "import json,sys
-try:
-    d=json.load(open(sys.argv[1], encoding=\"utf-8\"))
-except Exception:
-    raise SystemExit(0)
-for e in (d if isinstance(d, list) else []):
-    if isinstance(e, dict) and e.get(\"plugin_id\") == sys.argv[2]:
-        print(e.get(\"plugin_root\", \"\"))
-        break" "$cfg/plugins.json" zzjcool:forward 2>/dev/null) || root=""
+
+# --- 加载 ssh 探测库（ssh_probe_parse_target / ssh_probe_run / ssh_probe_plugin / kv_get） ---
+#   * checkout（git clone / 插件检出）：直接用同仓库的 lib/ssh-probe.sh，无需联网；
+#   * curl|bash：**按需**下载 —— 只有真的要探测 B（给了 --server-host）时才拉库，
+#     保证「旧用法（不传 --server-host）」不必联网、行为与提取前完全一致。
+SSH_PROBE_LIB_LOADED=0
+load_ssh_probe_lib() {
+  if ((SSH_PROBE_LIB_LOADED == 1)); then
+    return 0
+  fi
+  local lib=""
+  if [[ -n "${SELF_DIR}" && -f "${SELF_DIR}/../lib/ssh-probe.sh" ]]; then
+    lib="${SELF_DIR}/../lib/ssh-probe.sh"
+  else
+    local raw_base="${HF_RAW_BASE:-${RAW_BASE_DEFAULT}}"
+    local lib_url="${raw_base%/scripts}/lib/ssh-probe.sh"
+    if ! command -v curl >/dev/null 2>&1; then
+      die 1 "缺少依赖 'curl'（用于下载 ssh 探测库）。请安装 curl，或改用 git clone 后本地跑 scripts/setup-client.sh。"
+    fi
+    ensure_download_dir
+    lib="${download_dir}/ssh-probe.sh"
+    if ! curl -fsSL "${lib_url}" -o "${lib}" 2>/dev/null; then
+      die 1 "无法从 ${lib_url} 下载 ssh 探测库。
+   网络不可达 / URL 不对时，请改用：git clone https://github.com/zzjcool/herdr-forward && \\
+     ./herdr-forward/scripts/setup-client.sh --server-host <B 的 ssh target>
+   （本地检出会直接使用同仓库的 lib/ssh-probe.sh，不需要联网。）"
+    fi
+    [[ -s "${lib}" ]] ||
+      die 1 "下载到的 ssh-probe.sh 为空（${lib_url}）。请检查 URL 或改用 git clone 后本地跑。"
+  fi
+  # shellcheck source=../lib/ssh-probe.sh disable=SC1091
+  source "${lib}"
+  SSH_PROBE_LIB_LOADED=1
+}
+
+# --- --server-host：target 校验（用法错 -> 退出 2）并加载探测库 ---
+# 解析实现单一权威在 lib/ssh-probe.sh（支持 user@host / user@host:port / host / [v6]:port）。
+# 但**用户可见的报错文案与接受范围**必须与提取前逐字一致（回归闸门），故这里保留一层
+# 兼容前置校验：
+#   * 文案回归：`--server-host 端口非法: '<port>'` / `--server-host 缺少主机名: '<host>'`；
+#   * 范围回归：旧实现不接受方括号 IPv6（`[::1]:2222` 会被当成「端口非法」）——lib 的
+#     parse_target 额外支持方括号（供 M2 的 machines activate 用），但 setup-client.sh
+#     **有意不启用该放宽**，以免静默改变已发布 CLI 的行为。
+# 前置校验通过后目标必然是 lib 也接受的形态（两边对 user@host[:port] 的切分语义一致），
+# 故 ssh_probe_parse_target 不会失败。
+ssh_host=""
+if [[ -n "${server_host}" ]]; then
+  load_ssh_probe_lib
+  if [[ "${server_host}" == *:* ]]; then
+    legacy_port="${server_host#*:}"
+    [[ "${legacy_port}" =~ ^[0-9]+$ ]] ||
+      die 2 "--server-host 端口非法: '${legacy_port}'（期望 user@host[:port]）"
+    [[ -n "${server_host%%:*}" ]] ||
+      die 2 "--server-host 缺少主机名: '${server_host}'"
+  fi
+  parsed_target="$(ssh_probe_parse_target "${server_host}")"
+  ssh_host="${parsed_target% *}"
 fi
-if [ -z "$root" ]; then
-  for d in "$cfg"/plugins/github/*forward*; do
-    if [ -d "$d" ]; then root="$d"; fi
-  done
-fi
-if [ -n "$root" ]; then printf "HF_ROOT=%s\n" "$root"; fi
-enc="zzjcool%3Aforward"
-if [ -n "$root" ] && [ -f "$root/herdr-plugin.toml" ]; then
-  id=$(sed -n "s/^[[:space:]]*id[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$root/herdr-plugin.toml" | head -1)
-  if [ -n "$id" ]; then enc=$(printf "%s" "$id" | sed "s/:/%3A/g"); fi
-fi
-state="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$enc"
-if [ -d "$state" ]; then printf "HF_STATE_DIR=%s\n" "$state"; else printf "HF_DEFAULT_STATE=%s\n" "$state"; fi
-'
 
 # ssh 探测结果状态：skipped | present | absent | no-herdr | unreachable
+# 判定逻辑单一权威在 lib/ssh-probe.sh 的 ssh_probe_plugin（只读探测 + KV 输出，见该文件头注）。
 ssh_status="skipped"
 ssh_probe_root=""
 ssh_probe_state=""
@@ -238,26 +246,23 @@ ssh_install_hint=""
 
 if [[ -n "${server_host}" ]]; then
   ssh_install_hint="ssh ${server_host} 'herdr plugin install zzjcool/herdr-forward --yes'"
-  probe_raw="$(ssh_probe "${REMOTE_LIST_CMD}")"
-  probe_rc="$(kv_get "${probe_raw}" HF_SSH_RC)"
-  probe_body="$(printf '%s\n' "${probe_raw}" | sed '1d')"
-  if [[ "${probe_rc:-1}" != "0" ]]; then
-    ssh_status="unreachable"
-    ssh_probe_reason="$(printf '%s' "${probe_body}" | head -3 | tr '\n' ' ')"
-  elif [[ "${probe_body}" == *HF_NO_HERDR* ]]; then
-    ssh_status="no-herdr"
-    ssh_probe_reason="远端非交互 shell 里找不到 herdr（PATH 未含 ~/.local/bin？）"
-  elif printf '%s' "${probe_body}" | grep -qF "${PLUGIN_ID}"; then
-    ssh_status="present"
-    paths_raw="$(ssh_probe "${REMOTE_PATHS_CMD}")"
-    ssh_probe_root="$(kv_get "${paths_raw}" HF_ROOT)"
-    ssh_probe_state="$(kv_get "${paths_raw}" HF_STATE_DIR)"
+  ssh_probe_kv="$(ssh_probe_plugin "${server_host}" "${PLUGIN_ID}")"
+  ssh_status="$(kv_get "${ssh_probe_kv}" HF_STATUS)"
+  ssh_probe_reason="$(kv_get "${ssh_probe_kv}" HF_REASON)"
+  case "${ssh_status}" in
+  present)
+    ssh_probe_root="$(kv_get "${ssh_probe_kv}" HF_ROOT)"
+    ssh_probe_state="$(kv_get "${ssh_probe_kv}" HF_STATE_DIR)"
     if [[ -z "${ssh_probe_state}" ]]; then
-      ssh_probe_state="$(kv_get "${paths_raw}" HF_DEFAULT_STATE)"
+      ssh_probe_state="$(kv_get "${ssh_probe_kv}" HF_DEFAULT_STATE)"
     fi
-  else
-    ssh_status="absent"
-  fi
+    ;;
+  absent | no-herdr | unreachable) ;;
+  *)
+    # 库里没见过的状态（理论上不可达）：按连不上处理，降级而不是崩。
+    ssh_status="unreachable"
+    ;;
+  esac
 fi
 
 # --- 自动填入：--server-host 探测命中时，用户连 --server-root 都不用传 ---
@@ -303,24 +308,6 @@ if ((do_tabbar == 1)) && [[ -z "${server_root}" ]]; then
    只想要键绑定（不需要 server 路径）时加 --no-tabbar。"
 fi
 
-# ⚠ `curl … | bash -s` 时脚本从 stdin 读入，`BASH_SOURCE[0]` **未定义**，
-# 在 set -u 下直接展开会 "unbound variable" 把自己打死 —— 故用 `${BASH_SOURCE[0]:-}`，
-# 空值表示 stdin 形态（此时一定走下载分支）。
-SELF_PATH="${BASH_SOURCE[0]:-}"
-SELF_DIR=""
-if [[ -n "${SELF_PATH}" ]]; then
-  SELF_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
-fi
-readonly SELF_PATH SELF_DIR
-
-download_dir=""
-cleanup() {
-  if [[ -n "${download_dir}" ]]; then
-    rm -rf "${download_dir}"
-  fi
-}
-trap cleanup EXIT
-
 TABBAR_INSTALLER=""
 KEYS_INSTALLER=""
 
@@ -331,13 +318,14 @@ locate_installers() {
     return 0
   fi
 
-  # curl | bash：标准输入是脚本，同目录没有安装器 —— 按需下载两个安装器到临时目录。
+  # curl | bash：标准输入是脚本，同目录没有安装器 —— 按需下载两个安装器到临时目录
+  # （与 ssh 探测库共用 ensure_download_dir，退出时同一个 trap 清理）。
   # 用 HF_RAW_BASE 可指向镜像 / 本地目录（测试用 file://）。
   local raw_base="${HF_RAW_BASE:-${RAW_BASE_DEFAULT}}"
   if ! command -v curl >/dev/null 2>&1; then
     die 1 "缺少依赖 'curl'（用于下载安装器）。请安装 curl，或改用 git clone 后本地跑 scripts/setup-client.sh。"
   fi
-  download_dir="$(mktemp -d)"
+  ensure_download_dir
   local name=""
   for name in install-tabbar.sh install-keys.sh; do
     if ! curl -fsSL "${raw_base}/${name}" -o "${download_dir}/${name}" 2>/dev/null; then
