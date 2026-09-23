@@ -140,7 +140,7 @@ t_describe "setup-client.sh — 参数与校验"
 t_it "--help 退出 0，列出全部冻结参数"
 run_setup --help
 t_exit_ok 0 "${rc}" "退出 0"
-for flag in --config --server-root --server-state-dir --no-keys --no-tabbar; do
+for flag in --config --server-root --server-state-dir --server-host --no-keys --no-tabbar; do
   t_contains "${flag}" "${out}" "帮助含 ${flag}"
 done
 
@@ -466,6 +466,200 @@ setup_env=(
   "XDG_STATE_HOME=${WORK}/xdg-state"
 )
 
+t_describe "setup-client.sh — --server-host：ssh 真实探测（fake ssh shim，绝不真连任何主机）"
+
+# 假 ssh：只把参数写进日志，按 SSH_SHIM_SCENARIO 输出，永不联网。
+# 注入 PATH 后 setup-client.sh 里的 `ssh` 全是这个 shim —— 测试期间不可能连到真主机。
+SSH_SHIM_DIR="${WORK}/ssh-shim"
+SSH_SHIM_LOG="${WORK}/ssh-shim.log"
+mkdir -p "${SSH_SHIM_DIR}"
+cat >"${SSH_SHIM_DIR}/ssh" <<'SHIM'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'ARGV' >>"${SSH_SHIM_LOG:?}"
+for a in "$@"; do printf ' <%s>' "$a" >>"${SSH_SHIM_LOG}"; done
+printf '\n' >>"${SSH_SHIM_LOG}"
+cmd=""
+for a in "$@"; do cmd="$a"; done
+scenario="${SSH_SHIM_SCENARIO:-installed}"
+if [[ "${scenario}" == "unreachable" ]]; then
+  printf 'ssh: connect to host %s port 22: Connection refused\n' "${SSH_SHIM_HOST:-fake-host}" >&2
+  exit 255
+fi
+case "${cmd}" in
+*"plugin install"*)
+  printf 'UNEXPECTED-INSTALL\n'
+  exit 3
+  ;;
+*"plugin list"*)
+  if [[ "${scenario}" == "absent" ]]; then
+    printf 'No plugins installed.\n'
+  else
+    cat <<'OUT'
+1 plugin installed:
+- zzjcool:forward (forward) enabled [github:zzjcool/herdr-forward@deadbeef]
+  config: /home/b/.config/herdr/plugins/config/zzjcool%3Aforward
+OUT
+  fi
+  ;;
+*)
+  cat <<'OUT'
+HF_ROOT=/home/b/.config/herdr/plugins/github/zzjcool-forward-deadbeef
+HF_STATE_DIR=/home/b/.local/state/herdr/plugins/zzjcool%3Aforward
+HF_DEFAULT_STATE=/home/b/.local/state/herdr/plugins/zzjcool%3Aforward
+OUT
+  ;;
+esac
+exit 0
+SHIM
+chmod +x "${SSH_SHIM_DIR}/ssh"
+
+# 基础 PATH（shim 目录按需前置，避免多次调用叠加）
+BASE_PATH="${PATH}"
+
+run_setup_shim() {
+  local scenario="$1"
+  shift
+  rc=0
+  out="$(env -u HERDR_PLUGIN_STATE_DIR \
+    "HOME=${WORK}/home" "XDG_CONFIG_HOME=${WORK}/xdg-config" "XDG_STATE_HOME=${WORK}/xdg-state" \
+    "PATH=${SSH_SHIM_DIR}:${BASE_PATH}" "SSH_SHIM_LOG=${SSH_SHIM_LOG}" \
+    "SSH_SHIM_SCENARIO=${scenario}" \
+    bash "${SETUP_BIN}" "$@" 2>"${WORK}/stderr")" || rc=$?
+  err="$(cat "${WORK}/stderr")"
+}
+
+PROBED_ROOT="/home/b/.config/herdr/plugins/github/zzjcool-forward-deadbeef"
+PROBED_STATE="/home/b/.local/state/herdr/plugins/zzjcool%3Aforward"
+
+t_it "未提供 --server-host：一次 ssh 都不调用（向后兼容，本机探测路径不变）"
+: >"${SSH_SHIM_LOG}"
+c_no_ssh="${WORK}/no-ssh.toml"
+new_config "${c_no_ssh}" >/dev/null
+run_setup_shim installed --config "${c_no_ssh}" \
+  --server-root "${SERVER_ROOT_FIXTURE}" --server-state-dir "${SERVER_STATE}"
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "0" "$(grep -c . "${SSH_SHIM_LOG}" || true)" "ssh 未被调用"
+no_ssh_cmd="$(tabbar_command "${c_no_ssh}")"
+t_contains "${SERVER_ROOT_FIXTURE}/bin/forward" "${no_ssh_cmd}" "走显式 --server-root"
+t_match "本机探测|未在本机探测|✅" "${out}" "仍是本机尽力探测叙事"
+
+t_it "--server-host 装了：✅ + 自动推导 B 的插件根与 state 目录（用户零路径参数）"
+: >"${SSH_SHIM_LOG}"
+c_ssh_ok="${WORK}/ssh-ok.toml"
+new_config "${c_ssh_ok}" >/dev/null
+run_setup_shim installed --config "${c_ssh_ok}" --server-host b-user@b-host
+t_exit_ok 0 "${rc}" "退出 0"
+ssh_cmd_ok="$(tabbar_command "${c_ssh_ok}")"
+t_contains "${PROBED_ROOT}/bin/forward" "${ssh_cmd_ok}" "tab bar 用 ssh 探测到的 B 插件根"
+t_contains "${PROBED_STATE}" "${ssh_cmd_ok}" "tab bar 用 ssh 探测到的 B state 目录"
+t_contains "✅" "${out}" "打印 ✅（真实探测命中）"
+t_contains "${PROBED_ROOT}" "${out}" "输出展示探测到的插件根"
+t_contains "--server-root" "${out}" "说明 --server-root 已自动填入"
+shim_log="$(cat "${SSH_SHIM_LOG}")"
+t_contains "<-o> <BatchMode=yes>" "${shim_log}" "BatchMode 只读探测"
+t_contains "<-o> <ConnectTimeout=8>" "${shim_log}" "带 ConnectTimeout=8"
+t_contains "<b-user@b-host>" "${shim_log}" "目标主机正确"
+t_contains "plugin list" "${shim_log}" "用 herdr plugin list 探测 B"
+if [[ "${shim_log}" == *"plugin install"* ]]; then
+  t_fail_note "探测阶段出现了 plugin install（绝不自动装）"
+else
+  t_pass "探测阶段零安装动作"
+fi
+
+t_it "--server-host user@host:port：端口以 -p 传给 ssh，主机名剥掉端口后缀"
+: >"${SSH_SHIM_LOG}"
+c_ssh_port="${WORK}/ssh-port.toml"
+new_config "${c_ssh_port}" >/dev/null
+run_setup_shim installed --config "${c_ssh_port}" --server-host b-user@b-host:2222
+t_exit_ok 0 "${rc}" "退出 0"
+shim_port="$(cat "${SSH_SHIM_LOG}")"
+t_contains "<-p> <2222>" "${shim_port}" "端口用 -p 2222 传递"
+t_contains "<b-user@b-host>" "${shim_port}" "主机名不含端口"
+
+t_it "--server-host 显式 --server-root：显式优先，但 state 目录仍用 ssh 探测值（跨机正确的 B 路径）"
+: >"${SSH_SHIM_LOG}"
+c_ssh_win="${WORK}/ssh-win.toml"
+new_config "${c_ssh_win}" >/dev/null
+run_setup_shim installed --config "${c_ssh_win}" \
+  --server-host b-user@b-host --server-root "${SERVER_ROOT_FIXTURE}"
+t_exit_ok 0 "${rc}" "退出 0"
+win_cmd="$(tabbar_command "${c_ssh_win}")"
+t_contains "${SERVER_ROOT_FIXTURE}/bin/forward" "${win_cmd}" "显式 root 生效（未被探测值覆盖）"
+t_contains "${PROBED_STATE}" "${win_cmd}" "state 目录用 ssh 探测值（不是 A 的 HOME 推导）"
+
+# 显式 --server-state-dir 也不被覆盖
+t_it "--server-host 显式 --server-state-dir：显式优先"
+c_ssh_win2="${WORK}/ssh-win2.toml"
+new_config "${c_ssh_win2}" >/dev/null
+run_setup_shim installed --config "${c_ssh_win2}" --server-host b-user@b-host \
+  --server-root "${SERVER_ROOT_FIXTURE}" --server-state-dir "${SERVER_STATE}"
+t_exit_ok 0 "${rc}" "退出 0"
+win2_cmd="$(tabbar_command "${c_ssh_win2}")"
+t_contains "${SERVER_STATE}" "${win2_cmd}" "显式 state 目录生效"
+
+t_it "--server-host 没装（--no-tabbar）：递上可复制的安装命令，且绝不自动安装"
+: >"${SSH_SHIM_LOG}"
+c_absent="${WORK}/ssh-absent.toml"
+new_config "${c_absent}" >/dev/null
+run_setup_shim absent --config "${c_absent}" --server-host b-user@b-host --no-tabbar
+t_exit_ok 0 "${rc}" "退出 0（键位照常安装）"
+t_contains "ssh b-user@b-host 'herdr plugin install zzjcool/herdr-forward --yes'" "${out}" "递上可直接复制的安装命令"
+shim_calls="$(cat "${SSH_SHIM_LOG}")"
+if [[ "${shim_calls}" == *"plugin install"* ]]; then
+  t_fail_note "脚本自动执行了安装（应只打印命令）"
+else
+  t_pass "未自动安装（尊重用户）"
+fi
+absent_keys="$(keys_count "${c_absent}")"
+t_eq "3" "${absent_keys}" "键位照常装上（探测结果不影响安装步骤）"
+
+t_it "--server-host 没装 + 要 tab bar + 没给 --server-root：退出 2，stderr 递上安装命令"
+c_absent2="${WORK}/ssh-absent2.toml"
+new_config "${c_absent2}" >/dev/null
+run_setup_shim absent --config "${c_absent2}" --server-host b-user@b-host
+t_exit_ok 2 "${rc}" "退出 2（无法确定 B 插件根）"
+t_contains "herdr plugin install zzjcool/herdr-forward --yes" "${err}" "stderr 含安装命令"
+t_contains "--server-root" "${err}" "stderr 提到 --server-root"
+
+# 连不上：ssh shim 退 255，必须降级而不是崩
+t_it "--server-host 连不上：降级到 checklist 模式，显式 --server-root 仍照常安装（绝不阻塞）"
+: >"${SSH_SHIM_LOG}"
+c_bad="${WORK}/ssh-bad.toml"
+new_config "${c_bad}" >/dev/null
+run_setup_shim unreachable --config "${c_bad}" --server-host b-user@b-host \
+  --server-root "${SERVER_ROOT_FIXTURE}" --server-state-dir "${SERVER_STATE}"
+t_exit_ok 0 "${rc}" "退出 0（探测失败不阻塞安装）"
+bad_cmd="$(tabbar_command "${c_bad}")"
+t_contains "${SERVER_ROOT_FIXTURE}/bin/forward" "${bad_cmd}" "回落到显式 --server-root"
+t_match "降级|探测失败|Connection refused" "${out}" "打印降级原因（不静默）"
+t_contains "zzjcool:forward" "${out}" "checklist 仍提示去 B 确认插件"
+if [[ "${out}" == *"✅"* ]]; then
+  t_fail_note "探测失败却打了 ✅"
+else
+  t_pass "失败时不打 ✅"
+fi
+
+t_it "--server-host 连不上 + --no-tabbar：退出 0，降级 checklist，无 unbound 崩溃"
+run_setup_shim unreachable --config "${WORK}/ssh-bad2.toml" --server-host b-user@b-host --no-tabbar
+t_exit_ok 0 "${rc}" "退出 0"
+t_match "降级|探测失败|checklist|前置条件" "${out}" "降级到 checklist 模式"
+if [[ "${err}" == *"unbound variable"* ]]; then
+  t_fail_note "崩溃：unbound variable"
+else
+  t_pass "无 unbound variable"
+fi
+
+t_it "--server-host 连不上 + 要 tab bar + 没给 --server-root：退出 2 并说明探测失败"
+run_setup_shim unreachable --config "${WORK}/ssh-bad3.toml" --server-host b-user@b-host
+t_exit_ok 2 "${rc}" "退出 2"
+t_contains "--server-root" "${err}" "stderr 指出缺少 --server-root"
+t_match "ssh|探测" "${err}" "stderr 说明 ssh 探测失败"
+
+t_it "--server-host 为空值：退出 2（参数校验）"
+run_setup_shim installed --config "${WORK}/ssh-empty.toml" --server-host ""
+t_isnt "0" "${rc}" "空值被拒"
+
 t_describe "setup-client.sh — 静态检查与文档防漂移"
 
 t_it "shellcheck 严格模式干净（工具缺失则显式 SKIP）"
@@ -485,6 +679,22 @@ if command -v shfmt >/dev/null 2>&1; then
 else
   t_skip "shfmt 未安装，无法校验 ${SETUP}"
 fi
+
+t_it "README：一键命令升级为 --server-host 形态，旧 --server-root 用法保留"
+readme_ssh_ok="$(
+  python3 - "${ROOT}/README.md" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+has_host = "--server-host" in src
+has_old = "--server-root" in src
+# --server-host 必须出现在调用 setup-client.sh 的命令行里（有 --server-host 这个 flag 的实参）
+call = bool(re.search(r"setup-client\.sh[^\n]*--server-host|<B 的 ssh[^\n]*", src)) and has_host
+has_install_hint = "herdr plugin install zzjcool/herdr-forward --yes" in src
+print("ok" if (has_host and has_old and call and has_install_hint) else
+      f"host={has_host} old={has_old} call={call} hint={has_install_hint}")
+PY
+)"
+t_eq "ok" "${readme_ssh_ok}" "README 含 --server-host 一键形态 + 旧用法 + 安装命令提示"
 
 t_it "README：一键叙事用 setup-client.sh（curl 一行 + clone 备选），手工块保留为 fallback"
 readme_ok="$(
