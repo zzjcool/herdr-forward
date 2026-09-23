@@ -94,7 +94,8 @@ forward — herdr 端口转发管理（一期：ssh -L）
 
   forward publish <port>    # 二期（Cloudflare quick tunnel），当前 exit 9
   forward unpublish         # 二期，当前 exit 9
-  forward watch             # pane 入口：watch -n 3 forward list
+  forward watch             # pane 入口：TTY 下开交互面板（数字键激活机器），
+                            # 非 TTY（脚本/CI）退化为 watch -n 3 forward list
 
 退出码：0 成功 / 2 端口重复 / 3 记录不存在 / 4 machine 无法解析 /
         5 隧道启动失败 / 9 未实现 / 64 用法错误 / 127 依赖缺失
@@ -554,7 +555,30 @@ cmd_unpublish() {
 
 # --- watch ---
 
+# cmd_watch — pane 入口。TTY 下进交互式 Port Forward 面板（lib/panel.sh，M3）；
+# 非 TTY 一律退化为旧行为 `watch -n 3 forward list`。
+#
+# 为什么必须退化（向后兼容，不是偷懒）：
+#   * 脚本化调用 / CI / E2E 会把 stdin 重定向（或根本没有 stdin），此时 read -n 1
+#     没有输入源，真交互循环会空转到 EOF 或直接干扰输出解析；
+#   * 面板模块缺失（旧检出 / 部分安装）时 watch 路径仍然可用 —— 松散耦合。
 cmd_watch() {
+  if [[ -t 0 && -f "${FORWARD_LIB}/panel.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${FORWARD_LIB}/panel.sh"
+    if declare -F panel_main >/dev/null 2>&1; then
+      local panel_rc=0
+      set +o errexit
+      panel_main
+      panel_rc=$?
+      set -o errexit
+      if [[ "${panel_rc}" -eq 0 ]]; then
+        return 0
+      fi
+      log warn "交互面板未接管（rc=${panel_rc}），退化为 'watch -n 3 forward list'。"
+    fi
+  fi
+
   require_cmd watch "watch 命令缺失。请安装 procps/util-linux，或直接运行 'forward list'。"
   exec watch -n 3 "${FORWARD_ROOT}/bin/forward" list
 }
