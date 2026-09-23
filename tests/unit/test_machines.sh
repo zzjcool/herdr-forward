@@ -358,25 +358,44 @@ for _t in localhost LOCALHOST 127.0.0.1 ::1 "[::1]" "localhost:22" "user@localho
   t_eq "yes" "${o}" "local: ${_t}"
 done
 
+# 本机主机名候选（顺序与 lib 的 _machines_host_names 一致）。
+# 容器（archlinux 基础镜像）没有 hostname 可执行文件，退回 uname -n / $HOSTNAME；
+# 两者都拿不到就显式 t_skip（绝不静默通过，也绝不因缺工具就让整个文件 rc=127 崩掉）。
+host_name() {
+  local got=""
+  got="$(hostname 2>/dev/null || true)"
+  [[ -n "${got}" ]] || got="$(uname -n 2>/dev/null || true)"
+  [[ -n "${got}" ]] || got="${HOSTNAME:-}"
+  printf '%s\n' "${got}"
+}
+
 t_it "本机 hostname（短名）精确等值 -> yes"
-HOST_FULL="$(hostname)"
+HOST_FULL="$(host_name)"
 HOST_SHORT="$(hostname -s 2>/dev/null || true)"
-_capok machines_is_local_target "${HOST_FULL}"
-t_eq "yes" "${o}" "hostname: ${HOST_FULL}"
-_capok machines_is_local_target "user@${HOST_FULL}:22"
-t_eq "yes" "${o}" "user@hostname:port"
-if [[ -n "${HOST_SHORT}" ]]; then
+[[ -n "${HOST_SHORT}" ]] || HOST_SHORT="${HOST_FULL}"
+if [[ -z "${HOST_FULL}" ]]; then
+  t_skip "本机取不到主机名（无 hostname/uname -n/\$HOSTNAME）"
+fi
+if [[ -n "${HOST_FULL}" ]]; then
+  _capok machines_is_local_target "${HOST_FULL}"
+  t_eq "yes" "${o}" "hostname: ${HOST_FULL}"
+  _capok machines_is_local_target "user@${HOST_FULL}:22"
+  t_eq "yes" "${o}" "user@hostname:port"
   _capok machines_is_local_target "${HOST_SHORT}"
   t_eq "yes" "${o}" "hostname -s: ${HOST_SHORT}"
 else
-  t_skip "hostname -s 不可用"
+  t_skip "无主机名可用，跳过 hostname 系列用例"
 fi
 
 t_it "远程主机 / 前缀相似名 / 空值 -> no（不误判为同机）"
-for _t in "user@b-host:22" "gpu.example.com" "127.0.0.2" "127.0.0.10" "notlocalhost" "malocalhost" "user@remote" "${HOST_FULL}.example.com" ""; do
+for _t in "user@b-host:22" "gpu.example.com" "127.0.0.2" "127.0.0.10" "notlocalhost" "malocalhost" "user@remote" ""; do
   _capok machines_is_local_target "${_t}"
   t_eq "no" "${o}" "remote: ${_t:-<empty>}"
 done
+if [[ -n "${HOST_FULL}" ]]; then
+  _capok machines_is_local_target "${HOST_FULL}.example.com"
+  t_eq "no" "${o}" "remote: ${HOST_FULL}.example.com（FQDN 后缀，不是本机精确名）"
+fi
 
 t_it "恒 return 0（可安全用于条件判断）"
 _cap machines_is_local_target "user@b-host:22"

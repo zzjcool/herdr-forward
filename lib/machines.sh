@@ -437,11 +437,20 @@ machines_is_local_target() {
   return 0
 }
 
-# _machines_host_names -> stdout: hostname / hostname -s / hostname -f 各一行（保持原样）
+# _machines_host_names -> stdout: 本机主机名候选（每行一个，顺序即优先级）
+#   hostname / hostname -s / hostname -f；容器等精简环境可能**没有 hostname 可执行文件**
+#   （archlinux 基础镜像就没装 inetutils），那时退回 `uname -n`（内核同源，等价信号）
+#   与 $HOSTNAME。全部拿不到就输出空 —— 调用方逐行比较，空行天然被跳过，不误判。
 _machines_host_names() {
-  hostname 2>/dev/null || true
-  hostname -s 2>/dev/null || true
-  hostname -f 2>/dev/null || true
+  local got=""
+  got="$(hostname 2>/dev/null || true)"
+  got+="$(printf '\n%s' "$(hostname -s 2>/dev/null || true)")"
+  got+="$(printf '\n%s' "$(hostname -f 2>/dev/null || true)")"
+  if [[ -z "${got//$'\n'/}" ]]; then
+    got="$(uname -n 2>/dev/null || true)"
+    got+="$(printf '\n%s' "${HOSTNAME:-}")"
+  fi
+  printf '%s\n' "${got}"
   return 0
 }
 # ---------------------------------------------------------------------------

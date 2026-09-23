@@ -342,6 +342,7 @@ EOF
 chmod +x "${REMOTE_HOME}/.local/bin/herdr"
 
 t_it "ForceCommand wrapper 生效：远端命令跑在假 HOME 里（零污染证明）"
+# shellcheck disable=SC2016  # $HOME 由远端 shell 展开（本用例测的就是远端 HOME）
 _cap timeout 15 ssh -o BatchMode=yes -p "${SSHD_PORT}" "${SSH_USER}@127.0.0.2" 'printf "%s" "$HOME"'
 t_eq "${REMOTE_HOME}" "${out}" "远端 HOME 是 TMP 里的 fixture，不是宿主真实 HOME"
 
