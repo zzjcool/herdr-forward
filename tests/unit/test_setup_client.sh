@@ -499,7 +499,9 @@ case "${cmd}" in
   exit 3
   ;;
 *"plugin list"*)
-  if [[ "${scenario}" == "absent" ]]; then
+  if [[ "${scenario}" == "noherdr" ]]; then
+    printf 'HF_NO_HERDR\n'
+  elif [[ "${scenario}" == "absent" ]]; then
     printf 'No plugins installed.\n'
   else
     cat <<'OUT'
@@ -674,6 +676,18 @@ t_match "ssh|探测" "${err}" "stderr 说明 ssh 探测失败"
 t_it "--server-host 为空值：退出 2（参数校验）"
 run_setup_shim installed --config "${WORK}/ssh-empty.toml" --server-host ""
 t_isnt "0" "${rc}" "空值被拒"
+
+t_it "--server-host 连得上但远端无 herdr（PATH 问题）：单独诊断 + 降级，不误导为「没装插件」"
+run_setup_shim noherdr --config "${WORK}/ssh-noherdr.toml" --server-host b-user@b-host --no-tabbar
+t_exit_ok 0 "${rc}" "退出 0"
+t_match "找不到 herdr|PATH" "${out}" "打印 PATH 诊断（而不是「B 没装插件」）"
+if [[ "${out}" == *"herdr plugin install"* ]]; then
+  t_fail_note "误判为未安装并递了安装命令（应与 PATH 问题区分）"
+else
+  t_pass "未误判为未安装"
+fi
+noherdr_keys="$(keys_count "${WORK}/ssh-noherdr.toml")"
+t_eq "3" "${noherdr_keys}" "键位照常装上（不阻塞）"
 
 t_describe "setup-client.sh — 真 stdin 形态（curl|bash -s）+ ssh 探测（回归：ssh 不得吃掉脚本）"
 
