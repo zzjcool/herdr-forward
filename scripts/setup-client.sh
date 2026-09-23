@@ -186,7 +186,8 @@ ssh_probe() {
 }
 
 # --- ssh 探测 B（仅当给了 --server-host）：只读、超时、失败降级，绝不阻塞安装 ---
-# 每次探测都是 `timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`。
+# 每次探测都是 `timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`
+# （本机没有 `timeout` 时至少仍有 ConnectTimeout=8 兜底建连阶段；不静默降级）。
 readonly SSH_PROBE_TIMEOUT=15
 readonly SSH_CONNECT_TIMEOUT=8
 # shellcheck disable=SC2016  # 单引号是有意的：$HOME/$PATH 必须由 **远端** shell 展开

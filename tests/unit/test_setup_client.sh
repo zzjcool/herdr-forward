@@ -558,6 +558,14 @@ t_contains "${PROBED_ROOT}" "${out}" "输出展示探测到的插件根"
 t_contains "--server-root" "${out}" "说明 --server-root 已自动填入"
 shim_log="$(cat "${SSH_SHIM_LOG}")"
 t_contains "<-o> <BatchMode=yes>" "${shim_log}" "BatchMode 只读探测"
+# timeout 由 ssh_probe 以 `"$SSH_TIMER_BIN" "$SSH_PROBE_TIMEOUT"` 前置（shim 看不到这层 argv，
+# 只有 timeout 自己看不到——故此处做源码级防漂移断言）。
+if grep -qE 'cmd\+=\("\$\{SSH_TIMER_BIN\}" "\$\{SSH_PROBE_TIMEOUT\}"\)' "${SETUP}" &&
+  grep -qE '^readonly SSH_PROBE_TIMEOUT=15$' "${SETUP}"; then
+  t_pass "探测被 timeout 15 包裹（源码断言：SSH_TIMER_BIN + SSH_PROBE_TIMEOUT=15）"
+else
+  t_fail_note "探测未用 timeout 15 包裹（挂死保护缺失）"
+fi
 t_contains "<-o> <ConnectTimeout=8>" "${shim_log}" "带 ConnectTimeout=8"
 t_contains "<b-user@b-host>" "${shim_log}" "目标主机正确"
 t_contains "plugin list" "${shim_log}" "用 herdr plugin list 探测 B"
