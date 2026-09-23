@@ -283,6 +283,18 @@ def indent_block(text):
     return "\n".join("  " + line if line.strip() else line for line in text.splitlines())
 
 
+def append_to_array(src, open_at, close_at, extra_chunks):
+    """把 extra_chunks 追加到 src[open_at:close_at] 已有的数组里，统一规范化缩进。
+
+    按顶层逗号切分已有内容再重组 —— 直接拼接 inner 会在 multi-line 数组（末尾
+    带 trailing comma）下生成 `},," → 非法 TOML。也要丢掉空块（trailing comma
+    会在末尾多切出一个空串）。
+    """
+    chunks = [c.strip() for c in split_top_level(src[open_at + 1 : close_at]) if c.strip()]
+    chunks.extend(extra_chunks)
+    return "[\n" + "".join(indent_block(c) + ",\n" for c in chunks) + "]"
+
+
 def render_entry(interval, timeout):
     return '{ type = "command", command = %s, interval_seconds = %d, timeout_seconds = %d }' % (
         toml_string(command),
@@ -342,6 +354,7 @@ if marker_present:
     sys.exit(0)
 
 
+# --- 插入路径（未装过本插件） ---
 entry = render_entry(5, 2)
 block_lines = ["tab_bar_right = [", "  " + marker, "  " + entry + ",", "]"]
 
@@ -380,7 +393,8 @@ else:
             insert_at -= 1
         lines[insert_at:insert_at] = block_lines
     else:
-        # 段内已有该键：定位数组边界，把我们的条目追加进去
+        # 段内已有该键：定位数组边界，把我们的条目追加进去（复用 append_to_array，
+        # 避免在 multi-line 数组下产生双逗号）
         joined = "\n".join(lines)
         key_at = joined.find("tab_bar_right", sum(len(x) + 1 for x in lines[:arr_idx]))
         bounds = locate_array(joined, "tab_bar_right") if key_at != -1 else None
@@ -388,13 +402,7 @@ else:
             print("cannot locate tab_bar_right array", file=sys.stderr)
             sys.exit(4)
         open_at, close_at = bounds
-        inner = joined[open_at + 1 : close_at].strip()
-        rebuilt = "[\n"
-        if inner:
-            rebuilt += "  " + inner + ",\n"
-        rebuilt += "  " + marker + "\n"
-        rebuilt += "  " + entry + ",\n"
-        rebuilt += "]"
+        rebuilt = append_to_array(joined, open_at, close_at, [marker + "\n" + entry])
         lines = (joined[:open_at] + rebuilt + joined[close_at + 1 :]).splitlines()
 
 out = "\n".join(lines)

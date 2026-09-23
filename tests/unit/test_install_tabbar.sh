@@ -331,6 +331,44 @@ else
   t_fail_note "原有条目被破坏或追加位置不对"
 fi
 
+t_it "多行 tab_bar_right 含其它条目：不产生双逗号（原有条目保留 + 我们的条目追加）"
+# 回归：旧实现在此形态下把 inner（末尾带 trailed comma）拼进去，生成 \"},\",\"
+# → 自检报「不是合法 TOML」→ 安装失败（源文件未坏，但安装不可完成）。
+# README 自己推荐的手工粘贴块就是多行形态，故这是真实可达路径。
+configMulti="${WORK}/multiline.toml"
+cat >"${configMulti}" <<'EOF'
+[ui]
+tab_bar_position = "top"
+tab_bar_right = [
+  { type = "command", command = '"$HOME/bin/other" status', interval_seconds = 9, timeout_seconds = 4 },
+]
+EOF
+run_installer "${configMulti}"
+t_exit_ok 0 "${rc}" "退出 0（不再因双逗号失败）"
+py_rc=0
+set +o errexit
+python3 - "${configMulti}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+entries = doc["ui"]["tab_bar_right"]
+assert len(entries) == 2, entries
+assert entries[0]["command"] == '"$HOME/bin/other" status', entries
+assert entries[1]["type"] == "command" and "bin/forward" in entries[1]["command"], entries
+PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
+  t_pass "原条目逐字保留，我们的条目追加为第 2 条"
+else
+  t_fail_note "原条目被破坏或内容非法（双逗号回归）"
+fi
+# 幂等复查（多行形态下二次运行也不得改动）
+beforeMulti="$(md5 "${configMulti}")"
+run_installer "${configMulti}"
+afterMulti="$(md5 "${configMulti}")"
+t_eq "${beforeMulti}" "${afterMulti}" "多行形态二次运行未改文件"
+
 # 二次运行：文件内容不变（幂等）
 before8="$(md5 "${config8}")"
 run_installer "${config8}"
