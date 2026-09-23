@@ -235,4 +235,106 @@ err="$(cat "${WORK}/stderr")"
 if [[ "${rc}" -ne 0 ]]; then t_pass "缺失脚本 -> 非 0（rc=${rc}）"; else t_fail_note "缺失脚本未报错"; fi
 t_match "bootstrap|scripts" "${err}" "错误信息指明原因"
 
+t_describe "README 指引与实际安装器一致（防漂移）"
+
+t_it "README 的 tab bar 一键复制块 == install-tabbar.sh 实际写入的条目"
+config10="${WORK}/readme-tabbar.toml"
+printf '# sample\n' >"${config10}"
+rc=0
+out="$(bash "${ROOT}/scripts/install-tabbar.sh" --config "${config10}" 2>/dev/null)" || rc=$?
+t_exit_ok 0 "${rc}" "install-tabbar 退出 0"
+readme_entry="$(
+  python3 - "${ROOT}/README.md" <<'PY'
+import re, sys, textwrap
+src = open(sys.argv[1], encoding="utf-8").read()
+# 取 README 里 tab_bar_right 的手工粘贴块（含 marker 注释的 toml 代码块）。
+# README 把该块放在列表项内，故需 dedent（去掉统一缩进）后再比较。
+blocks = re.findall(r"```toml\n(.*?)```", src, re.S)
+for b in blocks:
+    if "tab bar status entry" in b and "tab_bar_right" in b:
+        print(textwrap.dedent(b).strip())
+        break
+PY
+)"
+actual_entry="$(
+  python3 - "${config10}" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+entry = doc["ui"]["tab_bar_right"][0]
+def toml_string(v):
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+print("[ui]")
+print("tab_bar_right = [")
+print("  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)")
+print("  { type = " + toml_string(entry["type"]) + ", command = " + toml_string(entry["command"])
+      + ", interval_seconds = " + str(entry["interval_seconds"])
+      + ", timeout_seconds = " + str(entry["timeout_seconds"]) + " },")
+print("]")
+PY
+)"
+if [[ -n "${readme_entry}" && "${readme_entry}" == "${actual_entry}" ]]; then
+  t_pass "README tab bar 块与安装器输出逐字一致"
+else
+  t_fail_note "README tab bar 块与安装器输出不一致
+--- README ---
+${readme_entry}
+--- actual ---
+${actual_entry}"
+fi
+
+t_it "README 的键位一键复制块 == install-keys.sh 实际写入的 3 条"
+config11="${WORK}/readme-keys.toml"
+printf '# sample\n' >"${config11}"
+rc=0
+out="$(bash "${ROOT}/scripts/install-keys.sh" --config "${config11}" 2>/dev/null)" || rc=$?
+t_exit_ok 0 "${rc}" "install-keys 退出 0"
+readme_keys="$(
+  python3 - "${ROOT}/README.md" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for b in re.findall(r"```toml\n(.*?)```", src, re.S):
+    if "keybindings (managed by scripts/install-keys.sh)" in b:
+        print(b.strip())
+        break
+PY
+)"
+py_rc=0
+set +o errexit
+python3 - "${readme_keys}" "${config11}" <<'PY' 2>/dev/null
+import sys, tomllib
+readme = tomllib.loads(sys.argv[1])
+with open(sys.argv[2], "rb") as fh:
+    actual = tomllib.load(fh)
+want = readme["keys"]["command"]
+got = [e for e in actual["keys"]["command"] if str(e.get("command", "")).startswith("zzjcool:forward.")]
+assert want == got, (want, got)
+PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
+  t_pass "README 键位块与安装器输出语义一致"
+else
+  t_fail_note "README 键位块与安装器输出不一致"
+fi
+
+t_it "README 明说能力边界：同机自动 / 跨机需一步（诚实文档）"
+readme_ok="no"
+set +o errexit
+readme_scan="$(
+  python3 - "${ROOT}/README.md" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+auto = "startup" in src and ("automatically" in src or "automatic" in src)
+cross = "cross-machine" in src.lower() or "Cross-machine" in src
+manual = "--config" in src and "bootstrap.sh" in src
+print("ok" if (auto and cross and manual) else "bad")
+PY
+)"
+set -o errexit
+if [[ "${readme_scan}" == "ok" ]]; then
+  readme_ok="yes"
+fi
+t_eq "yes" "${readme_ok}" "README 覆盖同机自动 + 跨机一步 + 手工块"
+
 t_done

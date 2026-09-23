@@ -48,37 +48,114 @@ herdr plugin link ~/code/herdr-forward
 picked up on the next `reload-config`. Use `herdr plugin unlink zzjcool:forward`
 to remove the link.
 
-### C. Tab bar status entry (optional)
+### C. Out-of-the-box UI (tab bar + keybindings)
 
-The Port Forward tab-bar entry shows the active forwards as `⇅3000⇅5173` on the
-right-hand side of the tab bar. Install it with the bundled helper — it edits
-`~/.config/herdr/config.toml` for you:
+Plugin v1 manifests cannot declare keybindings or tab-bar entries — those live in
+herdr's own `config.toml`, and no plugin API can register them at install time.
+So the plugin ships two idempotent installers plus one one-shot command that runs
+both:
 
 ```sh
-# preview first (writes nothing)
-./scripts/install-tabbar.sh --dry-run
-
-# install (backs up the original to config.toml.bak.<epoch>)
-./scripts/install-tabbar.sh
-
-# when installed from GitHub, run the copy inside the plugin checkout:
-#   "$HERDR_PLUGIN_ROOT/scripts/install-tabbar.sh"
+# after linking/installing the plugin — run from the plugin checkout,
+# or from anywhere via the `forward` CLI (`bin/forward bootstrap`)
+./scripts/bootstrap.sh          # tab bar status entry + 3 keybindings
+./scripts/bootstrap.sh --dry-run  # preview first, writes nothing
 ```
 
-Then reload herdr's config (`reload-config`). The helper is idempotent:
-re-running it detects its own entry and leaves the file untouched. To pin a
-different command (e.g. an absolute path), pass `--command '...'`; to target a
-non-default config, pass `--config /path/to/config.toml`. It adds roughly:
+Afterwards press `prefix+q` (or run `herdr server reload-config`) to apply it.
 
-```toml
-[ui]
-tab_bar_right = [
-  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-  { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
-]
+**What happens automatically (same machine):** if your herdr server and your
+herdr client run on the same machine (the common local case), the plugin's
+`[[startup]]` hook runs `scripts/startup-hook.sh` once the server is up. It
+detects the missing tab-bar entry and installs it for you — no manual step, and
+idempotent so it does nothing on subsequent starts. The hook writes the config
+file; the running server picks it up on the next `reload-config` (the hook itself
+cannot reload, and a hook failure never stops the server). The tab bar entry is
+the automatic part; the optional keybindings are not installed by the hook —
+run `bootstrap.sh` once if you want them.
+
+**What still takes one step (cross-machine):** `tab_bar_right` is *presentation*
+config owned by the client, even though the `command` inside it runs on the
+*server*. When you attach from machine A to a server on machine B, the plugin
+process on B cannot reach A's filesystem — a physical boundary, not an
+oversight. In that case:
+
+- On B (the server), the startup hook only logs a hint; nothing is written to A.
+- To get the tab bar on A, run the installer **on A**, pointing it at A's config:
+
+  ```sh
+  # on machine A, with the plugin checkout available there
+  <plugin-root>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml
+  ```
+
+  or paste this block into A's `~/.config/herdr/config.toml` by hand (it is the
+  exact block the installer writes — the `command` runs on B and renders on A):
+
+  ```toml
+  [ui]
+  tab_bar_right = [
+    # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
+    { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
+  ]
+  ```
+
+  and, for the keybindings:
+
+  ```toml
+  # herdr-forward: keybindings (managed by scripts/install-keys.sh)
+  [[keys.command]]
+  key = "prefix+f"
+  type = "plugin_action"
+  command = "zzjcool:forward.add"
+  description = "Port Forward: Add / open panel"
+
+  [[keys.command]]
+  key = "prefix+shift+f"
+  type = "plugin_action"
+  command = "zzjcool:forward.list"
+  description = "Port Forward: List forwards"
+
+  [[keys.command]]
+  key = "prefix+alt+f"
+  type = "plugin_action"
+  command = "zzjcool:forward.doctor"
+  description = "Port Forward: Doctor (probe tunnels)"
+  ```
+
+If you are already in a herdr session on the server, the same one-shot install is
+available as a plugin action (useful right after `herdr plugin link`):
+
+```sh
+herdr plugin action invoke bootstrap --plugin zzjcool:forward
 ```
 
-### Ctrl+click links
+#### The installers
+
+| Script | Adds | Notes |
+|---|---|---|
+| `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--command CMD`, `--dry-run` |
+| `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
+| `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
+| `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine |
+
+All of them are idempotent (a marker comment identifies our entries) and back up
+the original to `config.toml.bak.<epoch>` before any real change. When installed
+from GitHub, use the copy inside the managed checkout:
+`"$HERDR_PLUGIN_ROOT/scripts/bootstrap.sh"`.
+
+#### Default keys
+
+| Key | Action |
+|---|---|
+| `prefix+f` | open the Port Forward panel (`add`/`remove` happen there) |
+| `prefix+shift+f` | list current forwards |
+| `prefix+alt+f` | doctor — probe tunnels |
+
+Override them with `--add-key/--list-key/--doctor-key`. If a key is already
+bound to something else the installer warns and still installs (so a collision is
+visible rather than silent), so pass a different key if the warning fires.
+
+### D. Ctrl+click links
 
 The plugin registers a link handler so that localhost URLs in pane output open
 in your browser. herdr only recognises URLs that carry a scheme, so the link
@@ -93,7 +170,13 @@ bin/forward list                              # table
 bin/forward list --oneline                    # ⇅3000⇅5173 (what the tab bar runs)
 bin/forward remove f-3000                     # tear the tunnel down
 bin/forward doctor                            # probe tunnels, report status
+bin/forward bootstrap                         # (re)install the UI / print next steps
 ```
+
+Run it from the plugin checkout (or as `"$HERDR_PLUGIN_ROOT/bin/forward"` when
+installed from GitHub). In a herdr session the same commands are reachable as
+plugin actions — `Port Forward: Add…`, `List`, `Doctor`, and `Setup UI`
+(`herdr plugin action invoke bootstrap --plugin zzjcool:forward`).
 
 ## Related work
 

@@ -14,6 +14,19 @@ description = "Forward a saved SSH machine's TCP port to localhost, and optional
 platforms = ["linux", "macos"]
 
 # ---------------------------------------------------------------------------
+# startup hook —— OOTB：装好插件后自动补上 tab bar 状态条
+#
+# 职责（任务 §3）：herdr 在恢复会话、API socket ready 后跑一次（handoff 再跑）。
+# tab_bar_right 属于 client 的 config，其中 command 在 server 上执行；同机时
+# server config == 本机 config，钩子直接幂等地装；跨机时 server 碰不到 client
+# 文件系统（物理边界），脚本降级为一行日志提示，恒 exit 0，绝不阻塞 server。
+# 幂等与备份由 scripts/install-tabbar.sh 负责；脚本总览见 scripts/startup-hook.sh。
+# ---------------------------------------------------------------------------
+
+[[startup]]
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/scripts/startup-hook.sh"']
+
+# ---------------------------------------------------------------------------
 # actions —— herdr command palette / keybinding / link_handler 的落点
 # id 规则：ASCII letters/digits/`: . _ -`；action id 不能含点（SCOUT-FACTS §2.2）
 # ---------------------------------------------------------------------------
@@ -50,6 +63,16 @@ command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}
 id = "open-url"
 title = "Port Forward: Open link in browser"
 command = ["/bin/sh", "-c", 'url="$HERDR_PLUGIN_CLICKED_URL"; if [ -z "$url" ]; then exit 1; fi; if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$url"; elif command -v open >/dev/null 2>&1; then exec open "$url"; else exit 1; fi']
+
+# bootstrap —— OOTB 一键装 UI（tab bar 状态条 + 键绑定）。
+# 用户 link 后可在任意 pane 执行：
+#   herdr plugin action invoke bootstrap --plugin zzjcool:forward
+# 实际实现是 scripts/bootstrap.sh（幂等，装过就跳过）；两个 UI 落点都属于 herdr
+# 自己的 config.toml，manifest v1 无法声明（SCOUT-FACTS §2.2），故用 action 触发。
+[[actions]]
+id = "bootstrap"
+title = "Port Forward: Setup UI"
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" bootstrap']
 
 # ---------------------------------------------------------------------------
 # panes —— Port Forward 面板（表格 + 交互式增删）
