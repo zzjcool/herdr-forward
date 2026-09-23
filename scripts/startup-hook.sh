@@ -64,8 +64,12 @@ herdr [[startup]] 钩子：检测到 tab bar 状态条缺失时自动执行 inst
   --dry-run       只预览，不修改文件
   --help          显示本帮助
 
+绝对路径解析：hook 在 server 上跑，tab bar command 也在 server 上执行，因此
+install-tabbar.sh 自动解析出的「本机绝对路径」就是正确的 server 路径（不存在 $HERDR_PLUGIN_ROOT
+那样在 tab bar 执行上下文里缺失的 env）。跨机场景的 client 侧请用 bootstrap.sh --plugin-root。
+
 跨机说明：本 hook 只写「本机」（= herdr server 所在机器）的 config。client 若在
-另一台机器，请在那台机器上运行 <插件根>/scripts/bootstrap.sh（或按 README 手工加）。
+另一台机器，请在那台机器上运行 <插件根>/scripts/bootstrap.sh --plugin-root <server 插件根>。
 EOF
 }
 
@@ -126,7 +130,10 @@ if ((dry_run)); then
   dry_flag=(--dry-run)
 fi
 
-# install-tabbar.sh 自己幂等（已有条目则 exit 0 并提示 already），故直接调用即可。
+# install-tabbar.sh 自己幂等（已有条目则 exit 0 并提示 already；检测到旧格式的
+# $HERDR_PLUGIN_ROOT 字面量则自动升级为绝对路径），故直接调用即可。
+# 不传 --plugin-root：install-tabbar.sh 解析自身真实位置，得到的就是 **server 上的**
+# 绝对路径（hook 与 command 同在 server 执行），这比猜路径可靠。
 # set +e 包裹：任何非 0 都降级为日志，绝不冒泡（startup 不得打断 server）。
 installer_rc=0
 installer_out=""
@@ -143,7 +150,8 @@ if [[ "${installer_rc}" -eq 0 ]]; then
   fi
   printf '%s\n' \
     "提示：tab bar 条目已就绪。若你的 herdr client 跑在另一台机器（跨机 attach），" \
-    "那台机器需要单独运行 <插件根>/scripts/bootstrap.sh —— server 侧无法代写 client 配置。"
+    "那台机器需要单独运行 <插件根>/scripts/bootstrap.sh --config <A 的 config> " \
+    "--plugin-root <本机（server B）的插件根> —— server 侧无法代写 client 配置。"
   exit 0
 fi
 

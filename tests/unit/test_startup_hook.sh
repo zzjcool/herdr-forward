@@ -63,10 +63,42 @@ print(sum(1 for e in ((doc.get("ui") or {}).get("tab_bar_right") or [])
 PY
 }
 
+# tabbar_command <toml> -> 本插件的 tab_bar_right command（无则空）
+tabbar_command() {
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import sys, tomllib, os
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    for e in ((doc.get("ui") or {}).get("tab_bar_right") or []):
+        if isinstance(e, dict) and "bin/forward" in str(e.get("command", "")):
+            print(e["command"])
+            break
+except Exception:
+    print("")
+PY
+}
+
 mkdir -p "${WORK}/home/.config/herdr"
 DEFAULT_CONFIG="${WORK}/home/.config/herdr/config.toml"
 
 t_describe "startup-hook.sh（同机自动安装 tab bar）"
+
+ROOT_PHYS="$(cd -P "${ROOT}" && pwd)"
+
+inject_legacy_entry() {
+  # inject_legacy_entry <config>：写入一条**旧格式**（$HERDR_PLUGIN_ROOT 字面量）条目
+  cat >"${1}" <<'EOF'
+theme = "dark"
+
+[ui]
+tab_bar_position = "top"
+tab_bar_right = [
+  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
+  { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 7, timeout_seconds = 3 },
+]
+EOF
+}
 
 t_it "裸跑：在 XDG_CONFIG_HOME/herdr/config.toml 自动装 tab bar 条目"
 printf 'theme = "dark"\n' >"${DEFAULT_CONFIG}"
@@ -86,15 +118,15 @@ t_eq "${before}" "${after}" "重复运行未改文件"
 tb2="$(tabbar_count "${DEFAULT_CONFIG}")"
 t_eq "1" "${tb2}" "仍只有 1 条"
 
-t_it "已有条目（用户手装）→ 不重复插入、不备份、退出 0"
+t_it "已存在条目（用户手装，新格式）→ 不重复插入、不备份、退出 0"
 config2="${WORK}/preinstalled.toml"
-cat >"${config2}" <<'EOF'
+cat >"${config2}" <<EOF
 theme = "dark"
 
 [ui]
 tab_bar_right = [
   # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-  { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
+  { type = "command", command = "\"${ROOT_PHYS}/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
 ]
 EOF
 before2="$(md5 "${config2}")"
@@ -104,6 +136,69 @@ after2="$(md5 "${config2}")"
 t_eq "${before2}" "${after2}" "内容未变"
 bak2="$(find "${WORK}" -maxdepth 1 -name 'preinstalled.toml.bak.*' -print -quit)"
 t_eq "" "${bak2}" "未产生备份"
+
+t_it "旧格式（\$HERDR_PLUGIN_ROOT 字面量）：hook 自动升级为 server 绝对路径"
+# startup 上下文里 install-tabbar 解析自身真实位置 → 得到的就是 server 上的路径。
+# 旧格式在 tab bar 执行时 env 缺失 → 静默空白；重跑 hook 应自愈。
+configLegacy="${WORK}/legacy.toml"
+inject_legacy_entry "${configLegacy}"
+legacy_before="$(md5 "${configLegacy}")"
+run_hook --config "${configLegacy}"
+t_exit_ok 0 "${rc}" "退出 0"
+legacy_cmd="$(tabbar_command "${configLegacy}")"
+t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${legacy_cmd}" "command 升级为绝对路径"
+if grep -q 'HERDR_PLUGIN_ROOT' "${configLegacy}"; then
+  t_fail_note "升级后仍残留 \$HERDR_PLUGIN_ROOT"
+else
+  t_pass "升级后不再有 \$HERDR_PLUGIN_ROOT"
+fi
+tb_legacy="$(tabbar_count "${configLegacy}")"
+t_eq "1" "${tb_legacy}" "仍只 1 条"
+legacy_interval="$(
+  python3 - "${configLegacy}" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    print(doc["ui"]["tab_bar_right"][0]["interval_seconds"])
+except Exception:
+    print("")
+PY
+)"
+t_eq "7" "${legacy_interval}" "保留用户改过的 interval_seconds"
+legacy_bak="$(find "${WORK}" -maxdepth 1 -name 'legacy.toml.bak.*' -print -quit)"
+t_file_exists "${legacy_bak}"
+legacy_bak_md5="$(md5 "${legacy_bak}")"
+t_eq "${legacy_before}" "${legacy_bak_md5}" "备份 = 升级前内容"
+
+run_hook --config "${configLegacy}"
+t_exit_ok 0 "${rc}" "再跑退出 0"
+legacy_again="$(tabbar_command "${configLegacy}")"
+t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${legacy_again}" "再跑不变（幂等）"
+
+inject_legacy_entry "${WORK}/legacy-dry.toml"
+legacy_dry_before="$(md5 "${WORK}/legacy-dry.toml")"
+run_hook --config "${WORK}/legacy-dry.toml" --dry-run
+t_exit_ok 0 "${rc}" "dry-run 退出 0"
+legacy_dry_after="$(md5 "${WORK}/legacy-dry.toml")"
+t_eq "${legacy_dry_before}" "${legacy_dry_after}" "dry-run 不改旧格式文件"
+
+t_it "自动写入的 command 是绝对路径且不含 \$HERDR_PLUGIN_ROOT 字面量"
+def_cmd="$(tabbar_command "${DEFAULT_CONFIG}")"
+t_match '^"[^"]+/bin/forward" list --oneline$' "${def_cmd}" "command = \"<abs>/bin/forward\" list --oneline"
+t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${def_cmd}" "解析到本检出（server 本机路径）"
+if [[ "${def_cmd}" == *"\$HERDR_PLUGIN_ROOT"* ]]; then
+  t_fail_note "command 含 \$HERDR_PLUGIN_ROOT 字面量（tab bar 上下文里无法解析）"
+else
+  t_pass "不含 \$HERDR_PLUGIN_ROOT 字面量"
+fi
+
+sh_rc=0
+set +o errexit
+env -i /bin/sh -lc "${def_cmd}" >/dev/null 2>&1
+sh_rc=$?
+set -o errexit
+if [[ "${sh_rc}" -eq 0 ]]; then t_pass "env -i /bin/sh -lc 真实执行成功"; else t_fail_note "env -i 执行失败（rc=${sh_rc}）；command=[${def_cmd}]"; fi
 
 t_it "config 不存在 → 创建目录与文件（同机首次 link 场景）"
 fresh="${WORK}/fresh/.config/herdr/config.toml"

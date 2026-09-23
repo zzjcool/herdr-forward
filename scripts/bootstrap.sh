@@ -8,11 +8,14 @@
 #     本脚本用于补装键位 / 跨机场景 / 显式重装。
 #   - 跨机（client A attach 到 server B）：tab_bar_right 条目在 server 上解析执行，
 #     但配置本身是 client 的；B 的进程碰不到 A 的文件系统。B 侧 startup hook 只能
-#     降级为提示。跨机时请把本脚本（或 install-tabbar.sh）拷到 A 上，用 --config 指向
-#     A 的 config.toml 执行，或按 README 的一键复制块手工添加。
+#     降级为提示。跨机时请在 A 上运行本脚本、用 --config 指向 A 的 config.toml，
+#     **并用 --plugin-root 指向 B 上的插件路径**（command 在 B 上执行）。
 #
 # 行为契约：
 #   - --config PATH 透传给两个安装器（默认 ~/.config/herdr/config.toml）
+#   - --plugin-root PATH 透传给 install-tabbar.sh（tab bar command 里写的绝对路径）：
+#     语义是「**herdr server** 上的插件根」。默认可不传；**跨机时必须在 A 上显式传 B 的路径**
+#     （command 在 B 上执行，A 的本地路径对 B 无意义）。
 #   - --dry-run 透传（两个安装器都不落盘）
 #   - --no-tabbar / --no-keys 跳过对应安装器
 #   - 键位参数 --add-key/--list-key/--doctor-key 透传给 install-keys.sh
@@ -35,6 +38,8 @@ usage() {
 
 选项:
   --config PATH       目标 config 文件（默认: ~/.config/herdr/config.toml）
+  --plugin-root PATH  tab bar command 里写的插件绝对路径 = **herdr server** 上的插件根
+                      （默认自动解析为本脚本所在检出；跨机时传 server B 上的路径）
   --dry-run           只预览，不修改文件
   --no-tabbar         跳过 tab bar 状态条安装
   --no-keys           跳过键绑定安装
@@ -47,7 +52,8 @@ usage() {
 <config>.bak.<epoch>。装完执行 reload-config（或重启 herdr）即生效。
 
 跨机用户（client 与 herdr server 不在同一台机器）：本脚本只改「本机」config。
-需要为另一台机器装 tab bar 时，把本脚本拷过去用 --config 指定其 config.toml。
+需要为另一台机器装 tab bar 时，把本脚本拷过去用 --config 指定其 config.toml，
+并用 --plugin-root 指定 **server** 上的插件路径（tab bar command 在 server 上执行）。
 EOF
 }
 
@@ -58,6 +64,7 @@ die() {
 
 # --- 参数解析（禁交互） ---
 config_path=""
+plugin_root=""
 dry_run=0
 do_tabbar=1
 do_keys=1
@@ -67,6 +74,11 @@ while (($# > 0)); do
   --config)
     [[ $# -ge 2 ]] || die "--config 需要参数值"
     config_path="$2"
+    shift 2
+    ;;
+  --plugin-root)
+    [[ $# -ge 2 ]] || die "--plugin-root 需要参数值"
+    plugin_root="$2"
     shift 2
     ;;
   --dry-run)
@@ -103,6 +115,12 @@ if ((dry_run)); then
   dry_flag=(--dry-run)
 fi
 
+# --plugin-root 只对 tab bar 有意义（键位是 plugin_action，不经路径）
+plugin_root_args=()
+if [[ -n "${plugin_root}" ]]; then
+  plugin_root_args=(--plugin-root "${plugin_root}")
+fi
+
 step=0
 total=0
 ((do_tabbar)) && total=$((total + 1))
@@ -118,7 +136,7 @@ if ((do_tabbar)); then
   printf '\n== [%d/%d] tab bar 状态条 ==\n' "${step}" "${total}"
   [[ -f "${TABBAR_INSTALLER}" ]] ||
     die "缺少 ${TABBAR_INSTALLER}。请确认插件安装完整（herdr plugin link/install 后重试）。"
-  bash "${TABBAR_INSTALLER}" --config "${config_path}" "${dry_flag[@]}" ||
+  bash "${TABBAR_INSTALLER}" --config "${config_path}" "${plugin_root_args[@]}" "${dry_flag[@]}" ||
     die "install-tabbar.sh 失败（见上方输出）。文件未被部分破坏；修正后重跑本命令即可。"
 fi
 
@@ -147,6 +165,8 @@ cat <<EOF
 - B 上的插件进程碰不到 A 的文件系统，因此 B 侧无法自动替 A 写配置——这是物理
   边界，不是缺陷。同机用户（A == B）则由 [[startup]] hook 自动完成，无需本命令。
 - 为 A 安装：把本插件的 scripts/ 拷到 A（或 A 上直接 link 插件），然后在 A 上运行：
-     <插件根>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml
-  或按 README 的「一键复制块」手工添加等价条目。
+     <插件根>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
+       --plugin-root <server B 上的插件根>
+  ⚠ --plugin-root 必须写 **B** 上的路径（command 在 B 上执行），不是 A 的本地路径；
+    否则 tab bar 仍会静默空白。或按 README 的「一键复制块」手工添加等价条目。
 EOF
