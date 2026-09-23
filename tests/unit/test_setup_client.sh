@@ -25,6 +25,12 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SETUP="${ROOT}/scripts/setup-client.sh"
+# M1：ssh 探测实现已提取到 lib/ssh-probe.sh（setup-client.sh 改为消费方）。
+# 下面"timeout 15 包裹"的源码级防漂移断言，第 1 个 grep 故意指向**真实实现所在文件**
+#（断言强度不变：同一正则、同一对条件），第 2 个 grep 仍指向 setup-client.sh（它依然
+# 拥有 SSH_PROBE_TIMEOUT=15 这个策略常量）。这是 M1 对「只加用例不改既有」的唯一例外，
+# 已在 MR 描述与 worker 报告里显式申报。
+SSH_PROBE_LIB="${ROOT}/lib/ssh-probe.sh"
 
 if [[ -f "${ROOT}/tests/lib/assertions.sh" ]]; then
   # shellcheck source=/dev/null
@@ -36,6 +42,10 @@ fi
 
 if [[ ! -f "${SETUP}" ]]; then
   echo "RED: ${SETUP} 不存在（scripts/setup-client.sh 尚未实现）" >&2
+  exit 1
+fi
+if [[ ! -f "${SSH_PROBE_LIB}" ]]; then
+  echo "RED: ${SSH_PROBE_LIB} 不存在（lib/ssh-probe.sh 尚未提取，M1）" >&2
   exit 1
 fi
 
@@ -567,11 +577,13 @@ t_contains "${PROBED_ROOT}" "${out}" "输出展示探测到的插件根"
 t_contains "--server-root" "${out}" "说明 --server-root 已自动填入"
 shim_log="$(cat "${SSH_SHIM_LOG}")"
 t_contains "<-o> <BatchMode=yes>" "${shim_log}" "BatchMode 只读探测"
-# timeout 由 ssh_probe 以 `"$SSH_TIMER_BIN" "$SSH_PROBE_TIMEOUT"` 前置（shim 看不到这层 argv，
-# 只有 timeout 自己看不到——故此处做源码级防漂移断言）。
-if grep -qE 'cmd\+=\("\$\{SSH_TIMER_BIN\}" "\$\{SSH_PROBE_TIMEOUT\}"\)' "${SETUP}" &&
+# timeout 由 ssh_probe_run 以 `"$SSH_TIMER_BIN" "$SSH_PROBE_TIMEOUT"` 前置（shim 看不到这层
+# argv，只有 timeout 自己看不到——故此处做源码级防漂移断言）。
+# M1：实现搬到了 lib/ssh-probe.sh，故第 1 个 grep 指向 lib（断言强度不变）；
+#     策略常量 SSH_PROBE_TIMEOUT=15 仍由 setup-client.sh 拥有，第 2 个 grep 不动。
+if grep -qE 'cmd\+=\("\$\{SSH_TIMER_BIN\}" "\$\{SSH_PROBE_TIMEOUT\}"\)' "${SSH_PROBE_LIB}" &&
   grep -qE '^readonly SSH_PROBE_TIMEOUT=15$' "${SETUP}"; then
-  t_pass "探测被 timeout 15 包裹（源码断言：SSH_TIMER_BIN + SSH_PROBE_TIMEOUT=15）"
+  t_pass "探测被 timeout 15 包裹（源码断言：lib 的 SSH_TIMER_BIN 前置 + setup 的 SSH_PROBE_TIMEOUT=15）"
 else
   t_fail_note "探测未用 timeout 15 包裹（挂死保护缺失）"
 fi
@@ -677,6 +689,26 @@ t_it "--server-host 为空值：退出 2（参数校验）"
 run_setup_shim installed --config "${WORK}/ssh-empty.toml" --server-host ""
 t_isnt "0" "${rc}" "空值被拒"
 
+# M1 回归锚点：提取重构后，旧 CLI 的「接受范围 + 报错文案」必须逐字不变
+# （lib 的 parse_target 额外支持方括号 IPv6，但 setup-client.sh 有意不启用该放宽）。
+t_it "--server-host 端口非法：退出 2 且文案 = '端口非法: <port>'（提取后逐字不变）"
+run_setup_shim installed --config "${WORK}/ssh-badport.toml" --server-host b-user@b-host:ssh
+t_exit_ok 2 "${rc}" "退出 2"
+t_contains "--server-host 端口非法: 'ssh'" "${err}" "旧文案逐字保留"
+
+# 在 A 上先跑 ssh -o BatchMode=yes 提示（旧行为的另一条锚点）
+t_it "--server-host 缺主机名（:2222）：退出 2 且文案 = '缺少主机名: <target>'（逐字不变）"
+run_setup_shim installed --config "${WORK}/ssh-nohost.toml" --server-host ":2222"
+t_exit_ok 2 "${rc}" "退出 2"
+t_contains "--server-host 缺少主机名: ':2222'" "${err}" "旧文案逐字保留"
+
+t_it "--server-host 方括号 IPv6：仍按旧行为拒绝（退出 2，不静默放宽 CLI 接受范围）"
+: >"${SSH_SHIM_LOG}"
+run_setup_shim installed --config "${WORK}/ssh-v6.toml" --server-host "[::1]:2222"
+t_exit_ok 2 "${rc}" "退出 2（旧行为）"
+t_contains "端口非法" "${err}" "与提取前同一条报错"
+t_eq "0" "$(grep -c . "${SSH_SHIM_LOG}" || true)" "拒绝时未探测"
+
 t_it "--server-host 连得上但远端无 herdr（PATH 问题）：单独诊断 + 降级，不误导为「没装插件」"
 run_setup_shim noherdr --config "${WORK}/ssh-noherdr.toml" --server-host b-user@b-host --no-tabbar
 t_exit_ok 0 "${rc}" "退出 0"
@@ -716,6 +748,90 @@ t_eq "1" "${stdin_tb}" "tab bar 也装上（探测后的自动推导路径走通
 t_contains "✅" "${out}" "仍打印 ssh 探测结论（探测之后还有输出）"
 shim_calls_stdin="$(cat "${SSH_SHIM_LOG}")"
 t_contains "<-n>" "${shim_calls_stdin}" "ssh 用 -n（不读脚本本身）"
+
+t_describe "setup-client.sh — ssh 探测库的加载路径（checkout 直接 source / curl|bash 按需下载）"
+
+# M1 关键回归面：探测实现搬到 lib/ssh-probe.sh 后，两种形态都必须能找到它。
+# 隔离副本目录：既没有同目录安装器，也没有 ../lib/ —— 与 `curl … | bash -s` 等价。
+LIB_ISOLATED="${WORK}/curl-lib-form"
+mkdir -p "${LIB_ISOLATED}"
+cp "${SETUP}" "${LIB_ISOLATED}/setup-client.sh"
+
+t_it "curl|bash 形态 + --server-host：从 HF_RAW_BASE 同时拉到 lib/ssh-probe.sh，探测照常命中"
+: >"${SSH_SHIM_LOG}"
+cl_cfg="${WORK}/curl-lib.toml"
+new_config "${cl_cfg}" >/dev/null
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR \
+  "HOME=${WORK}/home" "XDG_CONFIG_HOME=${WORK}/xdg-config" "XDG_STATE_HOME=${WORK}/xdg-state" \
+  "PATH=${SSH_SHIM_DIR}:${BASE_PATH}" "SSH_SHIM_LOG=${SSH_SHIM_LOG}" \
+  "SSH_SHIM_SCENARIO=installed" \
+  "HF_RAW_BASE=file://${ROOT}/scripts" \
+  bash "${LIB_ISOLATED}/setup-client.sh" --config "${cl_cfg}" --server-host b-user@b-host \
+  2>"${WORK}/stderr")" || rc=$?
+err="$(cat "${WORK}/stderr")"
+t_exit_ok 0 "${rc}" "退出 0（err=${err:0:200}）"
+t_contains "✅" "${out}" "探测命中（证明 lib/ssh-probe.sh 真的被拉下来并 source 了）"
+cl_cmd="$(tabbar_command "${cl_cfg}")"
+t_contains "${PROBED_ROOT}/bin/forward" "${cl_cmd}" "tab bar 用探测到的 B 插件根（库已加载）"
+t_contains "${PROBED_STATE}" "${cl_cmd}" "tab bar 用探测到的 B state 目录"
+cl_keys="$(keys_count "${cl_cfg}")"
+t_eq "3" "${cl_keys}" "键位照常装上"
+cl_shim="$(cat "${SSH_SHIM_LOG}")"
+t_contains "<-o> <BatchMode=yes>" "${cl_shim}" "下载形态下探测也是 BatchMode 只读"
+if [[ "${cl_shim}" == *"plugin install"* ]]; then
+  t_fail_note "下载形态下自动装了插件（绝不自动装）"
+else
+  t_pass "下载形态下仍零安装动作"
+fi
+
+t_it "checkout 形态：同仓库的 ../lib/ssh-probe.sh 直接用，HF_RAW_BASE 不可达也不联网"
+: >"${SSH_SHIM_LOG}"
+co_cfg="${WORK}/co-lib.toml"
+new_config "${co_cfg}" >/dev/null
+run_setup_shim installed --config "${co_cfg}" --server-host b-user@b-host
+# run_setup_shim 不带 HF_RAW_BASE —— 默认回落到 raw.githubusercontent.com；
+# 但 checkout 形态根本不该去下载，故仍然必须命中探测（若误走下载，会因网络/URL 失败而退 1）。
+t_exit_ok 0 "${rc}" "退出 0（未联网）"
+co_cmd="$(tabbar_command "${co_cfg}")"
+t_contains "${PROBED_ROOT}/bin/forward" "${co_cmd}" "checkout 形态探测命中（lib 从 ../lib 加载）"
+
+t_it "下载不到 lib/ssh-probe.sh：非 0 + 点名推下载 URL + 给出 git clone 退路"
+: >"${SSH_SHIM_LOG}"
+bad_lib_cfg="${WORK}/bad-lib.toml"
+new_config "${bad_lib_cfg}" >/dev/null
+bad_lib_before="$(md5 "${bad_lib_cfg}")"
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR \
+  "HOME=${WORK}/home" "XDG_CONFIG_HOME=${WORK}/xdg-config" "XDG_STATE_HOME=${WORK}/xdg-state" \
+  "PATH=${SSH_SHIM_DIR}:${BASE_PATH}" "SSH_SHIM_LOG=${SSH_SHIM_LOG}" \
+  "HF_RAW_BASE=file://${WORK}/no-such-raw-base/scripts" \
+  bash "${LIB_ISOLATED}/setup-client.sh" --config "${bad_lib_cfg}" --server-host b-user@b-host \
+  2>"${WORK}/stderr")" || rc=$?
+err="$(cat "${WORK}/stderr")"
+t_isnt "0" "${rc}" "退出码非 0"
+t_contains "ssh-probe.sh" "${err}" "stderr 点名缺失的库文件"
+t_match "git clone|clone|ssh-probe" "${err}" "错误信息给出下一步"
+bad_lib_after="$(md5 "${bad_lib_cfg}")"
+t_eq "${bad_lib_before}" "${bad_lib_after}" "config 未被碰（未做半截安装）"
+t_eq "0" "$(grep -c . "${SSH_SHIM_LOG}" || true)" "lib 缺失时一次 ssh 都不发"
+
+t_it "--server-host 端口非法：退出 2（用法错，stderr 可读；不是 64 内部码泄漏）"
+: >"${SSH_SHIM_LOG}"
+bad_port_cfg="${WORK}/bad-port.toml"
+new_config "${bad_port_cfg}" >/dev/null
+bad_port_before="$(md5 "${bad_port_cfg}")"
+run_setup_shim installed --config "${bad_port_cfg}" --server-host b-user@b-host:nope
+t_exit_ok 2 "${rc}" "退出 2"
+t_contains "--server-host" "${err}" "stderr 点名参数"
+bad_port_after="$(md5 "${bad_port_cfg}")"
+t_eq "${bad_port_before}" "${bad_port_after}" "config 未被碰"
+t_eq "0" "$(grep -c . "${SSH_SHIM_LOG}" || true)" "非法 target 不探测"
+
+t_it "--server-host 缺主机名（:2222）：退出 2"
+run_setup_shim installed --config "${WORK}/bad-host.toml" --server-host ":2222"
+t_exit_ok 2 "${rc}" "退出 2"
+t_contains "--server-host" "${err}" "stderr 点名参数"
 
 t_describe "setup-client.sh — 静态检查与文档防漂移"
 
