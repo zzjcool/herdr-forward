@@ -8,6 +8,7 @@
 #   forward publish <port>     # 二期占位：exit 9
 #   forward unpublish          # 二期占位：exit 9
 #   forward watch              # pane 入口
+#   forward bootstrap [--config PATH] [--dry-run] [--no-tabbar] [--no-keys]  # OOTB UI 安装
 # 退出码表（A.3 冻结）：0 ok / 2 重复端口 / 3 记录不存在 / 4 machine 无法解析 /
 #   5 隧道启动失败 / 9 未实现 / 127 依赖缺失；用法错误用 64（EX_USAGE，见 --help）。
 set -Eeuo pipefail
@@ -84,6 +85,9 @@ forward — herdr 端口转发管理（一期：ssh -L）
 
   forward remove <id>
       删除映射（id 形如 f-3000），存在隧道模块时会一并停隧道。
+
+  forward bootstrap [--config PATH] [--dry-run] [--no-tabbar] [--no-keys]
+      OOTB 一键安装 UI：tab bar 状态条 + 键绑定（两个安装器都幂等）。
 
   forward doctor [--fix] [--prune]
       探活并报告；--fix 按探活结果修正 status；--prune 清理死进程记录。
@@ -555,6 +559,18 @@ cmd_watch() {
   exec watch -n 3 "${FORWARD_ROOT}/bin/forward" list
 }
 
+# --- bootstrap（OOTB 子命令） ---
+
+# cmd_bootstrap：把参数原样转发给 scripts/bootstrap.sh（单一实现，CLI 只是入口）。
+# 该脚本负责 tab bar + 键位的幂等安装与后续指引；缺脚本时给出可执行的下一步。
+cmd_bootstrap() {
+  local script="${FORWARD_ROOT}/scripts/bootstrap.sh"
+  if [[ ! -f "${script}" ]]; then
+    die 127 "缺少 ${script}（OOTB 安装脚本）。本机手动安装：bash scripts/install-tabbar.sh && bash scripts/install-keys.sh。请确认插件检出完整后重试。"
+  fi
+  exec bash "${script}" "$@"
+}
+
 # --- dispatch ---
 
 main() {
@@ -574,6 +590,7 @@ main() {
   publish) cmd_publish "$@" ;;
   unpublish) cmd_unpublish "$@" ;;
   watch) cmd_watch "$@" ;;
+  bootstrap) cmd_bootstrap "$@" ;;
   help | --help | -h)
     usage
     return 0
