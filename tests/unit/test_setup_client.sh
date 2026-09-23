@@ -371,6 +371,33 @@ t_isnt "0" "${rc}" "退出码非 0"
 t_file_absent "${c_dl}" "未写 config"
 t_match "git clone|clone|scripts/setup-client" "${err}" "错误信息给出下一步"
 
+t_it "真 stdin 形态（cat script | bash -s）：BASH_SOURCE 未定义也不得 unbound"
+: >"${STUB_LOG}"
+SETUP_BIN="${SETUP}"
+setup_env=(
+  "HOME=${WORK}/home"
+  "XDG_CONFIG_HOME=${WORK}/xdg-config"
+  "XDG_STATE_HOME=${WORK}/xdg-state"
+  "STUB_LOG=${STUB_LOG}"
+  "HF_RAW_BASE=file://${STUB_DIR}"
+  "STUB_FAIL_TABBAR=0"
+)
+c_stdin="${WORK}/stdin.toml"
+# `bash -s < script` 与 `curl | bash -s` 等价（脚本从 stdin 读入，BASH_SOURCE 未定义），
+# 且避开 shellcheck SC2002（useless cat）。
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR "${setup_env[@]}" bash -s -- \
+  --config "${c_stdin}" --server-root "${SERVER_ROOT_FIXTURE}" <"${SETUP}" 2>"${WORK}/stderr")" || rc=$?
+err="$(cat "${WORK}/stderr")"
+t_exit_ok 0 "${rc}" "退出 0"
+stdin_log="$(cat "${STUB_LOG}")"
+t_isnt "" "${stdin_log}" "安装器被调用（下载分支）"
+if [[ "${err}" == *"unbound variable"* ]]; then
+  t_fail_note "stdin 形态触发了 unbound variable（set -u 下 BASH_SOURCE 未定义）"
+else
+  t_pass "无 unbound variable"
+fi
+
 # 恢复被测脚本/环境到真实安装器
 SETUP_BIN="${SETUP}"
 setup_env=(

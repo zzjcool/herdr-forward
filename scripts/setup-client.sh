@@ -130,8 +130,15 @@ if ((do_tabbar == 1)) && [[ -z "${server_root}" ]]; then
 fi
 
 # --- 安装器定位：优先同目录（git clone / 插件检出场景），否则按需下载（curl | bash 场景） ---
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SELF_DIR
+# ⚠ `curl … | bash -s` 时脚本从 stdin 读入，`BASH_SOURCE[0]` **未定义**，
+# 在 set -u 下直接展开会 "unbound variable" 把自己打死 —— 故用 `${BASH_SOURCE[0]:-}`，
+# 空值表示 stdin 形态（此时一定走下载分支）。
+SELF_PATH="${BASH_SOURCE[0]:-}"
+SELF_DIR=""
+if [[ -n "${SELF_PATH}" ]]; then
+  SELF_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
+fi
+readonly SELF_PATH SELF_DIR
 
 download_dir=""
 cleanup() {
@@ -145,7 +152,7 @@ TABBAR_INSTALLER=""
 KEYS_INSTALLER=""
 
 locate_installers() {
-  if [[ -f "${SELF_DIR}/install-tabbar.sh" && -f "${SELF_DIR}/install-keys.sh" ]]; then
+  if [[ -n "${SELF_DIR}" && -f "${SELF_DIR}/install-tabbar.sh" && -f "${SELF_DIR}/install-keys.sh" ]]; then
     TABBAR_INSTALLER="${SELF_DIR}/install-tabbar.sh"
     KEYS_INSTALLER="${SELF_DIR}/install-keys.sh"
     return 0
@@ -209,7 +216,7 @@ PY
 state_dir_source="arg"
 if [[ -z "${server_state_dir}" ]]; then
   state_dir_source="derived"
-  server_state_dir="$(derive_state_dir "${server_root:-${SELF_DIR}/..}")"
+  server_state_dir="$(derive_state_dir "${server_root:-${SELF_DIR:-.}/..}")"
 fi
 
 # --- B 侧可用性探测（尽力而为：只打印，绝不阻塞） ---
