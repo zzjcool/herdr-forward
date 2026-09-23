@@ -61,6 +61,8 @@ herdr [[startup]] 钩子：检测到 tab bar 状态条缺失时自动执行 inst
 选项:
   --config PATH   显式指定目标 config（默认取 HERDR_CONFIG_PATH，再退
                   $XDG_CONFIG_HOME/herdr/config.toml）
+  --state-dir PATH 显式指定插件 state 目录（默认取 HERDR_PLUGIN_STATE_DIR，再交
+                  install-tabbar.sh 按 XDG 推导）。写进 tab bar command 的 env 前缀。
   --dry-run       只预览，不修改文件
   --help          显示本帮助
 
@@ -68,12 +70,18 @@ herdr [[startup]] 钩子：检测到 tab bar 状态条缺失时自动执行 inst
 install-tabbar.sh 自动解析出的「本机绝对路径」就是正确的 server 路径（不存在 $HERDR_PLUGIN_ROOT
 那样在 tab bar 执行上下文里缺失的 env）。跨机场景的 client 侧请用 bootstrap.sh --plugin-root。
 
+state 目录：hook 自己跑在插件上下文里，HERDR_PLUGIN_STATE_DIR 就是 herdr 给本插件分配的
+state 目录（插件 action / 面板 add 写的就是它）。tab bar command 的执行上下文里**没有**
+这个 env，故 hook 把它显式传给 install-tabbar.sh 写进 command —— 不这样做两处会分叉到
+~/.local/state/herdr-forward 与 ~/.local/state/herdr/plugins/zzjcool%3Aforward，tab bar 永远空。
+
 跨机说明：本 hook 只写「本机」（= herdr server 所在机器）的 config。client 若在
 另一台机器，请在那台机器上运行 <插件根>/scripts/bootstrap.sh --plugin-root <server 插件根>。
 EOF
 }
 
 config_path=""
+state_dir=""
 dry_run=0
 while (($# > 0)); do
   case "$1" in
@@ -84,6 +92,15 @@ while (($# > 0)); do
       continue
     fi
     config_path="$2"
+    shift 2
+    ;;
+  --state-dir)
+    if [[ $# -lt 2 ]]; then
+      _hook_warn "--state-dir 缺少参数值，按 HERDR_PLUGIN_STATE_DIR/推导默认继续"
+      shift
+      continue
+    fi
+    state_dir="$2"
     shift 2
     ;;
   --dry-run)
@@ -130,15 +147,26 @@ if ((dry_run)); then
   dry_flag=(--dry-run)
 fi
 
-# install-tabbar.sh 自己幂等（已有条目则 exit 0 并提示 already；检测到旧格式的
-# $HERDR_PLUGIN_ROOT 字面量则自动升级为绝对路径），故直接调用即可。
+# state 目录 = 插件上下文里 herdr 注入的权威值（插件 action / 面板 add 写的就是它）。
+# 显式传下去，install-tabbar.sh 会把它嵌进 tab bar command 的 env 前缀。
+# --state-dir 显式参数 > HERDR_PLUGIN_STATE_DIR > 交给安装器推导。
+state_dir_args=()
+if [[ -n "${state_dir}" ]]; then
+  state_dir_args=(--state-dir "${state_dir}")
+elif [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
+  state_dir_args=(--state-dir "${HERDR_PLUGIN_STATE_DIR}")
+fi
+
+# install-tabbar.sh 自己幂等（已有条目则 exit 0 并提示 already；检测到属于本插件但
+# 与当前期望不同的条目——旧的 $HERDR_PLUGIN_ROOT 字面量形式或缺 state env 前缀——
+# 则就地重写），故直接调用即可。
 # 不传 --plugin-root：install-tabbar.sh 解析自身真实位置，得到的就是 **server 上的**
 # 绝对路径（hook 与 command 同在 server 执行），这比猜路径可靠。
 # set +e 包裹：任何非 0 都降级为日志，绝不冒泡（startup 不得打断 server）。
 installer_rc=0
 installer_out=""
 set +o errexit
-installer_out="$(bash "${TABBAR_INSTALLER}" --config "${config_path}" "${dry_flag[@]}" 2>&1)"
+installer_out="$(bash "${TABBAR_INSTALLER}" --config "${config_path}" "${state_dir_args[@]}" "${dry_flag[@]}" 2>&1)"
 installer_rc=$?
 set -o errexit
 
@@ -151,7 +179,8 @@ if [[ "${installer_rc}" -eq 0 ]]; then
   printf '%s\n' \
     "提示：tab bar 条目已就绪。若你的 herdr client 跑在另一台机器（跨机 attach），" \
     "那台机器需要单独运行 <插件根>/scripts/bootstrap.sh --config <A 的 config> " \
-    "--plugin-root <本机（server B）的插件根> —— server 侧无法代写 client 配置。"
+    "--plugin-root <本机（server B）的插件根> --state-dir <本机（server B）的插件 state 目录> " \
+    "—— server 侧无法代写 client 配置。"
   exit 0
 fi
 

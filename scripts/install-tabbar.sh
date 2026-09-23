@@ -27,15 +27,39 @@
 #   不传则按本脚本的真实位置（<plugin_root>/scripts/）自动解析 —— 同机/在 server 上跑
 #   时这个默认值永远正确。
 #   render_oneline 输出纯文本无 ANSI，符合该执行模型。
+#
+# ⚠⚠ 第二个环境事实（真实环境 bug #3，本文件的核心修复）：tab bar command 的执行
+#   context 里**也没有** HERDR_PLUGIN_STATE_DIR（那是 herdr 注入给插件 action / pane /
+#   startup 命令的，§2.2）。没有它时 bin/forward 会回退到 ~/.local/state/herdr-forward，
+#   而插件 action 写的是 ~/.local/state/herdr/plugins/zzjcool%3Aforward —— 两个目录
+#   分叉，于是「面板里 add 的转发，tab bar 永远看不见」。修法：command 显式带 env 前缀：
+#     env HERDR_PLUGIN_STATE_DIR='<插件 state 目录>' '<plugin_root>/bin/forward' list --oneline
+#   state 目录名 = <XDG_STATE_HOME>/herdr/plugins/<plugin_id 的 URL 编码>（':' → '%3A'），
+#   安装器无法从 env 反推（tab bar 场景没有 env），故：
+#     --state-dir PATH 显式 > HERDR_PLUGIN_STATE_DIR env（插件 action/startup 上下文里有）
+#     > 默认 ${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward
+#   值里的 % 不需要转义（percent_expand 是 ssh 的事），但**单引号引用必须正确**
+#   （见 _sh_quote），且 TOML 字符串转义由 render_entry 的 toml_string 负责。
 set -Eeuo pipefail
 
 readonly PROG_NAME="${0##*/}"
 readonly DEFAULT_CONFIG="${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/herdr/config.toml"
+# 本插件在 herdr state 目录里的子路径：herdr 用 <id 的 URL 编码> 当目录名，
+# id 'zzjcool:forward' → 'zzjcool%3Aforward'（':' → '%3A'）。
+# 硬编码合法：plugin id 由本仓库自己声明，不会被改名。
+readonly PLUGIN_STATE_SUBDIR='herdr/plugins/zzjcool%3Aforward'
+readonly DEFAULT_STATE_DIR="${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/${PLUGIN_STATE_SUBDIR}"
 # 幂等标记：作为 TOML 注释写入，下次运行据此识别（不依赖 command 文本）
 readonly MARKER_COMMENT="# herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)"
-# 旧格式特征串（单引号 = 字面量，**故意不展开**）：命中即触发自愈升级。
-# shellcheck disable=SC2016  # 单引号内的 $HERDR_PLUGIN_ROOT 就是要匹配的字面量
-readonly LEGACY_ENV_MARK='$HERDR_PLUGIN_ROOT'
+
+# _sh_quote <value>：POSIX sh 单引号引用（值里的 ' 用 '\'' 转义）。
+# tab bar command 由 /bin/sh -lc 执行，state 目录可能含空格 / 引号，必须安全引用。
+# 例：/a%b'c -> '/a%b'\''c'（round-trip 由 /bin/sh 验证，见 tests/unit/test_install_tabbar.sh）。
+_sh_quote() {
+  local value="${1-}" escaped=""
+  escaped="${value//\'/\'\\\'\'}"
+  printf "'%s'" "${escaped}"
+}
 
 # _resolve_self：解析本脚本的真实路径（跟随符号链接，不依赖 GNU readlink -f —— BSD
 # readlink 无 -f）。herdr plugin link 会把整个插件目录做成符号链接，这里跟到真实树。
@@ -65,12 +89,20 @@ usage() {
   --config PATH       目标 config 文件（默认: ~/.config/herdr/config.toml）
   --plugin-root PATH  插件在 **herdr server** 上的绝对路径（默认自动解析为本脚本所在
                       插件检出；跨机场景下必须传 server B 上的路径）
-  --command CMD       tab bar 执行的 command 字符串（覆盖默认生成的绝对路径命令）
+  --state-dir PATH    插件在 **herdr server** 上的 state 目录绝对路径（默认取
+                      $HERDR_PLUGIN_STATE_DIR，再退
+                      ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/zzjcool%3Aforward）。
+                      写进 command 的 env 前缀 —— tab bar 执行上下文里**没有**
+                      HERDR_PLUGIN_STATE_DIR，不显式传就会和插件 action 写两份状态。
+                      跨机时传 server B 上的 state 目录。
+  --command CMD       tab bar 执行的 command 字符串（覆盖默认生成的命令；覆盖时不再
+                      自动加 state env 前缀，由调用方负责）
   --dry-run           只打印将要写入的内容，不修改文件
   --help              显示本帮助
 
-幂等：重复执行不会重复插入；检测到旧格式（command 含 $HERDR_PLUGIN_ROOT 字面量，
-在 tab bar 场景下无法解析）时会自动升级为绝对路径。每次真实修改都会先生成
+幂等：重复执行不会重复插入；检测到本插件管理的条目与当前期望不符（旧的
+$HERDR_PLUGIN_ROOT 字面量形式、缺少 state env 前缀、或 state 目录过期）时会就地重写
+（保留用户改过的 interval_seconds / timeout_seconds）。每次真实修改都会先生成
 <config>.bak.<epoch> 备份。
 EOF
 }
@@ -84,6 +116,7 @@ die() {
 config_path=""
 command_str=""
 plugin_root=""
+state_dir=""
 dry_run=0
 while (($# > 0)); do
   case "$1" in
@@ -95,6 +128,11 @@ while (($# > 0)); do
   --plugin-root)
     [[ $# -ge 2 ]] || die "--plugin-root 需要参数值"
     plugin_root="$2"
+    shift 2
+    ;;
+  --state-dir)
+    [[ $# -ge 2 ]] || die "--state-dir 需要参数值"
+    state_dir="$2"
     shift 2
     ;;
   --command)
@@ -130,9 +168,31 @@ else
   plugin_root="${DEFAULT_PLUGIN_ROOT}"
 fi
 
-# 默认 command：server 上的绝对路径 + 固定参数（不经 env、不经 shell 变量）
+# state 目录来源优先级：--state-dir > HERDR_PLUGIN_STATE_DIR env > XDG 推导默认。
+# env 优先于推导的理由：startup hook / 插件 action 上下文里有该 env，那正是 herdr 给本插件
+# 分配的权威 state 目录（面板 add 就写在那里），比推导更可靠。
+state_dir_source="default"
+if [[ -n "${state_dir}" ]]; then
+  state_dir_source="arg"
+elif [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
+  state_dir="${HERDR_PLUGIN_STATE_DIR}"
+  state_dir_source="env"
+fi
+[[ -n "${state_dir}" ]] || state_dir="${DEFAULT_STATE_DIR}"
+
+if [[ "${state_dir_source}" != "default" ]]; then
+  # 与 --plugin-root 同规矩：state 目录要写进 server 的 command，相对路径不可靠。
+  [[ "${state_dir}" == /* ]] ||
+    die "state 目录必须是绝对路径（收到 '${state_dir}'）：它会写进 tab bar command（在 server 上执行）。请用 --state-dir 传绝对路径。"
+  while [[ "${state_dir}" != "/" && "${state_dir}" == */ ]]; do
+    state_dir="${state_dir%/}"
+  done
+fi
+
+# 默认 command：env 前缀（state 目录，逃过 tab bar 上下文的 env 缺失）+ server 上的
+# 绝对路径 + 固定参数（命令里不出现任何 shell 变量展开，字面量路径）
 if [[ -z "${command_str}" ]]; then
-  command_str="\"${plugin_root}/bin/forward\" list --oneline"
+  command_str="env HERDR_PLUGIN_STATE_DIR=$(_sh_quote "${state_dir}") \"${plugin_root}/bin/forward\" list --oneline"
 fi
 
 if [[ ! -e "${plugin_root}/bin/forward" ]]; then
@@ -172,7 +232,6 @@ new_content=""
 rc=0
 new_content="$(
   HF_CONFIG="${config_path}" HF_COMMAND="${command_str}" HF_MARKER="${MARKER_COMMENT}" \
-    HF_LEGACY="${LEGACY_ENV_MARK}" \
     python3 - <<'PY'
 import os
 import sys
@@ -181,7 +240,6 @@ import tomllib
 path = os.environ["HF_CONFIG"]
 command = os.environ["HF_COMMAND"]
 marker = os.environ["HF_MARKER"]
-legacy = os.environ["HF_LEGACY"]
 
 raw = b""
 if os.path.exists(path):
@@ -303,23 +361,26 @@ def render_entry(interval, timeout):
     )
 
 
+def entry_from_chunk(chunk):
+    """从「标记注释 + inline table」的 chunk 里解析出条目（失败返回 None）。
+
+    inline table 在顶层不是合法 TOML 语句，故包一层 `x = …` 再解析。
+    """
+    body = "\n".join(line for line in chunk.splitlines() if not line.strip().startswith("#"))
+    if not body.strip():
+        return None
+    try:
+        return tomllib.loads("x = " + body.strip())["x"]
+    except Exception:
+        return None
+
+
 marker_present = any(line.strip() == marker for line in text.splitlines())
 
 if marker_present:
-    doc = tomllib.loads(text)
-    entries = (doc.get("ui") or {}).get("tab_bar_right") or []
-    if not isinstance(entries, list):
-        entries = []
-
-    # 已装用户的**旧格式**：我们管理的条目 command 仍是 $HERDR_PLUGIN_ROOT 字面量。
-    legacy_entries = [
-        e for e in entries if isinstance(e, dict) and legacy in str(e.get("command", ""))
-    ]
-    if len(legacy_entries) != 1:
-        # 已是新格式（或存在我们无法安全判定的结构）→ 幂等 no-op
-        sys.exit(10)
-
-    old = legacy_entries[0]
+    # 我们管理的条目就在标记注释所在的那个 chunk 里。是否重写只看一件事：
+    # 它的 command 是否与当前期望逐字相同 —— 不同即旧格式（$HERDR_PLUGIN_ROOT 字面量 /
+    # 缺 state env 前缀 / state 目录过期），就地重写并**保留**用户的 interval/timeout。
     bounds = locate_array(text, "tab_bar_right")
     if bounds is None:
         print("marker present but tab_bar_right array not located", file=sys.stderr)
@@ -327,24 +388,30 @@ if marker_present:
     open_at, close_at = bounds
     inner = text[open_at + 1 : close_at]
 
-    interval = sane_int(old.get("interval_seconds"), 5, 1, 31536000)
-    timeout = sane_int(old.get("timeout_seconds"), 2, 1, 3600)
-
     chunks = []
     replaced = 0
     for part in split_top_level(inner):
         stripped = part.strip()
         if not stripped:
             continue
-        if marker in [line.strip() for line in stripped.splitlines()]:
-            chunks.append(marker + "\n" + render_entry(interval, timeout))
-            replaced += 1
-        else:
+        if marker not in [line.strip() for line in stripped.splitlines()]:
             # 用户的其它条目原样保留（只规范化缩进）
             chunks.append(stripped)
+            continue
+        old = entry_from_chunk(stripped)
+        if not isinstance(old, dict):
+            # 结构不可安全判定 → 绝不乱动
+            sys.exit(10)
+        old_command = str(old.get("command", ""))
+        if old_command == command:
+            sys.exit(10)
+        interval = sane_int(old.get("interval_seconds"), 5, 1, 31536000)
+        timeout = sane_int(old.get("timeout_seconds"), 2, 1, 3600)
+        chunks.append(marker + "\n" + render_entry(interval, timeout))
+        replaced += 1
     if replaced != 1:
-        print("legacy marker entry not found in array (%d)" % replaced, file=sys.stderr)
-        sys.exit(4)
+        # 标记存在但找不到对应条目（结构异常）→ 不动
+        sys.exit(10)
 
     rebuilt = "[\n" + "".join(indent_block(chunk) + ",\n" for chunk in chunks) + "]"
     out = text[:open_at] + rebuilt + text[close_at + 1 :]

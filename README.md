@@ -95,7 +95,7 @@ oversight. In that case:
   [ui]
   tab_bar_right = [
     # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-    { type = "command", command = "\"<server-plugin-root>/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
+    { type = "command", command = "env HERDR_PLUGIN_STATE_DIR='<server-state-dir>' \"<server-plugin-root>/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
   ]
   ```
 
@@ -126,18 +126,30 @@ oversight. In that case:
   (B)** — not on A. The tab-bar `command` is executed by herdr *on the server*,
   under `/bin/sh -lc`, in an environment that does **not** contain
   `HERDR_PLUGIN_ROOT` (that variable is only injected for plugin actions, panes
-  and startup commands). So the command must be a literal absolute path that
-  exists on B. Replace `<server-plugin-root>` by hand, or let the installer do
-  it:
+  and startup commands) **nor `HERDR_PLUGIN_STATE_DIR`** (same reason). So the
+  command must be a literal absolute path that exists on B, plus an explicit
+  `env HERDR_PLUGIN_STATE_DIR=…` prefix pointing at **B's** plugin state
+  directory — `<XDG_STATE_HOME>/herdr/plugins/zzjcool%3Aforward`
+  (`~/.local/state/herdr/plugins/zzjcool%3Aforward` by default, on B). Without
+  that prefix `bin/forward` falls back to `~/.local/state/herdr-forward`, so the
+  tab bar reads a different `forwards.json` than the one your panel writes —
+  the status bar would always be blank. Replace the placeholders by hand, or let
+  the installer do it:
 
   ```sh
-  # on A, pointing at B's plugin checkout
+  # on A, pointing at B's plugin checkout and B's state dir
   <plugin-root>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
-    --plugin-root <server-plugin-root>
+    --plugin-root <server-plugin-root> \
+    --state-dir <server-state-dir>
   ```
 
-  If it is already installed with the old `$HERDR_PLUGIN_ROOT` form, just re-run
-  the command above: the installer detects the legacy entry and rewrites it in
+  (`--state-dir` defaults to `$HERDR_PLUGIN_STATE_DIR` when set, else to
+  `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward`;
+  cross-machine you must pass B's value, as above.)
+
+  If it is already installed with the old `$HERDR_PLUGIN_ROOT` form, or with the
+  absolute-path form that predates the state-env fix, just re-run the command
+  above: the installer detects the stale entry and rewrites it in
   place (keeping your `interval_seconds`/`timeout_seconds`).
 
 If you are already in a herdr session on the server, the same one-shot install is
@@ -151,15 +163,17 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 
 | Script | Adds | Notes |
 |---|---|---|
-| `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--command CMD`, `--dry-run` |
+| `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--command CMD`, `--dry-run` |
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
-| `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
+| `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
 | `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
 the original to `config.toml.bak.<epoch>` before any real change. Re-running
-`install-tabbar.sh` also upgrades a legacy entry (one whose `command` still
-contains the unexpandable `$HERDR_PLUGIN_ROOT` literal) to the absolute-path form.
+`install-tabbar.sh` rewrites a stale entry — one whose `command` still contains
+the unexpandable `$HERDR_PLUGIN_ROOT` literal, or that lacks/outdates the
+`env HERDR_PLUGIN_STATE_DIR=…` prefix — to the current form, keeping your
+`interval_seconds`/`timeout_seconds`.
 When installed from GitHub, use the copy inside the managed checkout:
 `"$HERDR_PLUGIN_ROOT/scripts/bootstrap.sh"`.
 
@@ -195,7 +209,20 @@ bin/forward bootstrap                         # (re)install the UI / print next 
 
 Run it from the plugin checkout (or as `"$HERDR_PLUGIN_ROOT/bin/forward"` in a
 herdr plugin context — note that this env var is **not** set for tab-bar
-commands, which is why the installer writes an absolute path there). In a herdr
+commands, which is why the installer writes an absolute path there; the same
+goes for `HERDR_PLUGIN_STATE_DIR`, which is why the installer also writes an
+explicit `env HERDR_PLUGIN_STATE_DIR=…` prefix). A bare `bin/forward` invoked
+outside a herdr plugin context has no `HERDR_PLUGIN_STATE_DIR`, so it falls back
+to `~/.local/state/herdr-forward` and will look empty even while the panel shows
+active forwards — pass the variable explicitly if you want to inspect the
+plugin's real state:
+
+```sh
+HERDR_PLUGIN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward" \
+  bin/forward list
+```
+
+In a herdr
 session the same commands are reachable as plugin actions — `Port Forward:
 Add…`, `List`, `Doctor`, and `Setup UI`
 (`herdr plugin action invoke bootstrap --plugin zzjcool:forward`).
