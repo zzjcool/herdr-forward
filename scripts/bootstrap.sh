@@ -16,6 +16,12 @@
 #   - --plugin-root PATH 透传给 install-tabbar.sh（tab bar command 里写的绝对路径）：
 #     语义是「**herdr server** 上的插件根」。默认可不传；**跨机时必须在 A 上显式传 B 的路径**
 #     （command 在 B 上执行，A 的本地路径对 B 无意义）。
+#   - --state-dir PATH 透传给 install-tabbar.sh（写进 tab bar command 的 env 前缀，
+#     = **herdr server** 上的插件 state 目录）。不传时依次取 HERDR_PLUGIN_STATE_DIR
+#     （插件 action/startup 上下文里有）→ install-tabbar.sh 的 XDG 推导默认值。
+#     为什么必须显式：tab bar command 的执行上下文里**没有** HERDR_PLUGIN_STATE_DIR，
+#     缺了它 bin/forward 会回退到 ~/.local/state/herdr-forward，与插件 action 写入的
+#     ~/.local/state/herdr/plugins/zzjcool%3Aforward 分叉 → tab bar 永远空（真实 bug #3）。
 #   - --dry-run 透传（两个安装器都不落盘）
 #   - --no-tabbar / --no-keys 跳过对应安装器
 #   - 键位参数 --add-key/--list-key/--doctor-key 透传给 install-keys.sh
@@ -40,6 +46,10 @@ usage() {
   --config PATH       目标 config 文件（默认: ~/.config/herdr/config.toml）
   --plugin-root PATH  tab bar command 里写的插件绝对路径 = **herdr server** 上的插件根
                       （默认自动解析为本脚本所在检出；跨机时传 server B 上的路径）
+  --state-dir PATH    tab bar command 里写的插件 state 目录 = **herdr server** 上的
+                      ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/zzjcool%3Aforward
+                      （默认取 HERDR_PLUGIN_STATE_DIR，再退上述路径）。tab bar 执行
+                      上下文里没有该 env，不写进 command 就会和插件 action 的状态目录分叉。
   --dry-run           只预览，不修改文件
   --no-tabbar         跳过 tab bar 状态条安装
   --no-keys           跳过键绑定安装
@@ -65,6 +75,7 @@ die() {
 # --- 参数解析（禁交互） ---
 config_path=""
 plugin_root=""
+state_dir=""
 dry_run=0
 do_tabbar=1
 do_keys=1
@@ -79,6 +90,11 @@ while (($# > 0)); do
   --plugin-root)
     [[ $# -ge 2 ]] || die "--plugin-root 需要参数值"
     plugin_root="$2"
+    shift 2
+    ;;
+  --state-dir)
+    [[ $# -ge 2 ]] || die "--state-dir 需要参数值"
+    state_dir="$2"
     shift 2
     ;;
   --dry-run)
@@ -121,6 +137,16 @@ if [[ -n "${plugin_root}" ]]; then
   plugin_root_args=(--plugin-root "${plugin_root}")
 fi
 
+# --state-dir 显式 > HERDR_PLUGIN_STATE_DIR（插件 action/startup 上下文里有这个 env，
+# 那正是 herdr 给本插件分配的权威 state 目录）> 交给 install-tabbar.sh 自己推导。
+# 显式传递也让「透传」在测试里可断言。
+state_dir_args=()
+if [[ -n "${state_dir}" ]]; then
+  state_dir_args=(--state-dir "${state_dir}")
+elif [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
+  state_dir_args=(--state-dir "${HERDR_PLUGIN_STATE_DIR}")
+fi
+
 step=0
 total=0
 ((do_tabbar)) && total=$((total + 1))
@@ -136,7 +162,7 @@ if ((do_tabbar)); then
   printf '\n== [%d/%d] tab bar 状态条 ==\n' "${step}" "${total}"
   [[ -f "${TABBAR_INSTALLER}" ]] ||
     die "缺少 ${TABBAR_INSTALLER}。请确认插件安装完整（herdr plugin link/install 后重试）。"
-  bash "${TABBAR_INSTALLER}" --config "${config_path}" "${plugin_root_args[@]}" "${dry_flag[@]}" ||
+  bash "${TABBAR_INSTALLER}" --config "${config_path}" "${plugin_root_args[@]}" "${state_dir_args[@]}" "${dry_flag[@]}" ||
     die "install-tabbar.sh 失败（见上方输出）。文件未被部分破坏；修正后重跑本命令即可。"
 fi
 
@@ -166,7 +192,9 @@ cat <<EOF
   边界，不是缺陷。同机用户（A == B）则由 [[startup]] hook 自动完成，无需本命令。
 - 为 A 安装：把本插件的 scripts/ 拷到 A（或 A 上直接 link 插件），然后在 A 上运行：
      <插件根>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
-       --plugin-root <server B 上的插件根>
+       --plugin-root <server B 上的插件根> --state-dir <server B 上的插件 state 目录>
   ⚠ --plugin-root 必须写 **B** 上的路径（command 在 B 上执行），不是 A 的本地路径；
-    否则 tab bar 仍会静默空白。或按 README 的「一键复制块」手工添加等价条目。
+    --state-dir 同理必须是 B 上的 ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/zzjcool%3Aforward ——
+    否则 tab bar 会读 A 的（不存在的）状态，显示永远为空。
+    或按 README 的「一键复制块」手工添加等价条目。
 EOF

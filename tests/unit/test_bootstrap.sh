@@ -30,11 +30,54 @@ err=""
 
 run_bootstrap() {
   rc=0
-  out="$(bash "${BOOTSTRAP}" "$@" 2>"${WORK}/stderr")" || rc=$?
+  out="$(env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
+    bash "${BOOTSTRAP}" "$@" 2>"${WORK}/stderr")" || rc=$?
   err="$(cat "${WORK}/stderr")"
 }
 
 md5() { md5sum "$1" | awk '{print $1}'; }
+
+# sh_squote / expected_cmd / cmd_part / state_dir_of / exe_path_of：与
+# tests/unit/test_install_tabbar.sh 同构（防漂移靠这里的显式断言，而非共享 helper）。
+sh_squote() {
+  local value="${1-}" escaped=""
+  escaped="${value//\'/\'\\\'\'}"
+  printf "'%s'" "${escaped}"
+}
+# expected_cmd <plugin_root> <state_dir>
+expected_cmd() {
+  local root="${1-}" state="${2-}" quoted=""
+  quoted="$(sh_squote "${state}")"
+  printf 'env HERDR_PLUGIN_STATE_DIR=%s "%s/bin/forward" list --oneline' "${quoted}" "${root}"
+}
+cmd_part() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import shlex, sys
+parts = shlex.split(sys.argv[1], posix=True)
+state = ""
+exe = ""
+i = 0
+if parts and parts[0] == "env":
+    i = 1
+    while i < len(parts):
+        key, sep, val = parts[i].partition("=")
+        if not sep or key != "HERDR_PLUGIN_STATE_DIR":
+            break
+        state = val
+        i += 1
+if i < len(parts):
+    exe = parts[i]
+print(state if sys.argv[2] == "state" else exe)
+PY
+}
+state_dir_of() { cmd_part "${1-}" state; }
+exe_path_of() { cmd_part "${1-}" exe; }
+
+# default_state_dir -> bootstrap.sh 未拿到 env/参数（run_bootstrap 隔离了 env）时
+# install-tabbar.sh 推导出的默认 state 目录 = ${XDG_STATE_HOME}/herdr/plugins/zzjcool%3Aforward
+default_state_dir() {
+  printf '%s/herdr/plugins/zzjcool%%3Aforward' "${WORK}/xdg-state"
+}
 
 # tabbar_count <toml> -> 本插件的 tab_bar_right 条目数
 tabbar_count() {
@@ -215,22 +258,89 @@ t_it "未知参数 -> 非 0（不静默接受）"
 run_bootstrap --bogus-flag
 if [[ "${rc}" -ne 0 ]]; then t_pass "未知参数拒绝（rc=${rc}）"; else t_fail_note "未知参数被静默接受"; fi
 
-t_describe "bootstrap.sh（tab bar command 必须是 server 上的绝对路径）"
+t_describe "bootstrap.sh（tab bar command = 绝对路径 + state env 前缀）"
 
-t_it "默认 tab bar command 是绝对路径，不含 \$HERDR_PLUGIN_ROOT 字面量"
+t_it "默认 tab bar command = env 前缀 + 绝对路径，不含 \$HERDR_PLUGIN_ROOT 字面量"
 configAbs="${WORK}/abs-path.toml"
 printf '# sample\n' >"${configAbs}"
 run_bootstrap --config "${configAbs}"
 t_exit_ok 0 "${rc}" "退出 0"
 cmdAbs="$(tabbar_command "${configAbs}")"
 root_phys="$(cd -P "${ROOT}" && pwd)"
-t_match '^"[^"]+/bin/forward" list --oneline$' "${cmdAbs}" "command = \"<abs>/bin/forward\" list --oneline"
+default_sd="$(default_state_dir)"
+expectedAbs="$(expected_cmd "${root_phys}" "${default_sd}")"
+t_eq "${expectedAbs}" "${cmdAbs}" \
+  "command = env HERDR_PLUGIN_STATE_DIR='<state>' \"<abs>/bin/forward\" list --oneline"
 if [[ "${cmdAbs}" == *"\$HERDR_PLUGIN_ROOT"* ]]; then
   t_fail_note "command 仍含 \$HERDR_PLUGIN_ROOT 字面量：${cmdAbs}"
 else
   t_pass "command 不含 \$HERDR_PLUGIN_ROOT 字面量"
 fi
-t_eq "\"${root_phys}/bin/forward\" list --oneline" "${cmdAbs}" "默认解析到本检出（bootstrap 与 install-tabbar 同树）"
+abs_exe="$(exe_path_of "${cmdAbs}")"
+t_eq "${root_phys}/bin/forward" "${abs_exe}" "默认解析到本检出（bootstrap 与 install-tabbar 同树）"
+abs_state="$(state_dir_of "${cmdAbs}")"
+t_eq "${default_sd}" "${abs_state}" "state env 默认 = ${WORK}/xdg-state/herdr/plugins/zzjcool%3Aforward"
+
+# 透传回归：bootstrap 必须把 HERDR_PLUGIN_STATE_DIR（插件 action/startup 上下文里
+# herdr 注入的权威 state 目录）透传给 install-tabbar.sh（见 bootstrap.sh 的 state_dir_args）。
+t_it "HERDR_PLUGIN_STATE_DIR env 被透传给 install-tabbar.sh（不落回推导默认）"
+configEnv="${WORK}/state-from-env.toml"
+printf '# sample\n' >"${configEnv}"
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
+  HERDR_PLUGIN_STATE_DIR="${WORK}/authoritative-state%3Aforward" \
+  bash "${BOOTSTRAP}" --config "${configEnv}" 2>"${WORK}/stderr")" || rc=$?
+set -o errexit
+t_exit_ok 0 "${rc}" "退出 0"
+env_cmd="$(tabbar_command "${configEnv}")"
+env_cmd_state="$(state_dir_of "${env_cmd}")"
+t_eq "${WORK}/authoritative-state%3Aforward" "${env_cmd_state}" \
+  "command 里的 state 与插件 action 用的是同一个 env 值"
+
+# --state-dir 显式参数优先于 env（跨机场景：在 A 上装、传 B 的 state 目录）
+t_it "--state-dir 显式参数透传且优先于 HERDR_PLUGIN_STATE_DIR env"
+configSd="${WORK}/state-explicit.toml"
+printf '# sample\n' >"${configSd}"
+rc=0
+out="$(env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
+  HERDR_PLUGIN_STATE_DIR="${WORK}/env-should-lose" \
+  bash "${BOOTSTRAP}" --config "${configSd}" \
+  --state-dir "/srv/server-b/herdr/plugins/zzjcool%3Aforward" 2>"${WORK}/stderr")" || rc=$?
+set -o errexit
+t_exit_ok 0 "${rc}" "退出 0"
+expectedSd="$(expected_cmd "${root_phys}" "/srv/server-b/herdr/plugins/zzjcool%3Aforward")"
+sd_cmd="$(tabbar_command "${configSd}")"
+t_eq "${expectedSd}" "${sd_cmd}" "--state-dir 压过 env，写进 command"
+
+# state 目录必须能被 /bin/sh 安全解析（env -i 下 tab bar 执行场景）
+t_it "生成的 command 可在 env -i 的 /bin/sh -lc 下执行，且子进程看到 state env"
+configSh="${WORK}/sh-exec.toml"
+printf '# sample\n' >"${configSh}"
+run_bootstrap --config "${configSh}"
+t_exit_ok 0 "${rc}" "退出 0"
+sh_ok="no"
+sh_cmd="$(tabbar_command "${configSh}")"
+# 模拟 tab bar 真实执行：/bin/sh -lc（login shell，PATH 由 profile 提供）。
+# 用 env -i 剥掉所有继承 env（含 HERDR_PLUGIN_STATE_DIR）—— 这正是本 bug 的现场。
+sh_rc=0
+set +o errexit
+env -i PATH=/usr/bin:/bin HOME="${WORK}/home" /bin/sh -lc "${sh_cmd}" \
+  >"${WORK}/sh-out" 2>"${WORK}/sh-err"
+sh_rc=$?
+set -o errexit
+if [[ "${sh_rc}" -eq 0 ]]; then sh_ok="yes"; fi
+t_eq "yes" "${sh_ok}" "env -i /bin/sh -lc 执行成功（无 HERDR_* env 依赖；state 目录不存在时输出空）"
+# 证明确实把 state 传给了子进程：把 state 目录建成真的并放一条 up 记录，看 ⇅ 输出。
+real_state="$(default_state_dir)"
+mkdir -p "${real_state}"
+cat >"${real_state}/forwards.json" <<'JSON'
+{ "version": 1, "forwards": [ { "id": "f-3000", "local_port": 3000, "remote_host": "127.0.0.1", "remote_port": 3000, "machine": "m", "ssh_target": "u@h:22", "pid": 1, "control_socket": "", "status": "up", "created_unix": 1790000000, "publish": { "pid": null, "url": null, "started_unix": null } } ] }
+JSON
+oneline="$(env -i PATH=/usr/bin:/bin HOME="${WORK}/home" /bin/sh -lc "${sh_cmd}" 2>/dev/null | tail -1)"
+t_eq "⇅3000" "${oneline}" "state 目录经 env 前缀被真正读到（⇅3000 —— 本 bug 的端到端回归）"
+# 反证：没有 env 前缀时同一 state 目录读不到（回退目录为空）→ 状态条永远空
+noenv_oneline="$(env -i PATH=/usr/bin:/bin HOME="${WORK}/home" /bin/sh -lc "\"${root_phys}/bin/forward\" list --oneline" 2>/dev/null | tail -1)"
+t_eq "" "${noenv_oneline}" "无 env 前缀时输出空（回退目录）—— 证明修复前状态条形同虚设"
 
 t_it "默认 command 可在 env -i 的 /bin/sh -lc 下执行（tab bar 无 HERDR_PLUGIN_ROOT env）"
 sh_rc=0
@@ -243,10 +353,12 @@ if [[ "${sh_rc}" -eq 0 ]]; then t_pass "env -i 下执行成功（rc=0）"; else 
 t_it "--plugin-root 透传给 install-tabbar.sh（跨机时 = server B 上的路径）"
 configCross="${WORK}/cross.toml"
 printf '# sample\n' >"${configCross}"
-run_bootstrap --config "${configCross}" --plugin-root "/opt/on-server-b/herdr-forward"
+run_bootstrap --config "${configCross}" --plugin-root "/opt/on-server-b/herdr-forward" \
+  --state-dir "/opt/on-server-b/herdr/plugins/zzjcool%3Aforward"
 t_exit_ok 0 "${rc}" "退出 0（路径在本机不存在也不报错）"
 cmdCross="$(tabbar_command "${configCross}")"
-t_eq '"/opt/on-server-b/herdr-forward/bin/forward" list --oneline' "${cmdCross}" "command 用 B 上的绝对路径"
+expectedCross="$(expected_cmd "/opt/on-server-b/herdr-forward" "/opt/on-server-b/herdr/plugins/zzjcool%3Aforward")"
+t_eq "${expectedCross}" "${cmdCross}" "command 用 B 上的插件路径 + B 上的 state 目录"
 kc_cross="$(key_count "${configCross}")"
 t_eq "3" "${kc_cross}" "键位不受 --plugin-root 影响（plugin_action 不经路径）"
 
@@ -267,9 +379,11 @@ rc=0
 out="$(bash "${BOOTSTRAP}" --help 2>/dev/null)" || rc=$?
 t_exit_ok 0 "${rc}" "--help 退出 0"
 t_match "plugin-root" "${out}" "--help 提到 --plugin-root"
+t_match "state-dir" "${out}" "--help 提到 --state-dir（本 bug 的修复参数）"
 
-t_it "重跑（含旧格式 config）自动升级为绝对路径映射（幂等修复路径）"
+t_it "重跑（含旧格式 config）自动升级为 env 前缀 + 绝对路径映射（幂等修复路径）"
 configLegacy="${WORK}/legacy.toml"
+# 旧格式：command 里是 $HERDR_PLUGIN_ROOT 字面量（TOML 里写成转义后的形态）
 cat >"${configLegacy}" <<'EOF'
 [ui]
 tab_bar_right = [
@@ -277,14 +391,55 @@ tab_bar_right = [
   { type = "command", command = "\"$HERDR_PLUGIN_ROOT/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
 ]
 EOF
-run_bootstrap --config "${configLegacy}" --no-keys
+run_bootstrap --config "${configLegacy}" --plugin-root "${ROOT}" --state-dir "/legacy/state%3Aforward" --no-keys
 t_exit_ok 0 "${rc}" "退出 0"
 cmdLegacy="$(tabbar_command "${configLegacy}")"
-t_eq "\"${root_phys}/bin/forward\" list --oneline" "${cmdLegacy}" "旧格式被升级为本检出绝对路径"
+expectedLegacy="$(expected_cmd "${root_phys}" "/legacy/state%3Aforward")"
+t_eq "${expectedLegacy}" "${cmdLegacy}" "旧格式被升级为 env 前缀 + 本检出绝对路径"
+if grep -q 'HERDR_PLUGIN_ROOT' "${configLegacy}"; then
+  t_fail_note "升级后仍残留 \$HERDR_PLUGIN_ROOT"
+else
+  t_pass "升级后不再有 \$HERDR_PLUGIN_ROOT"
+fi
 tb_legacy="$(tabbar_count "${configLegacy}")"
 t_eq "1" "${tb_legacy}" "仍只 1 条"
 
-run_bootstrap --config "${configLegacy}" --no-keys
+# 本 bug 的专属回归：旧格式 = worker-7 形态（绝对路径但无 state env 前缀）
+# → 状态条读回退目录（永远空），必须被重写成 env 前缀形态。
+t_it "已装但无 state env 前缀（worker-7 形态）→ 重跑 bootstrap 自动补上（本 bug 自愈）"
+configNoEnv="${WORK}/no-env-legacy.toml"
+python3 - "${configNoEnv}" "${root_phys}" <<'PY'
+import sys
+
+path, root = sys.argv[1], sys.argv[2]
+entry = (
+    '{ type = "command", command = \'"%s/bin/forward" list --oneline\','
+    " interval_seconds = 8, timeout_seconds = 3 }"
+) % root
+text = (
+    "[ui]\ntab_bar_right = [\n"
+    "  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)\n"
+    "  %s,\n]\n" % entry
+)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
+noenv_before="$(md5 "${configNoEnv}")"
+run_bootstrap --config "${configNoEnv}" --no-keys
+t_exit_ok 0 "${rc}" "退出 0"
+expectedNoEnv="$(expected_cmd "${root_phys}" "${default_sd}")"
+noenv_now="$(tabbar_command "${configNoEnv}")"
+t_eq "${expectedNoEnv}" "${noenv_now}" "command 升级为 env 前缀形态（重跑即修）"
+noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env-legacy.toml.bak.*' -print -quit)"
+t_file_exists "${noenv_bak}"
+noenv_bak_md5="$(md5 "${noenv_bak}")"
+t_eq "${noenv_before}" "${noenv_bak_md5}" "备份 = 升级前内容"
+run_bootstrap --config "${configNoEnv}" --no-keys
+t_exit_ok 0 "${rc}" "再跑退出 0"
+noenv_again="$(tabbar_command "${configNoEnv}")"
+t_eq "${expectedNoEnv}" "${noenv_again}" "再跑不变（幂等）"
+
+run_bootstrap --config "${configLegacy}" --plugin-root "${ROOT}" --state-dir "/legacy/state%3Aforward" --no-keys
 t_exit_ok 0 "${rc}" "再跑退出 0"
 legacy_again="$(tabbar_command "${configLegacy}")"
 t_eq "${cmdLegacy}" "${legacy_again}" "再跑不变（幂等）"
@@ -328,25 +483,34 @@ t_match "bootstrap|scripts" "${err}" "错误信息指明原因"
 t_describe "README 指引与实际安装器一致（防漂移）"
 
 t_it "README 的 tab bar 一键复制块 == install-tabbar.sh 实际写入的条目（占位符代入后）"
-# README 的跨机块用 <server-plugin-root> 占位（因为正确值取决于 server B）。
-# 本机自证时把占位符代入本检出，再与安装器输出逐字比对 —— 仍能拦住漂移。
+# README 的跨机块用 <server-plugin-root> / <server-state-dir> 占位（正确值取决于
+# server B）。本机自证时把两个占位符都代入「本机 + 本机默认 state」再与安装器输出
+# 逐字比对 —— 仍能拦住漂移（含 state env 前缀这类新形态）。
 config10="${WORK}/readme-tabbar.toml"
 printf '# sample\n' >"${config10}"
+readme_state="$(default_state_dir)"
 rc=0
-out="$(bash "${ROOT}/scripts/install-tabbar.sh" --config "${config10}" 2>/dev/null)" || rc=$?
+out="$(env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
+  bash "${ROOT}/scripts/install-tabbar.sh" --config "${config10}" 2>/dev/null)" || rc=$?
 t_exit_ok 0 "${rc}" "install-tabbar 退出 0"
 roadme_root="$(cd -P "${ROOT}" && pwd)"
 readme_entry="$(
-  python3 - "${ROOT}/README.md" "${roadme_root}" <<'PY'
+  python3 - "${ROOT}/README.md" "${roadme_root}" "${readme_state}" <<'PY'
 import re, sys, textwrap
 src = open(sys.argv[1], encoding="utf-8").read()
 root = sys.argv[2]
+state = sys.argv[3]
 # 取 README 里 tab_bar_right 的手工粘贴块（含 marker 注释的 toml 代码块）。
 # README 把该块放在列表项内，故需 dedent（去掉统一缩进）后再比较。
 blocks = re.findall(r"```toml\n(.*?)```", src, re.S)
 for b in blocks:
     if "tab bar status entry" in b and "tab_bar_right" in b:
-        print(textwrap.dedent(b).replace("<server-plugin-root>", root).strip())
+        print(
+            textwrap.dedent(b)
+            .replace("<server-plugin-root>", root)
+            .replace("<server-state-dir>", state)
+            .strip()
+        )
         break
 PY
 )"

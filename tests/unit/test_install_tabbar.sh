@@ -78,11 +78,16 @@ out=""
 err=""
 
 # run_installer <config_path> [extra args...] -> 设置 rc/out/err
+# 默认用**隔离的** XDG_STATE_HOME（${WORK}/xdg-state）并清掉 HERDR_PLUGIN_STATE_DIR，
+# 既让「state 目录推导默认值」可确定地断言，也保证绝不误碰真实 ~/.local/state。
+# 需要自定义 env（如 HERDR_PLUGIN_STATE_DIR 注入路径）时用 INSTALLER_ENV 追加。
+INSTALLER_ENV=()
 run_installer() {
   local config="$1"
   shift
   rc=0
-  out="$(bash "${INSTALLER}" --config "${config}" "$@" 2>"${WORK}/stderr")" || rc=$?
+  out="$(env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" "${INSTALLER_ENV[@]}" \
+    bash "${INSTALLER}" --config "${config}" "$@" 2>"${WORK}/stderr")" || rc=$?
   err="$(cat "${WORK}/stderr")"
 }
 
@@ -152,10 +157,58 @@ except Exception:
 PY
 }
 
-# exe_path_of <command 字符串> -> 取双引号内的可执行文件路径
-exe_path_of() {
-  local c="${1#\"}"
-  printf '%s\n' "${c%%\"*}"
+# cmd_part <command 字符串> <state|exe> -> 解析出的字段
+#
+# 当前生成形态（见 scripts/install-tabbar.sh）：
+#   env HERDR_PLUGIN_STATE_DIR='<state dir>' '<abs>/bin/forward' list --oneline
+# 用 shlex（POSIX 模式）解析，引用语义与 /bin/sh 一致；无 env 前缀的旧形态
+# （'<abs>/bin/forward' list --oneline）解析出的 state 为空串。
+cmd_part() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import shlex, sys
+parts = shlex.split(sys.argv[1], posix=True)
+state = ""
+exe = ""
+i = 0
+if parts and parts[0] == "env":
+    i = 1
+    while i < len(parts):
+        key, sep, val = parts[i].partition("=")
+        if not sep or key != "HERDR_PLUGIN_STATE_DIR":
+            break
+        state = val
+        i += 1
+if i < len(parts):
+    exe = parts[i]
+print(state if sys.argv[2] == "state" else exe)
+PY
+}
+
+# state_dir_of <command 字符串> -> 嵌入的 HERDR_PLUGIN_STATE_DIR 值（无则空）
+state_dir_of() { cmd_part "${1-}" state; }
+
+# exe_path_of <command 字符串> -> 可执行文件路径（无则空）
+exe_path_of() { cmd_part "${1-}" exe; }
+
+# sh_squote <value> -> POSIX sh 单引号引用（与 instal-tabbar.sh 的 _sh_quote 同构）
+sh_squote() {
+  local value="${1-}" escaped=""
+  escaped="${value//\'/\'\\\'\'}"
+  printf "'%s'" "${escaped}"
+}
+
+# expected_cmd <plugin_root> <state_dir> -> 期望的完整 command 字符串
+# 契约：env HERDR_PLUGIN_STATE_DIR='<state>' "<root>/bin/forward" list --oneline
+expected_cmd() {
+  local root="${1-}" state="${2-}" quoted=""
+  quoted="$(sh_squote "${state}")"
+  printf 'env HERDR_PLUGIN_STATE_DIR=%s "%s/bin/forward" list --oneline' "${quoted}" "${root}"
+}
+
+# default_state_dir -> 安装器未拿到 env/参数时的推导默认值
+# = ${XDG_STATE_HOME}/herdr/plugins/zzjcool%3Aforward（run_installer 注入 $- 见上）
+default_state_dir() {
+  printf '%s/herdr/plugins/zzjcool%%3Aforward' "${WORK}/xdg-state"
 }
 
 # check_ui_preserved <toml_path> -> 打印 ok/bad
@@ -398,24 +451,46 @@ else
   t_fail_note "dry-run 输出不是合法 TOML"
 fi
 
-t_it "生成的 command 可在 env -i 的 /bin/sh -lc 下真实执行（无任何 env 依赖）"
-# tab_bar_right 的 command 由 herdr 直接经 /bin/sh -lc 执行，env 里 **没有**
-# HERDR_PLUGIN_ROOT（该 env 只在插件 action/pane/startup 命令里注入，SCOUT-FACTS §2.2
-# 被误用到了 tab bar 场景；§2.4 才是 tab bar 的正确事实）。因此 command 必须是绝对路径。
+t_it "生成的 command 可在 env -i 的 /bin/sh -lc 下真实执行，且 state 目录经 env 前缀真的传到了进程"
+# tab_bar_right 的 command 由 herdr 直接经 /bin/sh -lc 执行，env 里 **既没有**
+# HERDR_PLUGIN_ROOT（§2.2 那个 env 只注入给插件 action/pane/startup），**也没有**
+# HERDR_PLUGIN_STATE_DIR（本 bug）：没有后者时 bin/forward 会回退到
+# ~/.local/state/herdr-forward，与插件 action 写入的
+# ~/.local/state/herdr/plugins/zzjcool%3Aforward 分叉 → tab bar 永远空。
+# 故 command 必须是「绝对路径 + 显式 env 前缀」。
 plug="${WORK}/plug"
 mkdir -p "${plug}/bin"
 cat >"${plug}/bin/forward" <<'SH'
 #!/bin/sh
+printf 'state=%s\n' "${HERDR_PLUGIN_STATE_DIR:-UNSET}"
 printf '⇅3000⇅5173\n'
 SH
 chmod +x "${plug}/bin/forward"
+plug_state="${WORK}/plug state%3Awith-quote'd"
 config10="${WORK}/shc.toml"
 printf 'theme = "dark"\n' >"${config10}"
-run_installer "${config10}" --plugin-root "${plug}"
-t_exit_ok 0 "${rc}" "退出 0（--plugin-root 覆盖）"
+run_installer "${config10}" --plugin-root "${plug}" --state-dir "${plug_state}"
+t_exit_ok 0 "${rc}" "退出 0（--plugin-root/--state-dir 覆盖）"
 cmd="$(command_of "${config10}")"
-sh_out="$(env -i /bin/sh -lc "${cmd}" | tail -1)"
-t_eq "⇅3000⇅5173" "${sh_out}" "env -i /bin/sh -lc 执行并取最后一行"
+sh_rc=0
+set +o errexit
+sh_out="$(env -i /bin/sh -lc "${cmd}" 2>/dev/null)"
+sh_rc=$?
+set -o errexit
+if [[ "${sh_rc}" -eq 0 ]]; then t_pass "env -i /bin/sh -lc 执行成功"; else t_fail_note "env -i 执行失败（rc=${sh_rc}）：cmd=[${cmd}]"; fi
+last_line="$(printf '%s\n' "${sh_out}" | tail -1)"
+t_eq "⇅3000⇅5173" "${last_line}" "输出最后一行仍是 oneline 状态"
+# 含空格/单引号/%3A 的 state dir 必须逐字送达（证明 _sh_quote 的引用语义正确）
+state_seen="$(printf '%s\n' "${sh_out}" | grep -F 'state=' | tail -1 || true)"
+t_eq "state=${plug_state}" "${state_seen}" "env 前缀把 state dir 逐字送达（含空格/引号/%）"
+
+# 回归锚点：worker-7 的形态（绝对路径但**无** env 前缀）在 env -i 下丢掉 state 目录
+plug2="${WORK}/plug2"
+mkdir -p "${plug2}/bin"
+cp "${plug}/bin/forward" "${plug2}/bin/forward"
+old_cmd="'${plug2}/bin/forward' list --oneline"
+old_env_seen="$(env -i /bin/sh -lc "${old_cmd}" 2>/dev/null | grep -F 'state=' | tail -1 || true)"
+t_eq "state=UNSET" "${old_env_seen}" "无 env 前缀的旧 command 下进程看不到 HERDR_PLUGIN_STATE_DIR（本 bug 形态）"
 
 t_it "回归锚点：旧格式（\$HERDR_PLUGIN_ROOT 字面量）在 env -i 下确实失败"
 # shellcheck disable=SC2016  # 单引号内就是要保留的字面量，正是待复现的 bug 形态
@@ -431,17 +506,19 @@ else
   t_fail_note "旧 command 竟然执行成功——本测试的前提事实需要重新核实"
 fi
 
-t_describe "install-tabbar.sh（tab bar command = server 上的绝对路径）"
+t_describe "install-tabbar.sh（tab bar command = 绝对路径 + state env 前缀）"
 
 ROOT_PHYS="$(cd -P "${ROOT}" && pwd)"
 
-t_it "默认 command 是本检出的**绝对**路径，且不含 \$HERDR_PLUGIN_ROOT 字面量"
+t_it "默认 command = env 前缀 + 本检出绝对路径，且不含 \$HERDR_PLUGIN_ROOT 字面量"
 configA="${WORK}/abs.toml"
 printf 'theme = "dark"\n' >"${configA}"
 run_installer "${configA}"
 t_exit_ok 0 "${rc}" "退出 0"
 cmdA="$(command_of "${configA}")"
-t_match '^"[^"]+/bin/forward" list --oneline$' "${cmdA}" "command 形状 = \"<abs>/bin/forward\" list --oneline"
+default_sd="$(default_state_dir)"
+expectedA="$(expected_cmd "${ROOT_PHYS}" "${default_sd}")"
+t_eq "${expectedA}" "${cmdA}" "command = env HERDR_PLUGIN_STATE_DIR='<state>' \"<abs>/bin/forward\" list --oneline"
 # 只在字符串模式下匹配字面量，不用 *'$HERDR_PLUGIN_ROOT'* 模式（后者触发 SC2016 提示）
 if [[ "${cmdA}" == *"\$HERDR_PLUGIN_ROOT"* ]]; then
   t_fail_note "command 仍含 \$HERDR_PLUGIN_ROOT 字面量：${cmdA}"
@@ -452,13 +529,203 @@ exe_path="$(exe_path_of "${cmdA}")"
 t_eq "${ROOT_PHYS}/bin/forward" "${exe_path}" "默认解析到本检出的 bin/forward（物理路径）"
 if [[ -x "${exe_path}" ]]; then t_pass "该路径可执行"; else t_fail_note "该路径不可执行：${exe_path}"; fi
 
+# ↓ 本 bug 的核心断言：state env 必须被嵌进 command，且值与插件 action 写的一致
+stateA="$(state_dir_of "${cmdA}")"
+t_eq "${default_sd}" "${stateA}" "state env = ${WORK}/xdg-state/herdr/plugins/zzjcool%3Aforward"
+if [[ "${stateA}" == *"/plugins/zzjcool%3Aforward" ]]; then
+  t_pass "state 目录名保留 URL 编码的 ':' → '%3A'（不是字面 ':'）"
+else
+  t_fail_note "state 目录名不对（应为 …/plugins/zzjcool%3Aforward）：${stateA}"
+fi
+
+# 回归锚点：tab bar 执行上下文里 env 缺失 → 无前缀的 command 看不到 state（本 bug）
+t_it "bug 锚点：无 state env 前缀时，tab bar 上下文读到的是回退目录（分叉）"
+# 探针脚本正文里的 $VAR 必须让 /bin/sh 自己展开（单引号是对的，抑制 SC2016 误报）
+# shellcheck disable=SC2016
+fallback="$(env -i HOME=/fake/home HERDR_PLUGIN_STATE_DIR= /bin/sh -c '
+  printf "%s" "${HERDR_PLUGIN_STATE_DIR:-${HOME:-/tmp}/.local/state/herdr-forward}"')"
+t_eq "/fake/home/.local/state/herdr-forward" "${fallback}" "无 env 时 bin/forward 回退到 ~/.local/state/herdr-forward（与插件 state 目录分叉）"
+if [[ "${stateA}" != "${fallback}" ]]; then
+  t_pass "两个目录确实不同（${stateA} vs ${fallback}）：不修就是永远空的状态条"
+else
+  t_fail_note "state 目录与回退目录相同，本用例失去意义"
+fi
+
+t_it "--state-dir 覆盖：写进 command，且 --state-dir 优先于 HERDR_PLUGIN_STATE_DIR env"
+configSD="${WORK}/state-dir.toml"
+printf 'theme = "dark"\n' >"${configSD}"
+INSTALLER_ENV=("HERDR_PLUGIN_STATE_DIR=${WORK}/from-env-should-lose")
+run_installer "${configSD}" --plugin-root "/opt/on-server-b/herdr-forward" \
+  --state-dir "/var/lib/herdr/plugins/zzjcool%3Aforward"
+INSTALLER_ENV=()
+t_exit_ok 0 "${rc}" "退出 0"
+cmdSD="$(command_of "${configSD}")"
+expectedSD="$(expected_cmd "/opt/on-server-b/herdr-forward" "/var/lib/herdr/plugins/zzjcool%3Aforward")"
+t_eq "${expectedSD}" "${cmdSD}" "--state-dir 写进 command 且压过 env（跨机场景：传 B 的 state 目录）"
+
+t_it "未传 --state-dir 时用 HERDR_PLUGIN_STATE_DIR env（插件 action/startup 上下文里的权威值）"
+configEnv="${WORK}/state-env.toml"
+printf 'theme = "dark"\n' >"${configEnv}"
+INSTALLER_ENV=("HERDR_PLUGIN_STATE_DIR=${WORK}/authoritative-state%3Ax")
+run_installer "${configEnv}"
+INSTALLER_ENV=()
+t_exit_ok 0 "${rc}" "退出 0"
+cmdEnv="$(command_of "${configEnv}")"
+env_state="$(state_dir_of "${cmdEnv}")"
+t_eq "${WORK}/authoritative-state%3Ax" "${env_state}" "env 在无参数时被采用（与插件 action 同一目录）"
+
+# state 目录可能是相对路径吗？不允许（它会写进 server 上执行的 command）
+t_it "--state-dir 相对路径 → 非 0（不静默接受）"
+configSDRel="${WORK}/state-rel.toml"
+before_sd="$(printf 'theme = "dark"\n')"
+printf '%s\n' "${before_sd}" >"${configSDRel}"
+run_installer "${configSDRel}" --state-dir "relative/state"
+if [[ "${rc}" -ne 0 ]]; then t_pass "相对 state 被拒绝（rc=${rc}）"; else t_fail_note "相对 state 被静默接受"; fi
+sd_after="$(cat "${configSDRel}")"
+t_eq "${before_sd}" "${sd_after}" "被拒绝时原文件未改"
+
+# 含单引号 / 空格的 state 目录（引用语义的真实回归）
+t_it "含单引号/空格的 --state-dir：command 可被 /bin/sh 安全解析且值逐字送达"
+configQuote="${WORK}/quote.toml"
+printf 'theme = "dark"\n' >"${configQuote}"
+weird_state="${WORK}/st ate%3Awith'quote"
+run_installer "${configQuote}" --plugin-root "${WORK}/plug" --state-dir "${weird_state}"
+t_exit_ok 0 "${rc}" "退出 0"
+cmdQ="$(command_of "${configQuote}")"
+q_state="$(state_dir_of "${cmdQ}")"
+t_eq "${weird_state}" "${q_state}" "shlex 解析出的 state 值逐字一致"
+q_seen="$(env -i /bin/sh -lc "${cmdQ}" 2>/dev/null | grep -F 'state=' | tail -1 || true)"
+t_eq "state=${weird_state}" "${q_seen}" "/bin/sh 执行后子进程看到同一值（引用语义正确）"
+
+# TOML 特殊字符：state 目录含双引号时不得产非法 TOML
+t_it "state 目录含双引号：TOML 转义正确（写入后仍可被 tomllib 解析）"
+configDq="${WORK}/dq.toml"
+printf 'theme = "dark"\n' >"${configDq}"
+dq_state="${WORK}/st\"quoted%3Astate"
+run_installer "${configDq}" --state-dir "${dq_state}"
+t_exit_ok 0 "${rc}" "退出 0"
+dq_shape="$(check_shape "${configDq}")"
+t_eq "ok" "${dq_shape}" "写入后仍是合法 TOML 且字段齐备"
+dq_cmd="$(command_of "${configDq}")"
+dq_parsed="$(state_dir_of "${dq_cmd}")"
+t_eq "${dq_state}" "${dq_parsed}" "双引号值经 TOML 转义往返一致"
+
+# 幂等 + 升级：旧格式（无 env 前缀 / 带 $HERDR_PLUGIN_ROOT）都要被重写成当前期望
+#
+# 旧的 worker-7 形态：command 已是绝对路径（`"<abs>/bin/forward" list --oneline`）
+# 但**没有** state env 前缀 —— tab bar 上下文里没有 HERDR_PLUGIN_STATE_DIR，于是读回退目录
+# （~/.local/state/herdr-forward），永远看不到插件 action 写的状态。
+# 用 python 生成文件避免 shell 多层引号嵌套。
+write_legacy_abs_entry() { # write_legacy_abs_entry <path> <abs_plugin_root>
+  python3 - "$1" "$2" <<'PY'
+import sys
+
+path, root = sys.argv[1], sys.argv[2]
+entry = (
+    '{ type = "command", command = \'"%s/bin/forward" list --oneline\','
+    " interval_seconds = 9, timeout_seconds = 4 }"
+) % root
+text = (
+    'theme = "dark"\n\n[ui]\ntab_bar_position = "top"\ntab_bar_right = [\n'
+    "  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)\n"
+    "  %s,\n]\n" % entry
+)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
+}
+
+t_it "旧格式（绝对路径但无 state env 前缀，worker-7 形态）→ 自动补上 env 前缀"
+configNoEnv="${WORK}/no-env.toml"
+write_legacy_abs_entry "${configNoEnv}" "${ROOT_PHYS}"
+noenv_before="$(md5 "${configNoEnv}")"
+run_installer "${configNoEnv}"
+t_exit_ok 0 "${rc}" "升级退出 0（不再是 no-op）"
+cmdNE="$(command_of "${configNoEnv}")"
+expectedNE="$(expected_cmd "${ROOT_PHYS}" "${default_sd}")"
+t_eq "${expectedNE}" "${cmdNE}" "补上 state env 前缀（命令其余部分不变）"
+ne_interval="$(entry_field "${configNoEnv}" interval_seconds)"
+t_eq "9" "${ne_interval}" "保留用户改过的 interval_seconds"
+ne_timeout="$(entry_field "${configNoEnv}" timeout_seconds)"
+t_eq "4" "${ne_timeout}" "保留用户改过的 timeout_seconds"
+noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env.toml.bak.*' -print -quit)"
+t_file_exists "${noenv_bak}"
+ne_bak_md5="$(md5 "${noenv_bak}")"
+t_eq "${noenv_before}" "${ne_bak_md5}" "备份 = 升级前内容"
+# 再跑：幂等
+run_installer "${configNoEnv}"
+t_exit_ok 0 "${rc}" "再跑退出 0"
+ne_again="$(command_of "${configNoEnv}")"
+t_eq "${cmdNE}" "${ne_again}" "再跑 command 不变"
+t_match "already" "${out}" "输出含 already"
+
+t_it "已装但 state 目录过期（换机/换 XDG_STATE_HOME）→ 重写为当前期望"
+configStale="${WORK}/stale.toml"
+printf 'theme = "dark"\n' >"${configStale}"
+run_installer "${configStale}" --state-dir "/old/machine/herdr/plugins/zzjcool%3Aforward"
+t_exit_ok 0 "${rc}" "首次安装退出 0"
+stale_mid="$(command_of "${configStale}")"
+stale_mid_state="$(state_dir_of "${stale_mid}")"
+t_eq "/old/machine/herdr/plugins/zzjcool%3Aforward" "${stale_mid_state}" "先写成旧 state"
+run_installer "${configStale}" --state-dir "/new/machine/herdr/plugins/zzjcool%3Aforward"
+t_exit_ok 0 "${rc}" "换 state 重跑退出 0（不是 already）"
+stale_new_cmd="$(command_of "${configStale}")"
+stale_new_state="$(state_dir_of "${stale_new_cmd}")"
+t_eq "/new/machine/herdr/plugins/zzjcool%3Aforward" "${stale_new_state}" "state 被更新"
+stale_markers="$(marker_lines "${configStale}")"
+t_eq "1" "${stale_markers}" "仍只 1 条本插件条目"
+
+# 用户其它条目 + 我们条目共存时升级，不得破坏邻居
+t_it "升级时保留相邻的用户条目（数组里多条共存）"
+configNb="${WORK}/neighbor.toml"
+python3 - "${configNb}" "${ROOT_PHYS}" <<'PY'
+import sys
+
+path, root = sys.argv[1], sys.argv[2]
+entry = (
+    '{ type = "command", command = \'"%s/bin/forward" list --oneline\','
+    " interval_seconds = 5, timeout_seconds = 2 }"
+) % root
+text = (
+    "[ui]\ntab_bar_right = [\n"
+    '  { type = "hostname" },\n'
+    "  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)\n"
+    "  %s,\n]\n" % entry
+)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
+run_installer "${configNb}"
+t_exit_ok 0 "${rc}" "升级退出 0"
+py_rc=0
+set +o errexit
+python3 - "${configNb}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+entries = doc["ui"]["tab_bar_right"]
+assert len(entries) == 2, entries
+assert entries[0] == {"type": "hostname"}, entries
+cmd = entries[1]["command"]
+assert cmd.startswith("env HERDR_PLUGIN_STATE_DIR="), entries[1]
+assert 'bin/forward" list --oneline' in cmd, entries[1]
+PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
+  t_pass "邻居条目逐字保留，我们的条目升级为 env 前缀形态"
+else
+  t_fail_note "升级破坏了数组结构或邻居条目"
+fi
+
 t_it "--plugin-root 覆盖：写入给定绝对路径（跨机时 = server B 上的路径，A 上可不存在）"
 configB="${WORK}/cross.toml"
 printf 'theme = "dark"\n' >"${configB}"
-run_installer "${configB}" --plugin-root "/opt/on-server-b/herdr-forward"
+run_installer "${configB}" --plugin-root "/opt/on-server-b/herdr-forward" --state-dir "/opt/on-server-b/state%3Aforward"
 t_exit_ok 0 "${rc}" "退出 0（路径在本机不存在也不报错）"
 cmdB="$(command_of "${configB}")"
-t_eq '"/opt/on-server-b/herdr-forward/bin/forward" list --oneline' "${cmdB}" "command 用 B 上的绝对路径"
+expectedB="$(expected_cmd "/opt/on-server-b/herdr-forward" "/opt/on-server-b/state%3Aforward")"
+t_eq "${expectedB}" "${cmdB}" "command 用 B 上的绝对路径 + B 上的 state 目录"
 
 if [[ -e "/opt/on-server-b/herdr-forward" ]]; then
   t_skip "本机恰好存在 /opt/on-server-b/herdr-forward，跳过「不存在也接受」断言"

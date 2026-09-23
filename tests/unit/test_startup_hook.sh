@@ -34,6 +34,8 @@ err=""
 
 # run_hook [args...] —— 在干净的 env 下跑 hook（默认隔离 HOME，绝不碰真实 ~/.config）
 # env -u HERDR_CONFIG_PATH：宿主若设了它，会盖过 XDG/HOME 默认，破坏「默认路径」用例
+# HERDR_PLUGIN_STATE_DIR=${WORK}/state：模拟 herdr 给插件注入的权威 state 目录
+# （tab bar command 的执行上下文里**没有**它，所以 hook 必须把它透传下去 —— 本 bug）。
 run_hook() {
   rc=0
   out="$(env -u HERDR_CONFIG_PATH \
@@ -45,6 +47,41 @@ run_hook() {
 }
 
 md5() { md5sum "$1" | awk '{print $1}'; }
+
+# sh_squote / expected_cmd / cmd_part：与 tests/unit/test_install_tabbar.sh 同构。
+# 生成形态：env HERDR_PLUGIN_STATE_DIR='<state>' "<root>/bin/forward" list --oneline
+sh_squote() {
+  local value="${1-}" escaped=""
+  escaped="${value//\'/\'\\\'\'}"
+  printf "'%s'" "${escaped}"
+}
+expected_cmd() {
+  local root="${1-}" state="${2-}" quoted=""
+  quoted="$(sh_squote "${state}")"
+  printf 'env HERDR_PLUGIN_STATE_DIR=%s "%s/bin/forward" list --oneline' "${quoted}" "${root}"
+}
+cmd_part() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import shlex, sys
+parts = shlex.split(sys.argv[1], posix=True)
+state = ""
+exe = ""
+i = 0
+if parts and parts[0] == "env":
+    i = 1
+    while i < len(parts):
+        key, sep, val = parts[i].partition("=")
+        if not sep or key != "HERDR_PLUGIN_STATE_DIR":
+            break
+        state = val
+        i += 1
+if i < len(parts):
+    exe = parts[i]
+print(state if sys.argv[2] == "state" else exe)
+PY
+}
+state_dir_of() { cmd_part "${1-}" state; }
+exe_path_of() { cmd_part "${1-}" exe; }
 
 tabbar_count() {
   python3 - "$1" <<'PY'
@@ -100,6 +137,22 @@ tab_bar_right = [
 EOF
 }
 
+# entry_field_of <toml> <field> -> 本插件条目的某字段值（无则空）
+entry_field_of() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    for e in ((doc.get("ui") or {}).get("tab_bar_right") or []):
+        if isinstance(e, dict) and "bin/forward" in str(e.get("command", "")):
+            print(e[sys.argv[2]])
+            break
+except Exception:
+    print("")
+PY
+}
+
 t_it "裸跑：在 XDG_CONFIG_HOME/herdr/config.toml 自动装 tab bar 条目"
 printf 'theme = "dark"\n' >"${DEFAULT_CONFIG}"
 run_hook
@@ -118,27 +171,80 @@ t_eq "${before}" "${after}" "重复运行未改文件"
 tb2="$(tabbar_count "${DEFAULT_CONFIG}")"
 t_eq "1" "${tb2}" "仍只有 1 条"
 
-t_it "已存在条目（用户手装，新格式）→ 不重复插入、不备份、退出 0"
+t_it "已存在条目（用户手装，已是当前格式且 state 一致）→ 不重复插入、不备份、退出 0"
 config2="${WORK}/preinstalled.toml"
-cat >"${config2}" <<EOF
-theme = "dark"
+python3 - "${config2}" "${ROOT_PHYS}" "${WORK}/state" <<'PY'
+import sys
 
-[ui]
-tab_bar_right = [
-  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-  { type = "command", command = "\"${ROOT_PHYS}/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
-]
-EOF
+path, root, state = sys.argv[1], sys.argv[2], sys.argv[3]
+command = "env HERDR_PLUGIN_STATE_DIR='%s' \"%s/bin/forward\" list --oneline" % (state, root)
+text = (
+    'theme = "dark"\n\n[ui]\ntab_bar_right = [\n'
+    "  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)\n"
+    '  { type = "command", command = "%s", interval_seconds = 5, timeout_seconds = 2 },\n]\n' % command
+)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
 before2="$(md5 "${config2}")"
 run_hook --config "${config2}"
 t_exit_ok 0 "${rc}" "退出 0"
 after2="$(md5 "${config2}")"
-t_eq "${before2}" "${after2}" "内容未变"
+t_eq "${before2}" "${after2}" "内容未变（state 一致 → already）"
 bak2="$(find "${WORK}" -maxdepth 1 -name 'preinstalled.toml.bak.*' -print -quit)"
 t_eq "" "${bak2}" "未产生备份"
 
-t_it "旧格式（\$HERDR_PLUGIN_ROOT 字面量）：hook 自动升级为 server 绝对路径"
-# startup 上下文里 install-tabbar 解析自身真实位置 → 得到的就是 server 上的路径。
+# 本 bug 的回归：旧格式（worker-7 形态：绝对路径但无 state env 前缀）→ hook 自愈
+# 与「已装/旧格式」区分：这里条目已存在但 command 与当前期望不同，必须重写。
+t_it "已装但无 state env 前缀（worker-7 形态）→ hook 自动补上 env 前缀（本 bug 自愈）"
+configNoEnvF="${WORK}/no-env-hook.toml"
+python3 - "${configNoEnvF}" "${ROOT_PHYS}" <<'PY'
+import sys
+
+path, root = sys.argv[1], sys.argv[2]
+entry = (
+    '{ type = "command", command = \'"%s/bin/forward" list --oneline\','
+    " interval_seconds = 6, timeout_seconds = 3 }"
+) % root
+text = (
+    'theme = "dark"\n\n[ui]\ntab_bar_right = [\n'
+    "  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)\n"
+    "  %s,\n]\n" % entry
+)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
+expectedHook="$(expected_cmd "${ROOT_PHYS}" "${WORK}/state")"
+noenv_before="$(md5 "${configNoEnvF}")"
+run_hook --config "${configNoEnvF}"
+t_exit_ok 0 "${rc}" "退出 0"
+noenv_cmd="$(tabbar_command "${configNoEnvF}")"
+t_eq "${expectedHook}" "${noenv_cmd}" \
+  "command 升级为 env 前缀形态（state = hook 的 HERDR_PLUGIN_STATE_DIR）"
+noenv_interval="$(entry_field_of "${configNoEnvF}" interval_seconds)"
+t_eq "6" "${noenv_interval}" "保留用户改过的 interval_seconds"
+noenv_bak="$(find "${WORK}" -maxdepth 1 -name 'no-env-hook.toml.bak.*' -print -quit)"
+t_file_exists "${noenv_bak}"
+noenv_bak_md5="$(md5 "${noenv_bak}")"
+t_eq "${noenv_before}" "${noenv_bak_md5}" "备份 = 升级前内容"
+run_hook --config "${configNoEnvF}"
+t_exit_ok 0 "${rc}" "再跑退出 0"
+noenv_again="$(tabbar_command "${configNoEnvF}")"
+t_eq "${expectedHook}" "${noenv_again}" "再跑不变（幂等）"
+
+# --state-dir 显式参数优先于 HERDR_PLUGIN_STATE_DIR env
+t_it "--state-dir 显式参数优先于 HERDR_PLUGIN_STATE_DIR env（跨机/自定义 state 场景）"
+configSd="${WORK}/explicit-state.toml"
+printf 'theme = "dark"\n' >"${configSd}"
+run_hook --config "${configSd}" --state-dir "/srv/other-machine/herdr/plugins/zzjcool%3Aforward"
+t_exit_ok 0 "${rc}" "退出 0"
+expectedSd="$(expected_cmd "${ROOT_PHYS}" "/srv/other-machine/herdr/plugins/zzjcool%3Aforward")"
+sd_cmd="$(tabbar_command "${configSd}")"
+t_eq "${expectedSd}" "${sd_cmd}" "--state-dir 压过 env"
+
+t_it "旧格式（\$HERDR_PLUGIN_ROOT 字面量）：hook 自动升级为 env 前缀 + server 绝对路径"
+# startup 上下文里 install-tabbar 解析自身真实位置 → 得到的就是 server 上的路径；
+# state 目录取 hook 的 HERDR_PLUGIN_STATE_DIR（herdr 给插件注入的权威值）。
 # 旧格式在 tab bar 执行时 env 缺失 → 静默空白；重跑 hook 应自愈。
 configLegacy="${WORK}/legacy.toml"
 inject_legacy_entry "${configLegacy}"
@@ -146,7 +252,8 @@ legacy_before="$(md5 "${configLegacy}")"
 run_hook --config "${configLegacy}"
 t_exit_ok 0 "${rc}" "退出 0"
 legacy_cmd="$(tabbar_command "${configLegacy}")"
-t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${legacy_cmd}" "command 升级为绝对路径"
+expectedLegacy="$(expected_cmd "${ROOT_PHYS}" "${WORK}/state")"
+t_eq "${expectedLegacy}" "${legacy_cmd}" "command 升级为 env 前缀 + 绝对路径"
 if grep -q 'HERDR_PLUGIN_ROOT' "${configLegacy}"; then
   t_fail_note "升级后仍残留 \$HERDR_PLUGIN_ROOT"
 else
@@ -154,17 +261,7 @@ else
 fi
 tb_legacy="$(tabbar_count "${configLegacy}")"
 t_eq "1" "${tb_legacy}" "仍只 1 条"
-legacy_interval="$(
-  python3 - "${configLegacy}" <<'PY' 2>/dev/null || true
-import sys, tomllib
-try:
-    with open(sys.argv[1], "rb") as fh:
-        doc = tomllib.load(fh)
-    print(doc["ui"]["tab_bar_right"][0]["interval_seconds"])
-except Exception:
-    print("")
-PY
-)"
+legacy_interval="$(entry_field_of "${configLegacy}" interval_seconds)"
 t_eq "7" "${legacy_interval}" "保留用户改过的 interval_seconds"
 legacy_bak="$(find "${WORK}" -maxdepth 1 -name 'legacy.toml.bak.*' -print -quit)"
 t_file_exists "${legacy_bak}"
@@ -174,7 +271,7 @@ t_eq "${legacy_before}" "${legacy_bak_md5}" "备份 = 升级前内容"
 run_hook --config "${configLegacy}"
 t_exit_ok 0 "${rc}" "再跑退出 0"
 legacy_again="$(tabbar_command "${configLegacy}")"
-t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${legacy_again}" "再跑不变（幂等）"
+t_eq "${expectedLegacy}" "${legacy_again}" "再跑不变（幂等）"
 
 inject_legacy_entry "${WORK}/legacy-dry.toml"
 legacy_dry_before="$(md5 "${WORK}/legacy-dry.toml")"
@@ -183,10 +280,15 @@ t_exit_ok 0 "${rc}" "dry-run 退出 0"
 legacy_dry_after="$(md5 "${WORK}/legacy-dry.toml")"
 t_eq "${legacy_dry_before}" "${legacy_dry_after}" "dry-run 不改旧格式文件"
 
-t_it "自动写入的 command 是绝对路径且不含 \$HERDR_PLUGIN_ROOT 字面量"
+t_it "自动写入的 command = env 前缀 + 绝对路径，且不含 \$HERDR_PLUGIN_ROOT 字面量"
 def_cmd="$(tabbar_command "${DEFAULT_CONFIG}")"
-t_match '^"[^"]+/bin/forward" list --oneline$' "${def_cmd}" "command = \"<abs>/bin/forward\" list --oneline"
-t_eq "\"${ROOT_PHYS}/bin/forward\" list --oneline" "${def_cmd}" "解析到本检出（server 本机路径）"
+expectedDef="$(expected_cmd "${ROOT_PHYS}" "${WORK}/state")"
+t_eq "${expectedDef}" "${def_cmd}" \
+  "command 形状 = env HERDR_PLUGIN_STATE_DIR='<state>' \"<abs>/bin/forward\" list --oneline"
+def_state="$(state_dir_of "${def_cmd}")"
+t_eq "${WORK}/state" "${def_state}" "state env = hook 拿到的 HERDR_PLUGIN_STATE_DIR（与插件 action 同目录）"
+def_exe="$(exe_path_of "${def_cmd}")"
+t_eq "${ROOT_PHYS}/bin/forward" "${def_exe}" "解析到本检出（server 本机路径）"
 if [[ "${def_cmd}" == *"\$HERDR_PLUGIN_ROOT"* ]]; then
   t_fail_note "command 含 \$HERDR_PLUGIN_ROOT 字面量（tab bar 上下文里无法解析）"
 else
