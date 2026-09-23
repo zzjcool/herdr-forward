@@ -41,8 +41,10 @@ STATE_DIR="${WORK}/state"
 FAKE_BIN="${WORK}/fakebin"
 HARNESS="${WORK}/harness.sh"
 
-# 事实 #1 schema 的最小 machine list（fake herdr CLI 输出）
-DEFAULT_MACHINES='[{"id":"m1","label":"test-probe","ssh_target":"user@b-host:22","enabled":true}]'
+# 事实 #1 schema 的最小 machine list（fake herdr CLI 输出）。
+# 注意：真 herdr machine list --json 的字段是 "target"（非 ssh_target），
+# activated-machines.json 里才是 ssh_target —— 勿混淆（M3 初版写错过）。
+DEFAULT_MACHINES='[{"id":"m1","label":"test-probe","target":"user@b-host:22","enabled":true}]'
 
 # 面板子进程 harness：载入 common/state/panel 后 source 掉代码片段文件。
 # 片段走文件（heredoc 生成）而非单引号字符串，既避免本层变量展开，也避开 SC2016。
@@ -66,9 +68,14 @@ stage() {
   cp "${ROOT}/lib/common.sh" "${PLUGIN_ROOT}/lib/common.sh"
   cp "${ROOT}/lib/state.sh" "${PLUGIN_ROOT}/lib/state.sh"
   cp "${PANEL}" "${PLUGIN_ROOT}/lib/panel.sh"
-  # M2 合入后一并拷入（面板优先用真模块；未合入时走面板自带降级路径）
+  # M2 合入后一并拷入（面板优先用真模块；未合入时走面板自带降级路径）。
+  # 注意 machines.sh 会 source 同目录的 ssh-probe.sh（M1 提取），必须一起拷，
+  # 否则 _panel_machines_module_loadable 子进程探测失败，面板降级到状态文件。
   if [[ -f "${ROOT}/lib/machines.sh" ]]; then
     cp "${ROOT}/lib/machines.sh" "${PLUGIN_ROOT}/lib/machines.sh"
+  fi
+  if [[ -f "${ROOT}/lib/ssh-probe.sh" ]]; then
+    cp "${ROOT}/lib/ssh-probe.sh" "${PLUGIN_ROOT}/lib/ssh-probe.sh"
   fi
 
   # fake watch：非 TTY 退化路径的断言目标
@@ -210,9 +217,24 @@ t_contains "[✓] 1." "${out}" "降级路径也标 active"
 rm -f "${STATE_DIR}/activated-machines.json"
 
 t_it "状态文件缺失 → 不报错（machines 段省略）"
+# M2 合入后：真 machines.sh 走 herdr list 透传，fake herdr shim 默认返回
+# DEFAULT_MACHINES（含 test-probe）。语义改为：空 herdr 视图 + 无状态文件 →
+# machines 段省略。原「无状态文件即省略」的假设只成立于 stub 时代。
+stage
+HF_FAKE_MACHINES="[]"
 _pl_run /dev/null "panel_render"
-t_exit_ok 0 "${rc}" "缺文件 exit 0"
+t_exit_ok 0 "${rc}" "缺文件且无 saved machines exit 0"
 _assert_absent "test-probe" "${out}" "无机器行"
+_assert_absent "未激活" "${out}" "不渲染 machines 段"
+t_contains "FORWARDS" "${out}" "forwards 段仍在（面板可用）"
+unset HF_FAKE_MACHINES # 上一段的 [] 会因 :- 的非空判定残留，必须显式清掉
+
+# 有 saved machines 但无激活状态 → 未激活置灰行（真路径正常渲染）
+stage
+_pl_run /dev/null "panel_render"
+t_exit_ok 0 "${rc}" "有 saved machines 无状态文件 exit 0"
+t_contains "[ ] 1. test-probe" "${out}" "未激活置灰行（来自 herdr list 透传）"
+t_contains "FORWARDS" "${out}" "forwards 段仍在"
 
 t_it "local（同机短路激活）行：也是 [✓] + 不置灰 + 本机说明"
 VIEW_LOCAL="${WORK}/view-local-render.json"
