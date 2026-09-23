@@ -214,6 +214,44 @@ _pl_run /dev/null "panel_render"
 t_exit_ok 0 "${rc}" "缺文件 exit 0"
 _assert_absent "test-probe" "${out}" "无机器行"
 
+t_it "local（同机短路激活）行：也是 [✓] + 不置灰 + 本机说明"
+VIEW_LOCAL="${WORK}/view-local-render.json"
+printf '%s\n' '[{"id":"m1","label":"self-pc","target":"localhost","enabled":true,"state":"local"}]' >"${VIEW_LOCAL}"
+HF_VIEW_FILE="${VIEW_LOCAL}"
+_pl_run /dev/null "${SNIP_RENDER}"
+t_contains "[✓] 1. self-pc" "${out}" "local 行也用 ✓ 标记"
+local_line="$(_line_of "${out}" "[✓] 1. self-pc")"
+_assert_absent "${DIM}" "${local_line}" "local 行不置灰"
+t_contains "本机" "${local_line}" "local 行说明是本机（无需远程探测）"
+
+t_it "lib/machines.sh 提供 machines_view_json → 面板自动加载它（M2 冻结签名的接入点）"
+stage
+cat >"${PLUGIN_ROOT}/lib/machines.sh" <<'M2STUB'
+set -o errexit -o nounset -o pipefail
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+M2STUB
+HF_VIEW_FILE="${VIEW_3}"
+_pl_run /dev/null 'panel_render'
+t_exit_ok 0 "${rc}" "自动加载后 panel_render exit 0"
+t_contains "[✓] 1. test-probe" "${out}" "列表来自 modules.sh 的 machines_view_json"
+t_contains "[·] 2. gpu-box" "${out}" "三态均由模块提供"
+t_contains "[ ] 3. lab-pc" "${out}" "未激活机器也渲染"
+
+t_it "lib/machines.sh source 即 die（依赖缺失的坏模块）→ 面板仍能开，降级读状态文件"
+stage
+cat >"${PLUGIN_ROOT}/lib/machines.sh" <<'M2BROKEN'
+set -o errexit -o nounset -o pipefail
+source "/nonexistent/ssh-probe.sh"
+M2BROKEN
+cat >"${STATE_DIR}/activated-machines.json" <<'EOF'
+{"version":1,"active":"m1","machines":{"m1":{"label":"fallback-box","ssh_target":"u@b:22","server_root":"/srv/b/x","state_dir":"/srv/b/s"}}}
+EOF
+_pl_run /dev/null 'panel_render'
+t_exit_ok 0 "${rc}" "坏模块不得拖趴面板（面板必须能开）"
+t_contains "fallback-box" "${out}" "降级读 activated-machines.json"
+t_contains "FORWARDS" "${out}" "forwards 段正常"
+stage
+
 t_describe "lib/panel.sh：按键流（panel_handle_key）"
 
 KEY_INACTIVE="${WORK}/view-inactive.json"
@@ -243,6 +281,12 @@ t_eq "activating:m2" "${out}" "2 → activating:m2（第 2 行）"
 t_it "数字选择当前 active 机器 → deactivating:<id>（确认后停用）"
 _key "${KEY_ACTIVE}" 1
 t_eq "deactivating:m1" "${out}" "active 机 → deactivating:m1"
+
+t_it "数字选择 local（同机短路激活）机器 → 同样是 deactivating:<id>"
+KEY_LOCAL="${WORK}/view-local.json"
+printf '%s\n' '[{"id":"m1","label":"self","target":"localhost","enabled":true,"state":"local"}]' >"${KEY_LOCAL}"
+_key "${KEY_LOCAL}" 1
+t_eq "deactivating:m1" "${out}" "local 机也是「当前活动」→ 停用"
 
 t_it "越界数字 / 未知键 → none"
 _key "${KEY_INACTIVE}" 9
@@ -435,5 +479,64 @@ _cap /dev/null env HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" PATH="${FAKE_BIN}:${PAT
   bash "${PLUGIN_ROOT}/bin/forward" watch
 t_exit_ok 0 "${rc}" "退出 0"
 t_contains "FAKE-WATCH" "${out}" "面板模块缺失不影响 watch"
+
+t_describe "cmd_watch：真实 pty 冒烟（单键确认 + 激活链路；无 script(1) 则显式 SKIP）"
+
+# 为什么要真 pty：单测里 panel_confirm 被 stub，而「终端下读一行会等回车」这类 UX
+# 坑只在真 tty 里出现（本用例就是为它加的回归闸门）。绝不真跑 ssh：
+# fake forward 把 `machines` 子命令拦住只打标记，其余转发给真 CLI。
+t_it "pty：数字 → 无需回车的单键确认 → 「探测中…」→ CLI 子进程 → x 退出"
+if ! command -v script >/dev/null 2>&1; then
+  t_skip "script(1) 不可用，无法构造真实 pty"
+else
+  stage
+  # 真 CLI 拷为 forward-real，bin/forward 抹成 wrapper：只拦截 `machines` 子命令
+  # （打标记后 exit 0，绝不真跑 ssh），其余原样转发给真 CLI。
+  cp "${PLUGIN_ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward-real"
+  chmod +x "${PLUGIN_ROOT}/bin/forward-real"
+  cat >"${PLUGIN_ROOT}/bin/forward" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1-}" == "machines" ]]; then
+  printf 'PROBE %s\n' "$*"
+  exit 0
+fi
+exec "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/forward-real" "$@"
+EOF
+  chmod +x "${PLUGIN_ROOT}/bin/forward"
+
+  # 面板在这里（无 M2 模块）降级读 activated-machines.json —— 它就是一个真实数据源，
+  # 顺带把「M2 未合入时的降级路径」也过一遍真 pty。
+  cat >"${STATE_DIR}/activated-machines.json" <<'EOF'
+{"version":1,"active":"m1","machines":{"m1":{"label":"test-probe","ssh_target":"user@b-host:22","server_root":"/srv/b/plugins/x","state_dir":"/srv/b/state"},"m2":{"label":"gpu-box","ssh_target":"u@g:22","server_root":"/srv/g/plugins/x","state_dir":"/srv/g/state"}}}
+EOF
+  pty_out="${WORK}/pty.out"
+  # 按键流一次性从 stdin 灌入（**不用 sleep 分段**）：分段时管道 writer 会先于
+  # script(1) 退出，pty 宿主拿 EOF 的时机不确定（实测 rc=141 / 丢帧）。
+  # 一次性写入 + script 内重定向后，交互顺序完全由面板的 read 循环决定。
+  printf '2yx' >"${WORK}/pty-keys"
+  set +o errexit
+  HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
+    PANEL_REFRESH_S=2 \
+    timeout 40 script -qec "${PLUGIN_ROOT}/bin/forward watch; echo PANEL-EXIT=\$?" /dev/null \
+    <"${WORK}/pty-keys" >"${pty_out}" 2>&1
+  pty_rc=$?
+  set -o errexit
+
+  plain=""
+  # 剥 ANSI / CR，得到人可读的交互轨迹
+  plain="$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//' "${pty_out}" 2>/dev/null || true)"
+  # 为什么真 pty（而不是继续 stub）：单测里 panel_confirm / panel_render 都被替换，
+  # 而「终端下 line-read 会等回车」这类 UX 坑只在真 tty 里出现（本用例就是它的闸门）。
+  t_contains "继续? [y/N]" "${plain}" "面板用真 pty 渲染并弹出确认提示"
+  t_contains "MACHINES (2)" "${plain}" "面板渲染出 machines 列表（降级数据源）"
+  t_contains "PROBE machines activate" "${plain}" "确认后真调 CLI（machines activate <id>）"
+  t_contains "探测中" "${plain}" "先落占位行再跑子进程"
+  t_contains "PANEL-EXIT=0" "${plain}" "x 正常退出，panel_main 返回 0"
+  if [[ "${pty_rc}" -eq 0 ]]; then
+    t_pass "pty 会话退出 0（无挂死、无 timeout 杀）"
+  else
+    t_fail_note "pty 会话非零退出（rc=${pty_rc}）；见 ${pty_out}"
+  fi
+fi
 
 t_done

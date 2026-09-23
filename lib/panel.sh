@@ -23,6 +23,12 @@
 #   panel_machines_json / _panel_probe / _panel_clear。
 set -o errexit -o nounset -o pipefail
 
+# common.sh bridge（N3 契约：lib/*.sh 一律 source 同目录的真 common.sh，不自带回退副本）。
+# bin/forward 已把 common.sh 作为硬依赖先载入；单测 harness 也先 source 它。
+_PANEL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh disable=SC1091
+source "${_PANEL_LIB_DIR}/common.sh"
+
 # 面板自动刷新间隔（秒）；测试用 PANEL_REFRESH_S 缩短
 if [[ -z ${PANEL_REFRESH_S:-} ]]; then
   readonly PANEL_REFRESH_S=3
@@ -34,14 +40,8 @@ readonly PANEL_RESET=$'\033[0m'
 
 # --- 内部小工具 -------------------------------------------------------------
 
-# _panel_warn <msg...>：有 common.sh 的 log 就用，否则退 stderr
-_panel_warn() {
-  if declare -F log >/dev/null 2>&1; then
-    log warn "$@"
-  else
-    printf 'panel: warn: %s\n' "$*" >&2
-  fi
-}
+# _panel_warn <msg...>：面板告警（走 common.sh 的 log，与 CLI 同一份日志）
+_panel_warn() { log warn "$@"; }
 
 # _panel_note <msg...>：面板正文（stdout；stderr 留给日志/错误）
 _panel_note() { printf '%s\n' "$*"; }
@@ -109,9 +109,52 @@ _panel_view_from_state_file() {
   return 0
 }
 
+# _panel_machines_module <path> -> stdout "yes"（可安全加载）
+# 先在**子进程**里试加载一次：M2 的 lib/machines.sh 会 source lib/ssh-probe.sh 等依赖，
+# 若依赖缺失它会 die（= 直接 exit）。子进程里 die 只杀掉探测，面板仍能降级到
+# activated-machines.json —— 「面板必须能开」优先于「machines 列表完整」（plan §1 降级）。
+_panel_machines_module_loadable() {
+  local path="${1-}"
+  [[ -f "${path}" ]] || return 0
+  local probe=""
+  # 探测失败是**预期分支**（坏模块），故整段用 set +e 包住；
+  # 不返回非零（空输出 = 不可加载），避免 errexit 把面板一并带下去。
+  set +o errexit
+  probe="$(bash -c 'source "$1" >/dev/null 2>&1' _ "${path}" 2>/dev/null && printf 'yes')"
+  set -o errexit
+  if [[ "${probe}" == "yes" ]]; then
+    printf 'yes\n'
+  fi
+  return 0
+}
+
+# _panel_try_load_machines：尽力把 M2 的 lib/machines.sh 载进本进程（只做一次）。
+# 为什么需要它：M2 会在 bin/forward 里 source 自己的模块，但**面板也可能被单独 source**
+# （单测 harness / 未来其他入口），而 machines_view_json 是列表数据的权威来源。
+# 加载失败只是退回文件降级路径，绝不让面板开不起来。
+panel_render_machines_loaded=""
+_panel_try_load_machines() {
+  [[ -n "${panel_render_machines_loaded}" ]] && return 0
+  panel_render_machines_loaded="done"
+  declare -F machines_view_json >/dev/null 2>&1 && return 0
+  local path="${_PANEL_LIB_DIR}/machines.sh"
+  local ok=""
+  ok="$(_panel_machines_module_loadable "${path}")"
+  [[ "${ok}" == "yes" ]] || return 0
+  set +o errexit
+  # shellcheck source=/dev/null
+  source "${path}" >/dev/null 2>&1
+  set -o errexit
+  if ! declare -F machines_view_json >/dev/null 2>&1; then
+    _panel_warn "lib/machines.sh 已加载但未提供 machines_view_json；面板退回读 activated-machines.json。"
+  fi
+  return 0
+}
+
 # panel_machines_json -> stdout: 合并视图数组（面板的唯一数据入口）
 #   优先 M2 的 machines_view_json（冻结签名）；不可用/返回非数组时降级读状态文件。
 panel_machines_json() {
+  _panel_try_load_machines
   local view="" is_array=""
   if declare -F machines_view_json >/dev/null 2>&1; then
     view="$(machines_view_json 2>/dev/null || true)"
@@ -269,7 +312,9 @@ panel_handle_key() {
     id="$(_panel_field "${json}" "${key}" id)"
     if [[ -n "${id}" ]]; then
       state="$(_panel_field "${json}" "${key}" state)"
-      if [[ "${state}" == "active" ]]; then
+      # 'local' = 同机短路的激活（plan §1：短路时记录里它就置为 active），
+      # 所以它和 'active' 一样是「当前活动」→ 数字键的含义是停用而不是再激活。
+      if [[ "${state}" == "active" || "${state}" == "local" ]]; then
         printf 'deactivating:%s\n' "${id}"
       else
         printf 'activating:%s\n' "${id}"
@@ -285,13 +330,22 @@ panel_handle_key() {
 # panel_confirm <prompt> -> stdout yes|no（提示词写 stderr）
 #   宽容解析：y|Y|yes|YES（含前后空白）→ yes；其余（含 EOF / 空输入）→ no。
 #   安全默认是 no：面板误触、stdin 被重定向时都不会意外发起 SSH 探测。
+#
+#   读取方式按输入源分流（真实 pty 冒烟发现的 UX 坑）：
+#     * 交互终端：单键确认（读 1 个字符），不必再敲回车；
+#     * 管道/重定向（测试、脚本）：读整行，保留 ' yes ' 这类宽容解析与 EOF=no 语义。
 panel_confirm() {
   local prompt="${1-}"
   printf '%s ' "${prompt}" >&2
 
   local ans=""
   set +o errexit
-  IFS= read -r ans
+  if [[ -t 0 ]]; then
+    IFS= read -r -n 1 ans
+    printf '\n' >&2 # 终端里单键不回显换行，补一个免得后续输出接在提示后
+  else
+    IFS= read -r ans
+  fi
   set -o errexit
 
   # 去前后空白（bash 内建，无 fork）

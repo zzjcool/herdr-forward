@@ -529,12 +529,16 @@ printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
 m3_cmd="$(tabbar_command "${M3_CONFIG}")"
-t_eq "$(expected_cmd "${B_ROOT}" "${B_STATE}")" "${m3_cmd}" \
+m3_want="$(expected_cmd "${B_ROOT}" "${B_STATE}")"
+m3_state="$(state_dir_of "${m3_cmd}")"
+m3_exe="$(exe_path_of "${m3_cmd}")"
+m3_tb="$(tabbar_count "${M3_CONFIG}")"
+t_eq "${m3_want}" "${m3_cmd}" \
   "command = env 前缀 + B 的绝对插件根（tab bar 在 B 上执行）"
-t_eq "${B_STATE}" "$(state_dir_of "${m3_cmd}")" "state env = 记录的 B state 目录"
-t_eq "${B_ROOT}/bin/forward" "$(exe_path_of "${m3_cmd}")" "可执行 = B 的插件根"
+t_eq "${B_STATE}" "${m3_state}" "state env = 记录的 B state 目录"
+t_eq "${B_ROOT}/bin/forward" "${m3_exe}" "可执行 = B 的插件根"
 _absent "${SANDBOX_PHYS}" "${m3_cmd}" "不再写沙箱（本机）路径"
-t_eq "1" "$(tabbar_count "${M3_CONFIG}")" "只 1 条"
+t_eq "1" "${m3_tb}" "只 1 条"
 t_file_exists "${M3_STATE}/logs/forward.log"
 
 t_it "active + 已存在本机旧条目 → 就地重写为 B 路径（stale 重写，不重复插入）"
@@ -546,14 +550,17 @@ t_exit_ok 0 "${rc}" "首次退出 0"
 m3_first_cmd="$(tabbar_command "${M3_CONFIG}")"
 run_hook_m3
 t_exit_ok 0 "${rc}" "再跑退出 0（幂等）"
-t_eq "${m3_first_cmd}" "$(tabbar_command "${M3_CONFIG}")" "再跑 command 不变"
-t_eq "1" "$(tabbar_count "${M3_CONFIG}")" "仍只 1 条"
+m3_again="$(tabbar_command "${M3_CONFIG}")"
+m3_tb2="$(tabbar_count "${M3_CONFIG}")"
+t_eq "${m3_first_cmd}" "${m3_again}" "再跑 command 不变"
+t_eq "1" "${m3_tb2}" "仍只 1 条"
 # 清掉 active（模拟 deactivate）→ 下次启动回到本机路径（闭环）
 write_activation "" -
 run_hook_m3
 t_exit_ok 0 "${rc}" "清 active 后退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
-  "无 active → 恢复本机路径（闭环）"
+m3_local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+m3_local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${m3_local_want}" "${m3_local_got}" "无 active → 恢复本机路径（闭环）"
 
 t_it "无 active（空文件 / active=null）→ 现行为：本机路径"
 setup_m3_sandbox stub
@@ -561,7 +568,9 @@ write_activation "" -
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "写沙箱（本机）路径"
 
 t_it "active 状态文件缺失 → 现行为（本机路径），不报错"
@@ -569,7 +578,9 @@ setup_m3_sandbox stub
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "缺文件 → 本机路径"
 
 t_it "active 指向同机（machines_is_local_target=yes）→ 本机路径（不写错 B 路径）"
@@ -578,7 +589,9 @@ write_activation "m-local" "{\"label\":\"self\",\"ssh_target\":\"localhost:22\",
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "同机短路 → 本机路径"
 
 t_it "损坏 json → 容错：exit 0 + 降级本机路径 + warn"
@@ -587,7 +600,9 @@ printf 'this is = = not json {{' >"${M3_STATE}/activated-machines.json"
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "损坏 json 仍 exit 0（startup 不得阻塞 server）"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "降级本机路径"
 t_match "warn|降级|损坏|不可解析|skip" "${err}" "有降级提示"
 
@@ -597,7 +612,9 @@ write_activation "m-partial" '{"label":"half","ssh_target":"user@h:22"}'
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "半截记录 → 本机路径"
 
 t_it "lib/machines.sh 缺失（M2 未合入）→ 现行为不变，exit 0"
@@ -606,7 +623,9 @@ write_activation "m-remote" "${REMOTE_RECORD}"
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")" "$(tabbar_command "${M3_CONFIG}")" \
+local_want="$(expected_cmd "${SANDBOX_PHYS}" "${M3_STATE}")"
+local_got="$(tabbar_command "${M3_CONFIG}")"
+t_eq "${local_want}" "${local_got}" \
   "无 machines 模块 → 本机路径（向后兼容）"
 
 t_it "active + --dry-run → 不落盘（不改文件、不建备份）"
@@ -616,7 +635,8 @@ printf 'theme = "dark"\n' >"${M3_CONFIG}"
 m3_before="$(md5 "${M3_CONFIG}")"
 run_hook_m3 --dry-run
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "${m3_before}" "$(md5 "${M3_CONFIG}")" "dry-run 未改 config"
+m3_after="$(md5 "${M3_CONFIG}")"
+t_eq "${m3_before}" "${m3_after}" "dry-run 未改 config"
 m3_bak="$(find "${WORK}/m3" -maxdepth 1 -name 'config.toml.bak.*' -print -quit)"
 t_eq "" "${m3_bak}" "dry-run 未建备份"
 
@@ -626,8 +646,11 @@ write_activation "m-remote" "${REMOTE_RECORD}"
 printf 'theme = "dark"\n' >"${M3_CONFIG}"
 run_hook_m3 --state-dir "/override/state"
 t_exit_ok 0 "${rc}" "退出 0"
-t_eq "/override/state" "$(state_dir_of "$(tabbar_command "${M3_CONFIG}")")" "--state-dir 压过记录"
-t_eq "${B_ROOT}/bin/forward" "$(exe_path_of "$(tabbar_command "${M3_CONFIG}")")" "plugin-root 仍为 B"
+ov_cmd="$(tabbar_command "${M3_CONFIG}")"
+ov_state="$(state_dir_of "${ov_cmd}")"
+ov_exe="$(exe_path_of "${ov_cmd}")"
+t_eq "/override/state" "${ov_state}" "--state-dir 压过记录"
+t_eq "${B_ROOT}/bin/forward" "${ov_exe}" "plugin-root 仍为 B"
 
 t_it "真仓库 hook + 真 lib/machines.sh（M2 联调闸门；未合入则显式 SKIP）"
 if [[ ! -f "${ROOT}/lib/machines.sh" ]]; then
@@ -648,7 +671,9 @@ else
     bash "${HOOK}" --config "${real_cfg}" 2>"${WORK}/m3-real-stderr")" || rc=$?
   err="$(cat "${WORK}/m3-real-stderr" 2>/dev/null || true)"
   t_exit_ok 0 "${rc}" "真模块下退出 0"
-  t_eq "$(expected_cmd "${B_ROOT}" "${B_STATE}")" "$(tabbar_command "${real_cfg}")" \
+  real_want="$(expected_cmd "${B_ROOT}" "${B_STATE}")"
+  real_got="$(tabbar_command "${real_cfg}")"
+  t_eq "${real_want}" "${real_got}" \
     "真 machines_activation_load 读出的 active → 写 B 路径（联调点）"
 fi
 

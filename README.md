@@ -16,6 +16,8 @@ local port  →  public URL (Cloudflare)        🌐 https://x.trycloudflare.com
 
 - **Explicit mappings** on saved machines (0.9+), not auto-forward-everything
 - **Three-layer UI**: tab bar status entry, a Port Forward pane, notifications
+- **Saved machines in the panel**: activate a machine and the tab bar follows it
+  (read-only SSH probe, one keystroke, directly reversible)
 - **Ctrl+click** `localhost:PORT` links anywhere in herdr
 
 ## Status
@@ -234,7 +236,7 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
 | `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
 | `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A | `--config PATH`, `--server-host TARGET` (SSH probe of B: auto-derives B's root/state dir), `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
-| `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine |
+| `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine; points the tab bar at the **active machine** when one is activated (see below) |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
 the original to `config.toml.bak.<epoch>` before any real change. Re-running
@@ -249,7 +251,7 @@ When installed from GitHub, use the copy inside the managed checkout:
 
 | Key | Action |
 |---|---|
-| `prefix+f` | open the Port Forward panel (`add`/`remove` happen there) |
+| `prefix+f` | open the Port Forward panel (forwards table + saved machines; `add`/`remove`/activate happen there) |
 | `prefix+shift+f` | list current forwards |
 | `prefix+alt+f` | doctor — probe tunnels |
 
@@ -272,6 +274,7 @@ bin/forward list                              # table
 bin/forward list --oneline                    # ⇅3000⇅5173 (what the tab bar runs)
 bin/forward remove f-3000                     # tear the tunnel down
 bin/forward doctor                            # probe tunnels, report status
+bin/forward watch                             # the Port Forward panel (see below)
 bin/forward bootstrap                         # (re)install the UI / print next steps
 ```
 
@@ -294,6 +297,66 @@ In a herdr
 session the same commands are reachable as plugin actions — `Port Forward:
 Add…`, `List`, `Doctor`, and `Setup UI`
 (`herdr plugin action invoke bootstrap --plugin zzjcool:forward`).
+
+## The Port Forward panel
+
+`prefix+f` opens the **Port Forward** pane, which runs `forward watch`. In an
+interactive terminal that is a live panel, refreshed every 3 seconds:
+
+```text
+herdr-forward · Port Forward   刷新 3s · r 立即刷新 · x 退出
+──────────────────────────────────────────────────────────────
+FORWARDS (1)
+  LOCAL  REMOTE                 STATUS    PID
+  3000   127.0.0.1:9443         up        -
+──────────────────────────────────────────────────────────────
+MACHINES (2)  数字键 = 激活 / 停用
+  [✓] 1. test-probe       user@b-host:22      （当前活动 · tab bar 指向该机）
+  [·] 2. gpu-box          user@g-host:22      （已激活, 非当前 · 按 2 切回）
+  [ ] 3. lab-pc           user@l-host:22      （未激活 · 按 3 探测并激活）
+──────────────────────────────────────────────────────────────
+按键: 1-9 选择机器（激活前会确认） · r 刷新 · a 添加转发用法 · x 退出
+```
+
+The top half is your forwarding table (the same `forwards.json` the tab bar
+reads). The bottom half lists your **saved herdr machines**, three states deep:
+`[✓]` is the machine the tab bar currently points at, `[·]` was activated before
+but is not the current one (press its number to switch back), `[ ]` has never
+been activated and is shown dimmed. Machines whose `ssh_target` is this very
+host are marked local (no probe needed).
+
+Pressing a number for a non-active machine asks for confirmation first —
+`将通过 SSH 只读探测 <machine>，约 15 秒，继续? [y/N]` — and only then runs
+`forward machines activate <id>`. The probe is read-only and bounded
+(`timeout 15`, `BatchMode`), so it can never prompt for a password and never
+hangs the panel: the `探测中…` placeholder appears before the probe starts.
+`y`/`Enter` semantics are one keypress, not a line editor — the panel does not
+wait for you to press Enter.
+
+Non-interactive stdin (pipes, CI, scripts) is **not** the panel: `forward watch`
+then degrades to the original `watch -n 3 forward list`, so nothing scripted
+against it changes behaviour.
+
+The panel is only a wrapper around the CLI — every action it performs is a
+command you can type yourself (and should, if the panel ever misbehaves):
+
+```sh
+forward machines list                  # ID / LABEL / TARGET / STATE
+forward machines list --json
+forward machines activate gpu-box      # probe (read-only) + point the tab bar at it
+forward machines deactivate gpu-box    # back to the local tab bar (idempotent)
+forward machines doctor                # re-probe the active machine, rewrite if its paths moved
+```
+
+Activation is a single-machine switch: activating another machine keeps the
+historical records but moves the tab bar, and `deactivate` restores the local
+paths. The `[[startup]]` hook follows the same record — on every server start it
+reads `activated-machines.json` and, if the active machine is a *remote* one,
+points the tab bar at that machine's plugin root and state dir (no SSH probe on
+the startup path: it must be instant, so it trusts what activation recorded).
+Anything unexpected — no active machine, an active one that is this host,
+a truncated record, a corrupt JSON file, a missing `lib/machines.sh` — degrades
+to the plain local behaviour, and the hook always exits 0.
 
 ## Related work
 
