@@ -477,4 +477,94 @@ if [[ "${remove_comment_out}" == "ok" ]]; then
 fi
 t_eq "yes" "${remove_comment_ok}" "remove action 块前声明了 pane/list 交互路径"
 
+# --- OOTB：[[startup]] 钩子 + bootstrap action（任务 §2/§3） ---
+t_describe "OOTB: [[startup]] hook 与 bootstrap action"
+
+t_it "manifest 声明 [[startup]]，command 是 argv 数组且经 \$HERDR_PLUGIN_ROOT"
+py_rc=0
+set +o errexit
+python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+startup = doc.get("startup") or []
+assert len(startup) == 1, startup
+argv = startup[0].get("command")
+assert isinstance(argv, list) and argv, argv
+joined = " ".join(argv)
+assert "startup-hook.sh" in joined, joined
+assert "HERDR_PLUGIN_ROOT" in joined, joined
+PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
+  t_pass "startup hook 声明合规（argv 数组 + HERDR_PLUGIN_ROOT + startup-hook.sh）"
+else
+  t_fail_note "[[startup]] 缺失或结构不合规"
+fi
+
+t_it "startup hook 可以无副作用地跑通（隔离 HOME + dry-run 的等价路径）"
+# manifest 的 startup argv 是本插件 scripts/startup-hook.sh；这里用同一脚本 + --dry-run
+# 验证「钩子本身可执行且不落盘」。复用 unit 层已有覆盖，不重复造 env 拼装。
+START_TMP="$(mktemp -d)"
+cfg="${START_TMP}/config.toml"
+printf 'theme = "dark"\n' >"${cfg}"
+startup_ok="no"
+plugin_root="$(cd "$(dirname "${MANIFEST}")" && pwd)"
+set +o errexit
+HERDR_PLUGIN_ROOT="${plugin_root}" \
+  HERDR_PLUGIN_STATE_DIR="${START_TMP}/state" \
+  HERDR_PLUGIN_EVENT=startup \
+  bash "${ROOT}/scripts/startup-hook.sh" --config "${cfg}" --dry-run >/dev/null 2>&1
+s_rc=$?
+set -o errexit
+cfg_after="$(cat "${cfg}")"
+if [[ "${s_rc}" -eq 0 && "${cfg_after}" == 'theme = "dark"' ]]; then
+  startup_ok="yes"
+fi
+rm -rf "${START_TMP}"
+t_eq "yes" "${startup_ok}" "startup hook 可执行且 --dry-run 无副作用"
+
+t_it "bootstrap action 存在（title 'Port Forward: Setup UI'）"
+py_rc=0
+set +o errexit
+python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+actions = {a.get("id"): a for a in doc.get("actions", [])}
+assert "bootstrap" in actions, sorted(actions)
+a = actions["bootstrap"]
+assert a.get("title") == "Port Forward: Setup UI", a
+argv = a.get("command")
+assert isinstance(argv, list) and argv, argv
+joined = " ".join(argv)
+assert "bootstrap" in joined and "HERDR_PLUGIN_ROOT" in joined, joined
+PY
+py_rc=$?
+set -o errexit
+if [[ "${py_rc}" -eq 0 ]]; then
+  t_pass "bootstrap action 声明合规"
+else
+  t_fail_note "bootstrap action 缺失或结构不合规"
+fi
+
+t_it "bootstrap action 与 forward bootstrap 子命令一致（CLI 是单一路径）"
+man_bootstrap="$(
+  python3 - "${MANIFEST}" <<'PY' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+for a in doc.get("actions", []):
+    if a.get("id") == "bootstrap":
+        print(" ".join(a.get("command", [])))
+        break
+PY
+)"
+if [[ "${man_bootstrap}" == *"bin/forward\" bootstrap"* || "${man_bootstrap}" == *"bin/forward' 'bootstrap"* || "${man_bootstrap}" == *"bin/forward bootstrap"* ]]; then
+  t_pass "action 走 bin/forward bootstrap"
+else
+  t_fail_note "bootstrap action 未走 bin/forward bootstrap（[${man_bootstrap:0:100}]）"
+fi
+
 t_done
