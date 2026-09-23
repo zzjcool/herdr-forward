@@ -510,8 +510,9 @@ START_TMP="$(mktemp -d)"
 cfg="${START_TMP}/config.toml"
 printf 'theme = "dark"\n' >"${cfg}"
 startup_ok="no"
+plugin_root="$(cd "$(dirname "${MANIFEST}")" && pwd)"
 set +o errexit
-HERDR_PLUGIN_ROOT="$(cd "$(dirname "${MANIFEST}")" && pwd)" \
+HERDR_PLUGIN_ROOT="${plugin_root}" \
   HERDR_PLUGIN_STATE_DIR="${START_TMP}/state" \
   HERDR_PLUGIN_EVENT=startup \
   bash "${ROOT}/scripts/startup-hook.sh" --config "${cfg}" --dry-run >/dev/null 2>&1
