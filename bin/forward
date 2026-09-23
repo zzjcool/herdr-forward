@@ -47,6 +47,10 @@ _hf_optional_source() {
   fi
 }
 _hf_optional_source "${FORWARD_LIB}/machine.sh"
+_hf_optional_source "${FORWARD_LIB}/machines.sh"
+# M1 交付（lib/ssh-probe.sh）：`forward machines activate/doctor` 的远端探测实现。
+# 缺失时 machines_ssh_probe_plugin 退化为 HF_STATUS=unreachable（绝不假装 present）。
+_hf_optional_source "${FORWARD_LIB}/ssh-probe.sh"
 _hf_optional_source "${FORWARD_LIB}/tunnel.sh"
 _hf_optional_source "${FORWARD_LIB}/notify.sh"
 _hf_optional_source "${FORWARD_LIB}/render.sh"
@@ -88,6 +92,21 @@ forward — herdr 端口转发管理（一期：ssh -L）
 
   forward bootstrap [--config PATH] [--dry-run] [--no-tabbar] [--no-keys]
       OOTB 一键安装 UI：tab bar 状态条 + 键绑定（两个安装器都幂等）。
+
+  forward machines list [--json] [--short]
+      列出 herdr saved machines 与激活状态（[✓] 当前 / [·] 曾激活 / [ ] 未激活）。
+      --json 输出合并视图（数组）；--short 每机器一行 TSV（供面板渲染）。
+
+  forward machines activate <id|label>
+      激活一台 saved machine：同机直接标记；远端先只读 SSH 探测其插件根与 state 目录，
+      探测到已装插件则写激活记录 + 把 tab bar 指向该机器（幂等）。
+      未装插件 / 连不上时打印可复制的下一步命令，不写记录。
+
+  forward machines deactivate <id|all>
+      停用：清 active 并把 tab bar 恢复为本机路径；all 同时删除全部激活记录。
+
+  forward machines doctor
+      对当前 active 的机器重新探测：路径漂移则重写记录与 tab bar；连不上则只报告。
 
   forward doctor [--fix] [--prune]
       探活并报告；--fix 按探活结果修正 status；--prune 清理死进程记录。
@@ -571,6 +590,556 @@ cmd_bootstrap() {
   exec bash "${script}" "$@"
 }
 
+# --- machines（herdr saved machines + 跨机激活；M2 归属） ---
+#
+# 归属声明：本段（cmd_machines / cmd_machines_list / cmd_machines_activate /
+# cmd_machines_deactivate / cmd_machines_doctor 及 _hf_machines_* / _hf_install_* 助手）
+# 归 M2。cmd_watch 的交互式面板改造归 M3，双方互不触碰（plan §4 的 bin/forward 函数块切割）。
+# 契约见 machines-integration-plan §2.3；退出码沿用冻结表（3 记录不存在 / 4 探测或解析失败
+# / 64 用法错误），另用 1 表示「探测通过但写记录/装 UI 失败」（冻结表未覆盖，见下面注释）。
+
+# _hf_machines_available：stdout yes 表示数据层已加载（输出式，避免 SC2310）
+_hf_machines_available() {
+  _hf_has_func machines_view_json
+}
+
+# _hf_machines_require：数据层缺失 -> die 127（绝不静默降级成空输出）
+_hf_machines_require() {
+  local has=""
+  has="$(_hf_machines_available)"
+  if [[ -z "${has}" ]]; then
+    die 127 "缺少 ${FORWARD_LIB}/machines.sh（machines 子命令的数据层）。请确认插件检出完整后重试（herdr plugin update）。"
+  fi
+}
+
+# _hf_config_path：stdout herdr config.toml 路径
+#   优先级与 scripts/startup-hook.sh 一致：$HERDR_CONFIG_PATH（herdr server 注入）> 默认。
+_hf_config_path() {
+  if [[ -n "${HERDR_CONFIG_PATH:-}" ]]; then
+    printf '%s\n' "${HERDR_CONFIG_PATH}"
+    return 0
+  fi
+  printf '%s\n' "${XDG_CONFIG_HOME:-${HOME:-/tmp}/.config}/herdr/config.toml"
+}
+
+# _hf_install_tabbar [plugin_root] [state_dir] -> 0 ok / 非 0 失败
+#   不传参数 = 恢复本机路径（install-tabbar.sh 自动解析自身所在的插件根）。
+#   安装器输出走 stderr：本函数用于 CLI 与（M3 的）面板共用，stdout 必须保持干净。
+_hf_install_tabbar() {
+  local plugin_root="${1-}"
+  local state_dir="${2-}"
+  local script="${FORWARD_ROOT}/scripts/install-tabbar.sh"
+  if [[ ! -f "${script}" ]]; then
+    log warn "缺少 ${script}，跳过 tab bar 更新。请手动运行：bash ${script}"
+    return 0
+  fi
+
+  local -a args=("--config" "$(_hf_config_path)")
+  if [[ -n "${plugin_root}" ]]; then
+    args+=("--plugin-root" "${plugin_root}")
+  fi
+  if [[ -n "${state_dir}" ]]; then
+    args+=("--state-dir" "${state_dir}")
+  fi
+
+  local rc=0
+  set +o errexit
+  bash "${script}" "${args[@]}" >&2
+  rc=$?
+  set -o errexit
+  return "${rc}"
+}
+
+# _hf_install_keys -> 0 ok / 非 0 失败（同样保持 stdout 干净）
+_hf_install_keys() {
+  local script="${FORWARD_ROOT}/scripts/install-keys.sh"
+  if [[ ! -f "${script}" ]]; then
+    log warn "缺少 ${script}，跳过键位安装。请手动运行：bash ${script}"
+    return 0
+  fi
+  local cfg=""
+  cfg="$(_hf_config_path)"
+  local rc=0
+  set +o errexit
+  bash "${script}" --config "${cfg}" >&2
+  rc=$?
+  set -o errexit
+  return "${rc}"
+}
+
+# _hf_machines_reload_hint <target>：激活/停用后告诉用户下一步（面板 §2.4 也复用它）
+_hf_machines_reload_hint() {
+  local target="${1-}"
+  printf '\n下一步：在 herdr 里执行 reload-config（或重启 herdr）使 tab bar 生效。\n'
+  printf '  tab bar command 由 herdr server 执行；跨机时它读的是 %s 上的插件与状态。\n' "${target:-该机器}"
+  printf '  回滚：forward machines deactivate all\n'
+}
+
+cmd_machines_list() {
+  _hf_machines_require
+
+  local mode="table"
+  while (($# > 0)); do
+    case "$1" in
+    --json)
+      mode="json"
+      shift
+      ;;
+    --short)
+      mode="short"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward machines list [--json] [--short]"
+      ;;
+    *)
+      die "${EXIT_USAGE}" "list 不接受位置参数：$1。用法：forward machines list [--json] [--short]"
+      ;;
+    esac
+  done
+
+  local view=""
+  view="$(machines_view_json)"
+  local fmt=""
+  # 三态标记与 §2.3/§2.4 冻结一致：[✓] 当前 / [·] 曾激活 / [ ] 未激活 / [✓ local] 同机
+  fmt='.[] | [
+    (if .state == "active" then "[✓]"
+     elif .state == "activated" then "[·]"
+     elif .state == "local" then "[✓ local]"
+     else "[ ]" end),
+    .id,
+    .label,
+    (.target | if . == "" then "-" else . end),
+    .state,
+    (if .orphan then "saved machine 已删除（记录残留）" else "" end)
+  ] | @tsv'
+
+  case "${mode}" in
+  json)
+    printf '%s\n' "${view}" | jq -c '.'
+    ;;
+  short)
+    # 面板消费：marker <TAB> id <TAB> label <TAB> target <TAB> state <TAB> orphan-note
+    printf '%s\n' "${view}" | jq -r "${fmt}"
+    ;;
+  *)
+    local count=""
+    count="$(printf '%s' "${view}" | jq -r 'length')"
+    if [[ "${count}" == "0" ]]; then
+      printf '没有可用的 saved machines。\n'
+      printf '  可能原因：herdr 里还没保存 machine（herdr machine add）；或本命令不是从 herdr 插件上下文调起的（HERDR_BIN_PATH 未注入，非插件运行时属正常）。\n'
+      return 0
+    fi
+    printf '%-10s %-20s %-24s %-16s %s\n' "STATE" "ID" "LABEL" "TARGET" "NOTE"
+    local rows=""
+    set +o errexit
+    rows="$(printf '%s' "${view}" | jq -r "${fmt}")"
+    set -o errexit
+    local row=""
+    while IFS= read -r row; do
+      [[ -z "${row}" ]] && continue
+      printf '%s\n' "${row}" | awk -F'\t' '{printf "%-10s %-20s %-24s %-16s %s\n", $1, $2, $3, $4, $6}'
+    done <<<"${rows}"
+    printf '\n[✓] 当前激活  [·] 曾激活（可重新激活）  [ ] 未激活  [✓ local] 本机\n'
+    printf '激活：forward machines activate <id|label>    停用：forward machines deactivate <id|all>\n'
+    ;;
+  esac
+}
+
+# _hf_machines_probe_fields <probe_kv>：把 §2.1 的 KV 输出解析进 PROBE_* 全局
+PROBE_STATUS=""
+PROBE_ROOT=""
+PROBE_STATE=""
+PROBE_REASON=""
+_hf_machines_probe_fields() {
+  local kv="${1-}"
+  PROBE_STATUS="$(machines_kv_get "${kv}" HF_STATUS)"
+  PROBE_ROOT="$(machines_kv_get "${kv}" HF_ROOT)"
+  PROBE_STATE="$(machines_kv_get "${kv}" HF_STATE_DIR)"
+  if [[ -z "${PROBE_STATE}" ]]; then
+    PROBE_STATE="$(machines_kv_get "${kv}" HF_DEFAULT_STATE)"
+  fi
+  PROBE_REASON="$(machines_kv_get "${kv}" HF_REASON)"
+}
+
+cmd_machines_activate() {
+  _hf_machines_require
+
+  local arg=""
+  local config_override=""
+  while (($# > 0)); do
+    case "$1" in
+    --config)
+      (($# >= 2)) || die "${EXIT_USAGE}" "--config 需要一个路径值。"
+      config_override="$2"
+      shift 2
+      ;;
+    --config=*)
+      config_override="${1#*=}"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward machines activate <id|label>"
+      ;;
+    *)
+      if [[ -n "${arg}" ]]; then
+        die "${EXIT_USAGE}" "activate 只接受一个 <id|label>（收到额外：$1）。"
+      fi
+      arg="$1"
+      shift
+      ;;
+    esac
+  done
+
+  if [[ -z "${arg}" ]]; then
+    die "${EXIT_USAGE}" "缺少 <id|label>。用法：forward machines activate <id|label>（用 'forward machines list' 查看）"
+  fi
+  if [[ -n "${config_override}" ]]; then
+    HERDR_CONFIG_PATH="${config_override}"
+    export HERDR_CONFIG_PATH
+  fi
+
+  local id=""
+  local info=""
+  id="$(machines_resolve_id "${arg}")"
+  info="$(machines_lookup_json "${id}")"
+
+  local label=""
+  local target=""
+  label="$(printf '%s' "${info}" | jq -r '.label')"
+  target="$(printf '%s' "${info}" | jq -r '.target')"
+
+  local is_local=""
+  is_local="$(machines_is_local_target "${target}")"
+
+  # ① 同机短路（§1）：不走 ssh，直接写记录（本机路径已正确，tab bar 无需改）
+  if [[ "${is_local}" == "yes" ]]; then
+    local local_state=""
+    local local_sock=""
+    local_state="$(state_dir)"
+    local_sock="${HERDR_SOCKET_PATH:-}"
+    printf 'machine %s（%s）与当前主机同机，直接标记激活（不发起 SSH 探测）。\n' "${id}" "${target}"
+    local rec=""
+    rec="$(jq -c -n \
+      --arg label "${label}" \
+      --arg target "${target}" \
+      --arg root "${FORWARD_ROOT}" \
+      --arg sd "${local_state}" \
+      --arg sock "${local_sock}" \
+      '{label: $label, ssh_target: $target, server_root: $root, state_dir: $sd,
+        local: true, socket_path: (if $sock == "" then null else $sock end)}')"
+    machines_activation_set "${id}" "${rec}"
+    printf '已激活（同机）：%s → 本机插件根 %s\n' "${id}" "${FORWARD_ROOT}"
+    printf 'tab bar 仍指向本机路径，无需改动；本机路径漂移时重跑本命令即刷新记录。\n'
+    return 0
+  fi
+
+  # ② 远端：先明示再探测（§5 风险 #1：15s 级耗时必须让用户有预期）
+  printf '将只读 SSH 探测 %s（BatchMode，最多约 15 秒）以定位其插件根与 state 目录…\n' "${target}"
+  local kv=""
+  kv="$(machines_ssh_probe_plugin "${target}")"
+  _hf_machines_probe_fields "${kv}"
+
+  case "${PROBE_STATUS}" in
+  present)
+    printf '探测命中：插件根 %s\n' "${PROBE_ROOT:-<未报告>}"
+    printf '            state 目录 %s\n' "${PROBE_STATE:-<未报告>}"
+    if [[ -z "${PROBE_ROOT}" ]]; then
+      die 4 "探测到 ${target} 已装插件，但没读到它的插件根（HF_ROOT 为空）：远端 plugins.json / 目录结构异常。请在 ${target} 上执行 'herdr plugin list --json' 核对，或改用 scripts/setup-client.sh --server-host ${target} --server-root <B 的插件根>。"
+    fi
+    ;;
+  absent)
+    # ③ absent：给出可直接复制的安装命令，不写记录（保持「递命令不代装」原则）
+    printf 'SSH 连上了 %s，但该机器上**没有**安装 herdr-forward 插件。\n' "${target}" >&2
+    printf '请在 %s 上执行（本命令不会替你装）：\n' "${target}" >&2
+    printf "  ssh %s 'herdr plugin install zzjcool/herdr-forward --yes'\n" "${target}" >&2
+    printf '装完后回到本机重跑：forward machines activate %s\n' "${arg}" >&2
+    die 4 "目标机器未安装 herdr-forward 插件（absent）：${target}。已给出安装命令，装好后重试。"
+    ;;
+  no-herdr)
+    printf 'SSH 连上了 %s，但远端非交互 shell 里找不到 herdr。\n' "${target}" >&2
+    printf '排查清单：\n  1) ssh -o BatchMode=yes %s true        # 确认免密与主机名\n' "${target}" >&2
+    printf '  2) ssh %s "command -v herdr || ls ~/.local/bin/herdr"   # 确认 herdr 位置\n' "${target}" >&2
+    printf '  3) 若 herdr 不在默认 PATH，请在 B 的 ~/.bashrc / profile 里补 PATH 后重试。\n' >&2
+    die 4 "远端找不到 herdr 命令（no-herdr）：${target}。${PROBE_REASON:+原因：${PROBE_REASON}}"
+    ;;
+  *)
+    printf 'SSH 探测失败，无法确认 %s 上的插件状态。\n' "${target}" >&2
+    printf '排查清单：\n  1) ssh -o BatchMode=yes %s true        # 免密/主机名/端口\n' "${target}" >&2
+    printf '  2) 检查 ~/.ssh/config 里的该主机别名与 IdentityFile。\n' >&2
+    printf '  3) 内网机请确认已连上 VPN。\n' >&2
+    die 4 "无法通过 SSH 到达 ${target}（unreachable）。${PROBE_REASON:+原因：${PROBE_REASON}}"
+    ;;
+  esac
+
+  # ④ present：写记录 → 装 UI（幂等）→ reload 提示
+  local record=""
+  record="$(jq -c -n \
+    --arg label "${label}" \
+    --arg target "${target}" \
+    --arg root "${PROBE_ROOT}" \
+    --arg sd "${PROBE_STATE}" \
+    '{label: $label, ssh_target: $target, server_root: $root, state_dir: $sd, local: false}')"
+  machines_activation_set "${id}" "${record}"
+
+  local tb_rc=0
+  local keys_rc=0
+  set +o errexit
+  _hf_install_tabbar "${PROBE_ROOT}" "${PROBE_STATE}"
+  tb_rc=$?
+  _hf_install_keys
+  keys_rc=$?
+  set -o errexit
+
+  if [[ "${tb_rc}" -ne 0 ]]; then
+    # 冻结退出码表没有「安装器失败」这一档；记录已写、tab bar 未切 = 半成品状态，
+    # 用 1（通用失败）显式失败，避免用户以为已生效。可用 deactivate 回滚。
+    die 1 "激活记录已写入，但 tab bar 安装器失败（rc=${tb_rc}）。请手动运行 'bash ${FORWARD_ROOT}/scripts/install-tabbar.sh --plugin-root ${PROBE_ROOT} --state-dir ${PROBE_STATE}' 后重试；或用 'forward machines deactivate all' 回滚。"
+  fi
+  if [[ "${keys_rc}" -ne 0 ]]; then
+    log warn "键位安装器返回 ${keys_rc}（tab bar 已切换成功）。可手动运行：bash ${FORWARD_ROOT}/scripts/install-keys.sh"
+  fi
+
+  printf '已激活：%s（%s）\n' "${id}" "${target}"
+  printf '  tab bar 已指向该机器：%s\n' "${PROBE_ROOT}"
+  _hf_machines_reload_hint "${target}"
+}
+
+cmd_machines_deactivate() {
+  _hf_machines_require
+
+  local arg=""
+  local config_override=""
+  while (($# > 0)); do
+    case "$1" in
+    --config)
+      (($# >= 2)) || die "${EXIT_USAGE}" "--config 需要一个路径值。"
+      config_override="$2"
+      shift 2
+      ;;
+    --config=*)
+      config_override="${1#*=}"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward machines deactivate <id|all>"
+      ;;
+    *)
+      if [[ -n "${arg}" ]]; then
+        die "${EXIT_USAGE}" "deactivate 只接受一个 <id|all>（收到额外：$1）。"
+      fi
+      arg="$1"
+      shift
+      ;;
+    esac
+  done
+
+  if [[ -z "${arg}" ]]; then
+    die "${EXIT_USAGE}" "缺少 <id|all>。用法：forward machines deactivate <id|all>（用 'forward machines list' 查看）"
+  fi
+  if [[ -n "${config_override}" ]]; then
+    HERDR_CONFIG_PATH="${config_override}"
+    export HERDR_CONFIG_PATH
+  fi
+
+  local active=""
+  active="$(machines_activation_active)"
+
+  if [[ "${arg}" == "all" ]]; then
+    # all：清 active + 删全部记录（§2.3「all 清空并删全部记录」）→ 回到初始态
+    machines_activation_reset
+    printf '已停用全部 machine 并清空激活记录。\n'
+  else
+    local id=""
+    id="$(machines_resolve_id "${arg}")"
+    # 记录必须存在，否则用户打错 id 会静默「成功」
+    machines_activation_get "${id}" >/dev/null
+
+    if [[ "${active}" != "${id}" ]]; then
+      # 非当前 active：只想清掉这台的历史记录（tab bar 不动）
+      machines_activation_remove "${id}"
+      printf '已删除 %s 的激活记录（它本就不是当前 active）。\n' "${id}"
+      if [[ -n "${active}" ]]; then
+        printf '当前 active 仍是 %s，tab bar 保持指向它。\n' "${active}"
+        printf '如需停用它：forward machines deactivate %s\n' "${active}"
+      fi
+      return 0
+    fi
+
+    # 当前 active：只清 active，记录保留为 [·] 历史（§1「deactivate 清 active」）
+    machines_activation_clear_active
+    printf '已停用 %s（记录保留，可用 forward machines activate %s 重新激活）。\n' "${id}" "${arg}"
+  fi
+
+  # 恢复本机路径：不传 --plugin-root，install-tabbar 自动解析本脚本所在插件根
+  local tb_rc=0
+  set +o errexit
+  _hf_install_tabbar
+  tb_rc=$?
+  set -o errexit
+  if [[ "${tb_rc}" -ne 0 ]]; then
+    die 1 "激活状态已清空，但 tab bar 恢复本机路径失败（rc=${tb_rc}）。请手动运行 'bash ${FORWARD_ROOT}/scripts/install-tabbar.sh' 恢复；tab bar 为空时不影响其他功能。"
+  fi
+
+  printf 'tab bar 已恢复为本机路径：%s\n' "${FORWARD_ROOT}"
+  _hf_machines_reload_hint "本机"
+}
+
+cmd_machines_doctor() {
+  _hf_machines_require
+
+  local config_override=""
+  while (($# > 0)); do
+    case "$1" in
+    --config)
+      (($# >= 2)) || die "${EXIT_USAGE}" "--config 需要一个路径值。"
+      config_override="$2"
+      shift 2
+      ;;
+    --config=*)
+      config_override="${1#*=}"
+      shift
+      ;;
+    -*)
+      die "${EXIT_USAGE}" "未知参数：$1。用法：forward machines doctor"
+      ;;
+    *)
+      die "${EXIT_USAGE}" "doctor 不接受位置参数：$1。"
+      ;;
+    esac
+  done
+  if [[ -n "${config_override}" ]]; then
+    HERDR_CONFIG_PATH="${config_override}"
+    export HERDR_CONFIG_PATH
+  fi
+
+  local active=""
+  active="$(machines_activation_active)"
+  if [[ -z "${active}" ]]; then
+    printf '没有处于激活状态的 machine（tab bar 指向本机路径），无需检查。\n'
+    printf '  列出可用机器：forward machines list\n'
+    return 0
+  fi
+
+  local rec=""
+  rec="$(machines_activation_get "${active}")"
+  local label=""
+  local target=""
+  local saved_root=""
+  local saved_state=""
+  local rec_local=""
+  label="$(printf '%s' "${rec}" | jq -r '.label // ""')"
+  target="$(printf '%s' "${rec}" | jq -r '.ssh_target // ""')"
+  saved_root="$(printf '%s' "${rec}" | jq -r '.server_root // ""')"
+  saved_state="$(printf '%s' "${rec}" | jq -r '.state_dir // ""')"
+  rec_local="$(printf '%s' "${rec}" | jq -r 'if .local == true then "yes" else "no" end')"
+
+  printf '当前 active：%s（%s）\n' "${active}" "${label}"
+  printf '  ssh_target  : %s\n' "${target}"
+  printf '  server_root : %s\n' "${saved_root:-<未记录>}"
+  printf '  state_dir   : %s\n' "${saved_state:-<未记录>}"
+
+  # 同机记录：无需 ssh，只检查记录路径是否与本机一致（路径漂移 = 本机重装/移动检出）
+  if [[ "${rec_local}" == "yes" ]]; then
+    printf '  类型        : 同机（local）\n'
+    if [[ "${saved_root}" != "${FORWARD_ROOT}" ]]; then
+      printf '发现路径漂移：记录的插件根 %s 与当前检出 %s 不一致。\n' "${saved_root}" "${FORWARD_ROOT}"
+      local rec2=""
+      local now_state=""
+      now_state="$(state_dir)"
+      rec2="$(printf '%s' "${rec}" | jq -c --arg r "${FORWARD_ROOT}" --arg s "${now_state}" '.server_root = $r | .state_dir = $s')"
+      machines_activation_set "${active}" "${rec2}"
+      printf '已更新记录为当前检出（tab bar 本就指向本机，无需改动）。\n'
+      return 0
+    fi
+    printf '记录与当前检出一致，无需修复。\n'
+    return 0
+  fi
+
+  # 远端记录：重探测（只读）。stale 路径 -> 重写记录 + 重写 tab bar；unreachable -> 只报告。
+  printf '\n正在重新探测 %s（只读，最多约 15 秒）…\n' "${target}"
+  local kv=""
+  kv="$(machines_ssh_probe_plugin "${target}")"
+  _hf_machines_probe_fields "${kv}"
+
+  case "${PROBE_STATUS}" in
+  present)
+    if [[ -z "${PROBE_ROOT}" ]]; then
+      printf '记录 stale：探测到插件但没读到插件根，无法自动修复。\n'
+      printf '  下一步：ssh %s "herdr plugin list --json"\n' "${target}"
+      die 4 "active machine ${active} 的插件根无法确认（HF_ROOT 为空）。记录保持原样，未改动 config。"
+    fi
+    printf '  重探测插件根: %s\n' "${PROBE_ROOT}"
+    printf '  重探测 state: %s\n' "${PROBE_STATE:-<未报告>}"
+    if [[ "${PROBE_ROOT}" == "${saved_root}" && "${PROBE_STATE}" == "${saved_state}" ]]; then
+      printf '记录与远端一致，无需修复。\n'
+      return 0
+    fi
+    printf '发现 stale 路径（远端已漂移）：记录 %s / 实测 %s\n' "${saved_root}" "${PROBE_ROOT}"
+    local rec3=""
+    rec3="$(printf '%s' "${rec}" | jq -c --arg r "${PROBE_ROOT}" --arg s "${PROBE_STATE}" '.server_root = $r | .state_dir = $s')"
+    machines_activation_set "${active}" "${rec3}"
+    printf '已更新激活记录。\n'
+    local tb_rc=0
+    set +o errexit
+    _hf_install_tabbar "${PROBE_ROOT}" "${PROBE_STATE}"
+    tb_rc=$?
+    set -o errexit
+    if [[ "${tb_rc}" -ne 0 ]]; then
+      die 1 "记录已更新，但 tab bar 重写失败（rc=${tb_rc}）。请手动运行 'bash ${FORWARD_ROOT}/scripts/install-tabbar.sh --plugin-root ${PROBE_ROOT} --state-dir ${PROBE_STATE}'。"
+    fi
+    printf 'tab bar 已按新路径重写。\n'
+    _hf_machines_reload_hint "${target}"
+    ;;
+  absent)
+    printf '远端 %s 上已找不到该插件（可能被卸载）。\n' "${target}"
+    printf '  下一步：在 %s 上重装（ssh %s '"'"'herdr plugin install zzjcool/herdr-forward --yes'"'"'）\n' "${target}" "${target}"
+    printf '  或停用：forward machines deactivate %s\n' "${active}"
+    die 4 "active machine ${active} 的远端已卸载插件（absent）。记录与 config 保持原样，未改动。"
+    ;;
+  no-herdr | unreachable)
+    # 关键：连不上时**不动** config 与记录（stale 报告，不误删 —— §2.3 doctor 契约）
+    printf '远端暂不可达/无法判定（%s）：%s\n' "${PROBE_STATUS}" "${PROBE_REASON:-无更多信息}"
+    printf '记录与 config 均保持原样（不做任何破坏性修复）。\n'
+    printf '  排查：ssh -o BatchMode=yes %s true\n' "${target}"
+    printf '  网络恢复后重跑：forward machines doctor\n'
+    die 4 "active machine ${active} 暂不可达（${PROBE_STATUS}），已按 stale 报告（未改动任何文件）。"
+    ;;
+  *)
+    printf '探测返回未知状态（%s），记录与 config 保持原样。\n' "${PROBE_STATUS:-<empty>}"
+    die 4 "active machine ${active} 的探测状态未知：${PROBE_STATUS:-<empty>}。"
+    ;;
+  esac
+}
+
+cmd_machines() {
+  if (($# == 0)); then
+    die "${EXIT_USAGE}" "缺少 machines 子命令。用法：forward machines list|activate|deactivate|doctor（'forward --help' 查看）"
+  fi
+
+  local sub="$1"
+  shift
+  case "${sub}" in
+  list) cmd_machines_list "$@" ;;
+  activate) cmd_machines_activate "$@" ;;
+  deactivate) cmd_machines_deactivate "$@" ;;
+  doctor) cmd_machines_doctor "$@" ;;
+  help | --help | -h)
+    printf '用法：forward machines <list|activate|deactivate|doctor>\n'
+    printf '  list [--json] [--short]      列出 saved machines 与激活状态\n'
+    printf '  activate <id|label>         激活（远端先只读 SSH 探测）\n'
+    printf '  deactivate <id|all>         停用并把 tab bar 恢复本机路径\n'
+    printf '  doctor                      重探测 active 机器（stale 路径检测）\n'
+    ;;
+  -*)
+    die "${EXIT_USAGE}" "未知参数：${sub}。用法：forward machines list|activate|deactivate|doctor"
+    ;;
+  *)
+    die "${EXIT_USAGE}" "未知 machines 子命令：${sub}。可用：list / activate / deactivate / doctor。"
+    ;;
+  esac
+}
+
 # --- dispatch ---
 
 main() {
@@ -591,6 +1160,7 @@ main() {
   unpublish) cmd_unpublish "$@" ;;
   watch) cmd_watch "$@" ;;
   bootstrap) cmd_bootstrap "$@" ;;
+  machines) cmd_machines "$@" ;;
   help | --help | -h)
     usage
     return 0
