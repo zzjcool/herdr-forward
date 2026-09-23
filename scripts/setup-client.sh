@@ -13,17 +13,19 @@
 # （各自有独立测试）—— 本脚本不重复实现，也不直接碰文件。
 #
 # 能力边界（诚实标注，SCOUT-FACTS 已确认）：
-#   A 上的任何进程都无法枚举 B 的插件安装状态（herdr socket API 没有 machine/plugin
-#   枚举，插件也不跨机执行）。因此「B 上是否已装插件 / ssh 免密 / jq」只能**打印成
-#   checklist 让用户确认**，脚本无法自动验证。脚本会做一次**尽力而为**的本机探测
-#   （同机用户 A == B 时命中），探测失败绝不阻塞、绝不影响退出码。
+#   A 上的任何进程都无法*本地*枚举 B 的插件安装状态（herdr socket API 没有 machine/plugin
+#   枚举，插件也不跨机执行）。但 A attach B 走的就是 **SSH** —— 所以当用户给出
+#   `--server-host <ssh target>` 时，本脚本会**通过 ssh 真实探测 B**（timeout 15，
+#   BatchMode 只读）：探到插件 → 自动推导 B 的插件根 + state 目录（用户连 --server-root
+#   都不用传）；没探到 → 把可直接复制的安装命令递到手上（**不自动装**，尊重用户）；
+#   探测失败（连不上/没权限）→ 降级成本机尽力探测 + 手工 checklist，绝不阻塞安装。
+#   不传 --server-host 时行为不变（本机尽力探测 + checklist，向后兼容）。
 #
 # 用法（A 上，无需 A 安装插件）：
 #   curl -fsSL https://raw.githubusercontent.com/zzjcool/herdr-forward/main/scripts/setup-client.sh \
-#     | bash -s -- --server-root <B 上的插件根>
+#     | bash -s -- --server-host <B 的 ssh target>
 # 或 git clone 后本地跑（会用同目录的安装器，不下载）：
-#   ./scripts/setup-client.sh --config ~/.config/herdr/config.toml \
-#     --server-root <B 上的插件根> --server-state-dir <B 上的 state 目录>
+#   ./scripts/setup-client.sh --config ~/.config/herdr/config.toml --server-host me@b
 set -Eeuo pipefail
 
 readonly PROG_NAME="${0##*/}"
@@ -41,12 +43,20 @@ herdr config.toml。两个条目都指向 **herdr server（B）** 上的插件�
 选项:
   --config PATH            A（本机）的 config.toml（默认: $XDG_CONFIG_HOME/herdr/config.toml，
                            退 $HOME/.config/herdr/config.toml）
+  --server-host TARGET     **herdr server（B）** 的 ssh target，形如 user@host 或 user@host:port。
+                           给出后会通过 ssh 真实探测 B（只读，timeout 15，BatchMode）：
+                             · B 已装插件 → 自动探测 B 的插件根与 state 目录，
+                               --server-root/--server-state-dir 都不用传；
+                             · B 未装插件 → 打印可复制的安装命令（不自动装）；
+                             · 连不上/无权限 → 降级为本机探测 + checklist，绝不阻塞。
+                           不传则维持旧行为（本机尽力探测 + checklist）。
   --server-root PATH       **herdr server（B）** 上的插件根绝对路径。要装 tab bar 时必填
                            （tab bar command 在 B 上执行，A 的本地路径对 B 无意义）。
+                           给了 --server-host 且探测命中时可省（自动填入）。
                            例: /home/me/.config/herdr/plugins/github/zzjcool-forward-xxxxxxxx
   --server-state-dir PATH  **server（B）** 上的插件 state 目录绝对路径
-                           （默认从 --server-root 里的 herdr-plugin.toml 的 id 推导：
-                           <XDG_STATE_HOME>/herdr/plugins/<id 的 ':' → '%3A'>；
+                           （默认：--server-host 探测到的值；否则从 --server-root 里的
+                           herdr-plugin.toml 的 id 推导：<XDG_STATE_HOME>/herdr/plugins/<id 的 ':' → '%3A'>；
                            推导不出来时退回 .../herdr/plugins/zzjcool%3Aforward）。
   --no-keys               跳过键绑定安装
   --no-tabbar             跳过 tab bar 状态条安装（此时不需要 --server-root）
@@ -57,7 +67,9 @@ herdr config.toml。两个条目都指向 **herdr server（B）** 上的插件�
 <config>.bak.<epoch>。装完在 herdr 里按 prefix+q（reload_config）或运行
 `herdr server reload-config` 生效。
 
-示例（跨机 A → B）:
+示例（跨机 A → B，路径全自动）:
+  setup-client.sh --server-host me@b-host
+旧用法（不传 --server-host：本机探测 + checklist）:
   setup-client.sh --server-root /home/me/.config/herdr/plugins/github/zzjcool-forward-ab12cd34
 EOF
 }
@@ -71,10 +83,18 @@ die() {
 
 note() { printf '%s: %s\n' "${PROG_NAME}" "$*"; }
 
+# kv_get <多行文本> <KEY> -> 第一个 KEY= 的值（无则空）
+kv_get() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1 || true
+}
+
+# --- 安装器定位：优先同目录（git clone / 插件检出场景），否则按需下载（curl | bash 场景） ---
+
 # --- 参数解析（禁交互：未知参数直接报错，绝不等确认） ---
 config_path=""
 server_root=""
 server_state_dir=""
+server_host=""
 dry_run=0
 do_tabbar=1
 do_keys=1
@@ -83,6 +103,12 @@ while (($# > 0)); do
   --config)
     [[ $# -ge 2 ]] || die 2 "--config 需要参数值"
     config_path="$2"
+    shift 2
+    ;;
+  --server-host)
+    [[ $# -ge 2 ]] || die 2 "--server-host 需要参数值（B 的 ssh target，形如 user@host[:port]）"
+    server_host="$2"
+    [[ -n "${server_host}" ]] || die 2 "--server-host 不能为空（不要探测 B 时请去掉该参数）"
     shift 2
     ;;
   --server-root)
@@ -122,14 +148,156 @@ done
 if ((do_tabbar == 0 && do_keys == 0)); then
   die 2 "--no-tabbar 与 --no-keys 同时指定：没有可执行的安装步骤，请去掉其一。"
 fi
+ssh_host=""
+ssh_port=""
+SSH_TIMER_BIN=""
+if [[ -n "${server_host}" ]]; then
+  ssh_host="${server_host}"
+  if [[ "${server_host}" == *:* ]]; then
+    ssh_host="${server_host%%:*}"
+    ssh_port="${server_host#*:}"
+    if [[ ! "${ssh_port}" =~ ^[0-9]+$ ]]; then
+      die 2 "--server-host 端口非法: '${ssh_port}'（期望 user@host[:port]）"
+    fi
+    [[ -n "${ssh_host}" ]] || die 2 "--server-host 缺少主机名: '${server_host}'"
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    SSH_TIMER_BIN="timeout"
+  fi
+fi
+
+# ssh_probe <远端命令> -> 第一行 `HF_SSH_RC=<rc>`，其后是远端 stdout+stderr。恒返回 0。
+ssh_probe() {
+  local remote="$1"
+  local rc=0
+  local merged=""
+  local -a cmd=()
+  if [[ -n "${SSH_TIMER_BIN}" ]]; then
+    cmd+=("${SSH_TIMER_BIN}" "${SSH_PROBE_TIMEOUT}")
+  fi
+  cmd+=(ssh -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}")
+  if [[ -n "${ssh_port}" ]]; then
+    cmd+=(-p "${ssh_port}")
+  fi
+  cmd+=("${ssh_host}" "${remote}")
+  merged="$("${cmd[@]}" 2>&1)" || rc=$?
+  printf 'HF_SSH_RC=%d\n%s\n' "${rc}" "${merged}"
+  return 0
+}
+
+# --- ssh 探测 B（仅当给了 --server-host）：只读、超时、失败降级，绝不阻塞安装 ---
+# 每次探测都是 `timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 <host> '<远端命令>'`。
+readonly SSH_PROBE_TIMEOUT=15
+readonly SSH_CONNECT_TIMEOUT=8
+# shellcheck disable=SC2016  # 单引号是有意的：$HOME/$PATH 必须由 **远端** shell 展开
+readonly REMOTE_LIST_CMD='if command -v herdr >/dev/null 2>&1; then herdr plugin list; else PATH="$HOME/.local/bin:$PATH" herdr plugin list 2>/dev/null || echo HF_NO_HERDR; fi'
+# 远端路径探测：plugins.json 的 plugin_root → 退回 plugins/github/*forward* glob →
+# state 目录按远端 HOME/XDG 推导（HF_STATE_DIR=已存在 / HF_DEFAULT_STATE=默认位置）。
+# 注意：这里是**单引号本地字符串**（整体作为一个 ssh 实参），内部一律不用 '。
+# shellcheck disable=SC2016  # 同上：整段是远端脚本，变量必须留给远端展开
+readonly REMOTE_PATHS_CMD='
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/herdr"
+root=""
+if [ -f "$cfg/plugins.json" ] && command -v python3 >/dev/null 2>&1; then
+  root=$(python3 -c "import json,sys
+try:
+    d=json.load(open(sys.argv[1], encoding=\"utf-8\"))
+except Exception:
+    raise SystemExit(0)
+for e in (d if isinstance(d, list) else []):
+    if isinstance(e, dict) and e.get(\"plugin_id\") == sys.argv[2]:
+        print(e.get(\"plugin_root\", \"\"))
+        break" "$cfg/plugins.json" zzjcool:forward 2>/dev/null) || root=""
+fi
+if [ -z "$root" ]; then
+  for d in "$cfg"/plugins/github/*forward*; do
+    if [ -d "$d" ]; then root="$d"; fi
+  done
+fi
+if [ -n "$root" ]; then printf "HF_ROOT=%s\n" "$root"; fi
+enc="zzjcool%3Aforward"
+if [ -n "$root" ] && [ -f "$root/herdr-plugin.toml" ]; then
+  id=$(sed -n "s/^[[:space:]]*id[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$root/herdr-plugin.toml" | head -1)
+  if [ -n "$id" ]; then enc=$(printf "%s" "$id" | sed "s/:/%3A/g"); fi
+fi
+state="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$enc"
+if [ -d "$state" ]; then printf "HF_STATE_DIR=%s\n" "$state"; else printf "HF_DEFAULT_STATE=%s\n" "$state"; fi
+'
+
+# ssh 探测结果状态：skipped | present | absent | no-herdr | unreachable
+ssh_status="skipped"
+ssh_probe_root=""
+ssh_probe_state=""
+ssh_probe_reason=""
+ssh_install_hint=""
+
+if [[ -n "${server_host}" ]]; then
+  ssh_install_hint="ssh ${server_host} 'herdr plugin install zzjcool/herdr-forward --yes'"
+  probe_raw="$(ssh_probe "${REMOTE_LIST_CMD}")"
+  probe_rc="$(kv_get "${probe_raw}" HF_SSH_RC)"
+  probe_body="$(printf '%s\n' "${probe_raw}" | sed '1d')"
+  if [[ "${probe_rc:-1}" != "0" ]]; then
+    ssh_status="unreachable"
+    ssh_probe_reason="$(printf '%s' "${probe_body}" | head -3 | tr '\n' ' ')"
+  elif [[ "${probe_body}" == *HF_NO_HERDR* ]]; then
+    ssh_status="no-herdr"
+    ssh_probe_reason="远端非交互 shell 里找不到 herdr（PATH 未含 ~/.local/bin？）"
+  elif printf '%s' "${probe_body}" | grep -qF "${PLUGIN_ID}"; then
+    ssh_status="present"
+    paths_raw="$(ssh_probe "${REMOTE_PATHS_CMD}")"
+    ssh_probe_root="$(kv_get "${paths_raw}" HF_ROOT)"
+    ssh_probe_state="$(kv_get "${paths_raw}" HF_STATE_DIR)"
+    if [[ -z "${ssh_probe_state}" ]]; then
+      ssh_probe_state="$(kv_get "${paths_raw}" HF_DEFAULT_STATE)"
+    fi
+  else
+    ssh_status="absent"
+  fi
+fi
+
+# --- 自动填入：--server-host 探测命中时，用户连 --server-root 都不用传 ---
+server_root_source="arg"
+if [[ -z "${server_root}" && "${ssh_status}" == "present" && -n "${ssh_probe_root}" ]]; then
+  server_root="${ssh_probe_root}"
+  server_root_source="ssh"
+fi
+
 if ((do_tabbar == 1)) && [[ -z "${server_root}" ]]; then
+  # 探测没命中/没给 --server-host：把「怎么拿到 B 的插件根」直接递到手上，再拒。
+  hint=""
+  case "${ssh_status}" in
+  absent)
+    hint="ssh 探测到 B 上**没有**装插件。先在 B 上装（复制执行即可，本脚本不会替你装）：
+     ${ssh_install_hint}
+   装完重跑本命令就不必再传 --server-root；或先显式指定：
+     --server-root \$(ssh ${ssh_host} \"herdr plugin list --json | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"result\"][\"plugins\"][0][\"plugin_root\"])'\")"
+    ;;
+  no-herdr)
+    hint="ssh 连上了 B，但远端非交互 shell 里找不到 herdr：${ssh_probe_reason}
+   请在 B 上把 herdr 放进 PATH，或用 --server-root 显式指定 B 的插件根。"
+    ;;
+  unreachable)
+    hint="ssh 探测 B 失败（不影响后面的安装步骤）：${ssh_probe_reason}
+   免密没配好 / 主机名不对时，请在 A 上先确认 \`ssh ${ssh_host} true\` 能过，
+   然后传 --server-root 显式指定 B 的插件根。"
+    ;;
+  skipped)
+    hint="未提供 --server-host，脚本无法探测 B 的插件根（A 上的路径对 B 无意义）。"
+    ;;
+  present)
+    hint="ssh 探测到 B 已装插件，但读不到它的 plugin_root（B 的 plugins.json / 目录结构异常）。"
+    ;;
+  *)
+    hint="探测状态未知（${ssh_status}）；请用 --server-root 显式指定 B 的插件根。"
+    ;;
+  esac
   die 2 "缺少 --server-root（server B 上的插件根绝对路径）。
    tab bar 的 command 在 herdr server 上执行，必须写 server 上的真实路径；A 上的路径对 B 无意义。
+   ${hint}
    找法：在 B 上运行 \`herdr plugin list\`，或直接看 B 的 ~/.config/herdr/plugins.json 里的 plugin_root。
    只想要键绑定（不需要 server 路径）时加 --no-tabbar。"
 fi
 
-# --- 安装器定位：优先同目录（git clone / 插件检出场景），否则按需下载（curl | bash 场景） ---
 # ⚠ `curl … | bash -s` 时脚本从 stdin 读入，`BASH_SOURCE[0]` **未定义**，
 # 在 set -u 下直接展开会 "unbound variable" 把自己打死 —— 故用 `${BASH_SOURCE[0]:-}`，
 # 空值表示 stdin 形态（此时一定走下载分支）。
@@ -213,10 +381,19 @@ PY
   printf '%s/herdr/plugins/%s' "${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}" "${encoded}"
 }
 
+# state 目录优先级：显式 --server-state-dir > ssh 探测到的 B 上的 state 目录 > 由（可能来自
+# ssh 探测的）server-root 的 manifest id 推导 > 默认 id。
+# ssh 探测值优先于本机推导，因为 state 目录取决于 **B 的** $XDG_STATE_HOME/$HOME 与插件 id ——
+# 用 A 的 HOME 推导会写出 A 的路径，tab bar（在 B 上执行）就会读错 forwards.json。
 state_dir_source="arg"
 if [[ -z "${server_state_dir}" ]]; then
-  state_dir_source="derived"
-  server_state_dir="$(derive_state_dir "${server_root:-${SELF_DIR:-.}/..}")"
+  if [[ "${ssh_status}" == "present" && -n "${ssh_probe_state}" ]]; then
+    state_dir_source="ssh"
+    server_state_dir="${ssh_probe_state}"
+  else
+    state_dir_source="derived"
+    server_state_dir="$(derive_state_dir "${server_root:-${SELF_DIR:-.}/..}")"
+  fi
 fi
 
 # --- B 侧可用性探测（尽力而为：只打印，绝不阻塞） ---
@@ -290,12 +467,16 @@ locate_installers
 printf '%s: herdr-forward 跨机 client 一键配置（%d 步，config=%s）\n' \
   "${PROG_NAME}" "${total}" "${config_path}"
 if ((do_tabbar == 1)); then
-  printf '  server 插件根: %s\n' "${server_root}"
-  if [[ "${state_dir_source}" == "derived" ]]; then
-    printf '  server state 目录: %s（由 server-root 的 manifest id 推导）\n' "${server_state_dir}"
+  if [[ "${server_root_source}" == "ssh" ]]; then
+    printf '  server 插件根: %s（由 --server-host ssh 探测自动填入，可省 --server-root）\n' "${server_root}"
   else
-    printf '  server state 目录: %s\n' "${server_state_dir}"
+    printf '  server 插件根: %s\n' "${server_root}"
   fi
+  case "${state_dir_source}" in
+  ssh) printf '  server state 目录: %s（由 --server-host ssh 探测得到）\n' "${server_state_dir}" ;;
+  derived) printf '  server state 目录: %s（由 server-root 的 manifest id 推导）\n' "${server_state_dir}" ;;
+  *) printf '  server state 目录: %s\n' "${server_state_dir}" ;;
+  esac
 fi
 
 if ((do_tabbar == 1)); then
@@ -342,22 +523,69 @@ cat <<EOF
      herdr server reload-config
 2. 之后：prefix+f 打开 Port Forward 面板 / prefix+shift+f 列出转发 / prefix+alt+f 探活检查。
 3. tab bar 右侧出现 ⇅<port> 即表示状态条生效（无活跃转发时为空）。
-
-== B（herdr server）侧插件可用性探测（尽力而为）==
 EOF
-probe_result="$(probe_plugin_present)"
-if [[ "${probe_result}" == "yes" ]]; then
-  printf '✅ 在 herdr 配置目录里探测到 %s 的安装（managed checkout 或 link）。\n' "${PLUGIN_ID}"
-  printf '   若 herdr server 就是本机，前置条件已满足；跨机时这只是本机的副本，仍需看下方清单。\n'
+
+# --- B 侧探测结论：ssh 真实探测（有 --server-host）优先，否则本机尽力探测 + checklist ---
+ssh_report() {
+  case "${ssh_status}" in
+  present)
+    printf "✅ ssh 真实探测 %s：B 上已装 %s。\\n" "${server_host}" "${PLUGIN_ID}"
+    if [[ -n "${ssh_probe_root}" ]]; then
+      printf '   B 的插件根（探测值）: %s\n' "${ssh_probe_root}"
+    else
+      printf '   （B 的 plugins.json 里读不到 plugin_root；插件根请手动确认。）\n'
+    fi
+    if [[ -n "${ssh_probe_state}" ]]; then
+      printf '   B 的 state 目录（探测值）: %s\n' "${ssh_probe_state}"
+    fi
+    printf '   探测只读（BatchMode + timeout %ss），未在 B 上做任何修改。\n' "${SSH_PROBE_TIMEOUT}"
+    ;;
+  absent)
+    printf "ℹ️  ssh 真实探测 %s：B 上**没有**装 %s。\\n" "${server_host}" "${PLUGIN_ID}"
+    printf '   ⚠ 不要在 A 上装（插件必须跑在 herdr server 所在的 B 上）。\n'
+    printf '   在 B 上装（复制执行即可，本脚本不会替你装）：\n'
+    printf '     %s\n' "${ssh_install_hint}"
+    ;;
+  no-herdr)
+    printf "⚠️  ssh 连上了 %s，但远端非交互 shell 里找不到 herdr：\\n" "${server_host}"
+    printf '     %s\n' "${ssh_probe_reason}"
+    printf '   请在 B 上把 herdr 放进 PATH（非交互 ssh 不读 ~/.bashrc），或按下方清单手工确认。\n'
+    ;;
+  unreachable)
+    printf "⚠️  ssh 探测 %s 失败，**已降级**为本机探测 + 手工 checklist（不影响本次安装）：\\n" "${server_host}"
+    printf '     %s\n' "${ssh_probe_reason}"
+    printf '   排查：在 A 上先跑 ssh -o BatchMode=yes %s herdr plugin list（非交互）；\n' "${server_host}"
+    printf '   免密没配好 / 主机名或端口不对时，修好后重跑本命令即可自动推导 B 的路径。\n'
+    ;;
+  skipped)
+    printf 'ℹ️  未提供 --server-host：无法从 A 真实探测 B（ssh 通道未指定）。\n'
+    printf '   下次可用一条命令连路径一起自动推导：setup-client.sh --server-host <B 的 ssh target>\n'
+    ;;
+  *)
+    printf '⚠️  未预期的探测状态（%s），已降级为手工 checklist。\n' "${ssh_status}"
+    ;;
+  esac
+}
+
+if [[ "${ssh_status}" != "skipped" ]]; then
+  printf '\n== B（herdr server）侧探测（经 ssh 通道，真实）==\n'
+  ssh_report
 else
-  printf 'ℹ️  未在本机探测到 %s 的安装。\n' "${PLUGIN_ID}"
-  printf '   若 herdr server 在另一台机器，请在 server 上确认：herdr plugin list 里有 %s\n' "${PLUGIN_ID}"
-  printf '   （没有就先装：herdr plugin install zzjcool/herdr-forward）。\n'
+  printf '\n== B（herdr server）侧插件可用性探测（本机尽力而为；未给 --server-host）==\n'
+  probe_result="$(probe_plugin_present)"
+  if [[ "${probe_result}" == "yes" ]]; then
+    printf '✅ 在 herdr 配置目录里探测到 %s 的安装（managed checkout 或 link）。\n' "${PLUGIN_ID}"
+    printf '   若 herdr server 就是本机，前置条件已满足；跨机时这只是本机的副本，仍需看下方清单。\n'
+  else
+    printf 'ℹ️  未在本机探测到 %s 的安装。\n' "${PLUGIN_ID}"
+    printf '   若 herdr server 在另一台机器，请在 server 上确认：herdr plugin list 里有 %s\n' "${PLUGIN_ID}"
+    printf '   （没有就先装：herdr plugin install zzjcool/herdr-forward）。\n'
+  fi
 fi
 
 cat <<EOF
 
-== B 侧前置条件检查清单（无法从 A 自动检测，请逐条确认）==
+== B 侧前置条件检查清单（ssh 探测之外的项仍需手工确认）==
 [ ] herdr server（B）上已装插件：\`herdr plugin list\` 里有 ${PLUGIN_ID}
 [ ] server（B）上的插件根 = ${server_root:-<未提供：用了 --no-tabbar>}
 [ ] server（B）上有 jq（本插件依赖）
