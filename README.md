@@ -28,7 +28,7 @@ Pre-alpha. See `docs/PLAN.md` (roadmap) and `docs/RESEARCH.md`
 Requires herdr ≥ 0.8.0 and `jq` (plus `ssh` for the tunnels). The plugin installs
 with the `zzjcool:forward` id.
 
-### A. From GitHub (once published)
+### A. From GitHub
 
 ```sh
 herdr plugin install zzjcool/herdr-forward
