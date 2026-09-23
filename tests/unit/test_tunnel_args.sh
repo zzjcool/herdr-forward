@@ -82,11 +82,18 @@ fi
 # SC2312 ("masking return value") stays silent.
 T2_OUT=""
 T2_LINES=()
-t2_cap() { T2_OUT="$("$@")"; }
+# 容错：被测函数缺失/报错时记为空串，让断言报 FAIL 而不是被 set -e 中断。
+t2_cap() {
+  set +o errexit
+  T2_OUT="$("$@" 2>/dev/null || true)"
+  set -o errexit
+}
 t2_lines() {
   T2_LINES=()
-  local raw
-  raw="$("$@")"
+  local raw=""
+  set +o errexit
+  raw="$("$@" 2>/dev/null || true)"
+  set -o errexit
   mapfile -t T2_LINES <<<"${raw}"
 }
 
@@ -180,6 +187,69 @@ t_match '\|ControlPath='"${t2_dir}"'/ctl-f-5173\|' "${t2_joined}" "control path"
 t_match '\|-L\|127\.0\.0\.1:5173:10\.0\.0\.9:5173\|' "${t2_joined}" "remote spec"
 t_match '\|-p\|2200\|' "${t2_joined}" "port"
 t_eq 'bob@10.0.0.9' "${t2_args[-1]}" "destination"
+
+t_describe "ssh percent_expand: state dir 含 % 时必须转义（真实环境 bug 回归锚点）"
+# 真实环境：herdr 插件的 state 目录名是 URL 编码的 .../plugins/zzjcool%3Aforward/。
+# ssh 对 -o ControlPath / -o UserKnownHostsFile 的值做 percent token 展开（%3 不是
+# 合法 token）→ "percent_dollar_expand: unknown key %3" → 隧道根本起不来。
+# 修法：只对交给 ssh 的路径值把 % 变成 %%（字面 %），文件系统操作仍用原路径。
+t_it "tunnel_ssh_path_escape 把 % 翻倍（ssh percent_expand 的字面 %）"
+t2_cap tunnel_ssh_path_escape '/state/zzjcool%3Aforward/ssh-ctl/ctl-f-1'
+t_eq '/state/zzjcool%%3Aforward/ssh-ctl/ctl-f-1' "${T2_OUT}" "% -> %%"
+t_it "无 % 的路径原样返回（不影响常规路径）"
+t2_cap tunnel_ssh_path_escape '/state/plain/ssh-ctl/ctl-f-1'
+t_eq '/state/plain/ssh-ctl/ctl-f-1' "${T2_OUT}" "identity when no percent"
+
+# 取 -o <key>=... 的值（argv 逐行存放于 T2_LINES）
+t2_optval() {
+  local key="${1}"
+  local i=""
+  for ((i = 0; i < ${#T2_LINES[@]}; i++)); do
+    if [[ ${T2_LINES[i]} == '-o' && ${T2_LINES[i + 1]:-} == "${key}="* ]]; then
+      printf '%s\n' "${T2_LINES[i + 1]#"${key}="}"
+      return 0
+    fi
+  done
+  printf '\n'
+}
+
+T2_PCT_BASE="${T2_TMP}/zzjcool%3Aforward"
+T2_PCT_BASE_ESC="${T2_TMP}/zzjcool%%3Aforward"
+export HERDR_PLUGIN_STATE_DIR="${T2_PCT_BASE}"
+t_it "ControlPath / UserKnownHostsFile 交给 ssh 时 % 已转义，文件系统路径不变"
+t2_lines tunnel_ssh_args f-9000 9000 127.0.0.1:8080 'user@host'
+t2_cap t2_optval ControlPath
+t_eq "${T2_PCT_BASE_ESC}/ssh-ctl/ctl-f-9000" "${T2_OUT}" "ControlPath 转义"
+t2_cap t2_optval UserKnownHostsFile
+t_eq "${T2_PCT_BASE_ESC}/ssh-ctl/known_hosts" "${T2_OUT}" "UserKnownHostsFile 转义"
+t_it "文件系统原路径（tunnel_control_path）保持未转义的 %"
+t2_cap tunnel_control_path f-9000
+t_eq "${T2_PCT_BASE}/ssh-ctl/ctl-f-9000" "${T2_OUT}" "control path 原样"
+if [[ -d "${T2_PCT_BASE}/ssh-ctl" ]]; then
+  t_pass "真实目录按原路径创建（mkdir 不转义）"
+else
+  t_fail "control dir 未按原路径创建：${T2_PCT_BASE}/ssh-ctl"
+fi
+t_it "转义后的 ControlPath 直接交给 ssh 时不再报 percent token 错误"
+t2_cap tunnel_ssh_path_escape "${T2_PCT_BASE}/ssh-ctl/ctl-f-9000"
+t2_esc_path="${T2_OUT}"
+t2_ssh_err=""
+t2_ssh_err="$(ssh -F /dev/null -o BatchMode=yes -o "ControlPath=${t2_esc_path}" -O check dummy@dummy 2>&1 || true)"
+if [[ ${t2_ssh_err} == *'unknown key'* || ${t2_ssh_err} == *'percent'*'expand'* ]]; then
+  t_fail "ssh 仍报 percent token 错误：${t2_ssh_err}"
+else
+  t_pass "ssh 未报 percent token 错误（转义生效）"
+fi
+# 对照：未转义时 ssh 应当报错（证明前面的绿不是假阳）
+t2_ssh_raw=""
+t2_ssh_raw="$(ssh -F /dev/null -o BatchMode=yes -o "ControlPath=${T2_PCT_BASE}/ssh-ctl/ctl-f-9000" -O check dummy@dummy 2>&1 || true)"
+if [[ ${t2_ssh_raw} == *'unknown key'* ]]; then
+  t_pass "对照组：未转义确实触发 unknown key（回归锚点有效）"
+else
+  t_fail "对照组失效：未转义的 %3A 未被 ssh 拒绝：${t2_ssh_raw}"
+fi
+# 恢复：后续用例复用最初的 state dir
+export HERDR_PLUGIN_STATE_DIR="${T2_TMP}/herdr-forward"
 
 t_describe "tunnel_alive (kill -0 + non-zombie)"
 t_it "false for a pid that does not exist"

@@ -65,6 +65,23 @@ tunnel_parse_ssh_target() {
   printf '%s\n' "${port}" "${dest}"
 }
 
+# tunnel_ssh_path_escape <path> -> stdout: <path> with every % doubled.
+#
+# 为什么必须转义（真实环境 bug）：herdr 插件把 state 目录命名为 URL 编码的
+# `zzjcool%3Aforward`。ssh 对 `-o ControlPath=` / `-o UserKnownHostsFile=` 的值做
+# percent token 展开，`%3` 不是合法 token，于是 ssh 直接失败：
+#   vdollar_percent_expand: unknown key %3
+#   percent_dollar_expand: failed
+# 隧道永远起不来。ssh 认 `%%` 为字面 `%`，故把值里的每个 % 翻倍即可；
+# ssh 展开后还原成真实路径。
+# 注意：**只**用于交给 ssh -o 的路径值。mkdir / [[ -S ]] / rm 等文件系统操作
+# 必须继续用原路径（它们不做 percent 展开），否则会去找一个不存在的 `%%` 目录。
+# 纯 bash 参数展开（零 fork）。
+tunnel_ssh_path_escape() {
+  local path="${1:-}"
+  printf '%s\n' "${path//\%/%%}"
+}
+
 # tunnel_ssh_args <id> <local_port> <remote_host:remote_port> <ssh_target>
 # stdout: one argv element per line (unit-testable seam; no ssh is spawned).
 tunnel_ssh_args() {
@@ -80,16 +97,21 @@ tunnel_ssh_args() {
   local dest="${parsed[1]}"
   local dir
   dir="$(tunnel_control_dir)"
+  # ssh -o 的值必须做 % 转义（state dir 名可能含 %，见 tunnel_ssh_path_escape）。
+  local ssh_ctl_path=""
+  ssh_ctl_path="$(tunnel_ssh_path_escape "${dir}/ctl-${id}")"
+  local ssh_khf=""
+  ssh_khf="$(tunnel_ssh_path_escape "${dir}/known_hosts")"
   printf '%s\n' \
     '-N' \
     '-L' "127.0.0.1:${local_port}:${remote}" \
     '-o' 'BatchMode=yes' \
     '-o' 'ExitOnForwardFailure=yes' \
     '-o' 'ControlMaster=auto' \
-    '-o' "ControlPath=${dir}/ctl-${id}" \
+    '-o' "ControlPath=${ssh_ctl_path}" \
     '-o' 'ControlPersist=yes' \
     '-o' 'StrictHostKeyChecking=accept-new' \
-    '-o' "UserKnownHostsFile=${dir}/known_hosts" \
+    '-o' "UserKnownHostsFile=${ssh_khf}" \
     '-F' '/dev/null' \
     '-p' "${port}" \
     "${dest}"
@@ -169,6 +191,9 @@ tunnel_start() {
   local dir
   dir="$(tunnel_control_dir)"
   local ctl="${dir}/ctl-${id}"
+  # 只有交给 ssh 的值需要 % 转义；ctl 本身仍是文件系统路径（[[ -S ]] / rm 用）。
+  local ctl_ssh=""
+  ctl_ssh="$(tunnel_ssh_path_escape "${ctl}")"
   local log_file="${dir}/log-${id}"
   local pid_file="${dir}/pid-${id}"
   local target_file="${dir}/target-${id}"
@@ -193,7 +218,7 @@ tunnel_start() {
   local state=""
   local tries=0
   while ((tries < 50)); do
-    state="$(_tunnel_ctl_ssh -o "ControlPath=${ctl}" -O check dummy@dummy 2>&1)"
+    state="$(_tunnel_ctl_ssh -o "ControlPath=${ctl_ssh}" -O check dummy@dummy 2>&1)"
     if [[ ${state} =~ Master\ running\ \(pid=([0-9]+)\) ]]; then
       master="${BASH_REMATCH[1]}"
       break
@@ -232,12 +257,14 @@ tunnel_stop() {
   dir="$(tunnel_control_dir)"
   local ctl="${dir}/ctl-${id}"
   local pid_file="${dir}/pid-${id}"
+  local ctl_ssh=""
+  ctl_ssh="$(tunnel_ssh_path_escape "${ctl}")"
 
   # Graceful shutdown via the control socket. `timeout` can only exec a *program*,
   # never a shell function, so the ssh binary is invoked directly here; wrapping
   # _tunnel_ctl_ssh would exit 127 and silently skip the graceful path.
   if [[ -S "${ctl}" ]]; then
-    timeout 5 ssh -F /dev/null -o BatchMode=yes -o "ControlPath=${ctl}" \
+    timeout 5 ssh -F /dev/null -o BatchMode=yes -o "ControlPath=${ctl_ssh}" \
       -O exit dummy@dummy >/dev/null 2>&1 || true
   fi
 
