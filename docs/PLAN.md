@@ -108,7 +108,7 @@ Legend：`[x]` 可自动验证且已绿 ／ `[~]` 部分验证（沙箱内绿，
 - 隧道自动重连
 
 ## 发布检查单
-- [ ] 公开前：GitHub `herdr-forward in:name` total_count == 0（否则换名）
-- [ ] README 首句写明双能力：remote port → localhost，localhost → public URL
-- [ ] 明确和 herdr-portfwd / herdr-fwd / herdr-tunnel 的差异（saved machines 显式映射）
+- [x] 公开前：GitHub `herdr-forward in:name` total_count == 0（否则换名）（2026-09-23 实查：仅 zzjcool/herdr-forward 自身）
+- [x] README 首句写明双能力：remote port → localhost，localhost → public URL
+- [x] 明确和 herdr-portfwd / herdr-fwd / herdr-tunnel 的差异（saved machines 显式映射）
 - [ ] 反悔信号监控（RESEARCH §2.5）
