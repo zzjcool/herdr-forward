@@ -64,3 +64,14 @@ tab_bar_right = [
 - **T0**：本机缺 shellcheck/shfmt/nc —— ci.sh 需支持「工具缺失时明确报错提示安装」或跳过并警示（不静默绿）；容器内装齐（arch Dockerfile: pacman -Sy --noconfirm shellcheck shfmt openbsd-netcat jq openssh bash coreutils util-linux）。
 - **T2**：machine_resolve 主路径 = machines.toml（配置文件是正式路径，不是兜底）；socket API 读取路线删除。
 - **T3**：link pattern 定稿必须带 scheme；oneline 输出纯文本无 ANSI；manifest 用 HERDR_PLUGIN_ROOT env 包装；id 不能含点。
+
+## 5. 追加实证（machines 集成，2026-09-23）
+
+- `herdr machine list --json` 输出 schema（本机真实验证）：
+  `[{"id":"<hex>","label":"<label>","target":"<ssh target>","session":"default","enabled":true,"selected":false}]`
+  —— 与二进制证据 SavedSshEndpoint{ssh,label,target,session,enabled} 吻合；§2.1 的
+  「endpoints.json schema 未知」结论就此闭环：插件侧经 HERDR_BIN_PATH CLI 透传即可拿到
+  saved machines（socket API 仍无对应 method）。
+- saved machine 的 target 不支持端口后缀（`host:2222` 会被 herdr machine add 当作
+  主机名解析失败）——herdr 自身限制，非插件问题。
+- `herdr machine add` 会做远端平台探测（真 SSH 连接 + host key 校验），失败不落盘。

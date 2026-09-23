@@ -669,9 +669,14 @@ machines_resolve_id() {
 # ---------------------------------------------------------------------------
 
 # machines_kv_get <multi_line_text> <KEY> -> stdout: 第一个 KEY= 的值（无则空行）
-#   与 M1 的 lib/ssh-probe.sh 的 kv_get 同语义；本文件自带一份是为了在 M1 未合入时
-#   仍能解析探测输出（两处解析约定一致，勿单边改动；联调点见报告）。
+#   与 M1 的 lib/ssh-probe.sh 的 kv_get 同语义；M1 已合入后委托优先（review nit：
+#   消除双实现），仅在 ssh-probe 未加载时用本地副本（bin/forward 两者都 source，
+#   实际路径永远是委托版）。
 machines_kv_get() {
+  if declare -F kv_get >/dev/null 2>&1; then
+    kv_get "${1-}" "${2-}"
+    return 0
+  fi
   local text="${1-}"
   local key="${2-}"
   if [[ -z ${key} ]]; then

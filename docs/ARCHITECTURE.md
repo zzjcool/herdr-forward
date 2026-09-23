@@ -147,7 +147,8 @@ notify_toast <title> <body>                    # herdr socket API / notification
 - 二期 publish 后加 `🌐` 后缀
 
 **退出码表冻结**：`0 ok / 2 重复端口 / 3 记录不存在 / 4 machine 无法解析 /
-5 隧道启动失败 / 9 未实现 / 127 依赖缺失`
+5 隧道启动失败 / 9 未实现 / 127 依赖缺失`；machines 集成后补充：
+`64 用法错误 / 1 激活半成品（激活记录已写入，但 tab bar/键位安装器失败）`
 
 ### A.3.1 review 后的契约修正 — D1：探活必须验证「远端可达」
 
@@ -183,6 +184,24 @@ notify_toast <title> <body>                    # herdr socket API / notification
   `--prune` 才 reap + 删记录。
 - 诚实性代价（显式声明）：对「连上但从不应答」的远端协议（如裸 TCP/二进制协议），
   `status` 会保守地读作 `down`；`--fix` **只改状态字段，不动活隧道**，故转发本身不受影响。
+
+### A.3.2 machines 集成（二期中途追加，冻结计划见合并历史）
+
+用户新 UX：A 装插件 → 面板列出 saved machines（置灰）→ 主动激活 → SSH 只读探测 B
+→ 已装则自动写 A 的 client config（tab bar 指向 B + 键位），未装则递安装命令。
+接口（详细签名见 /tmp 计划归档与对应测试）：
+- `lib/ssh-probe.sh`：ssh_probe_parse_target / ssh_probe_run（timeout 15 外层 +
+  ssh -n BatchMode）/ ssh_probe_plugin（HF_STATUS 四态 + HF_ROOT/HF_STATE_DIR）/ kv_get
+- `lib/machines.sh`：machines_herdr_list_json（HERDR_BIN_PATH 透传，缺/败/非 JSON →
+  "[]"+warn 不 die）/ activated-machines.json CRUD（{version,active,machines} schema，
+  损坏容错）/ machines_view_json（合并视图单一权威）/ machines_is_local_target
+- `bin/forward machines list|activate|deactivate|doctor`；面板（lib/panel.sh）只是
+  CLI 包装，CLI 直调等价；startup-hook 按 active 记录智能写 tab bar（同机本机路径 /
+  远端 B 路径），恒 exit 0
+- 退出码补充：64 用法错误 / 1 激活半成品（记录已写但安装器失败）
+- 实测事实：`herdr machine list --json` 输出 `[{id,label,target,session,enabled,
+  selected}]`；saved machine 的 target 不支持端口后缀（herdr 自身限制），端口场景用
+  `forward add --ssh-target` 直连语义
 
 ### A.4 herdr-plugin.toml 冻结声明（开工时填入）
 
