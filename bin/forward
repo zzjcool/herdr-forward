@@ -54,6 +54,9 @@ _hf_optional_source "${FORWARD_LIB}/ssh-probe.sh"
 _hf_optional_source "${FORWARD_LIB}/tunnel.sh"
 _hf_optional_source "${FORWARD_LIB}/notify.sh"
 _hf_optional_source "${FORWARD_LIB}/render.sh"
+# A.3.3：client ↔ server 桥接（client 映射）与本机监听端口发现
+_hf_optional_source "${FORWARD_LIB}/bridge.sh"
+_hf_optional_source "${FORWARD_LIB}/ports.sh"
 
 # _hf_has_func <name>：stdout "yes" 表示函数已定义（输出式，避免 SC2310；恒 return 0）
 _hf_has_func() {
@@ -84,6 +87,11 @@ forward — herdr 端口转发管理（一期：ssh -L）
       新增映射并把远端端口拉到本地 localhost:<local>。
       --ssh-target 优先（跳过 machine 解析）；否则用 --machine 经 machines.toml 解析。
 
+  forward add <port>|<client>:<here> [--client]
+      远程开发：把**本机**端口映射到 attach 过来的 client 的 localhost（client 侧由桥接
+      代为监听）。没给 --machine/--ssh-target 且有 client 在线时默认就是这种；
+      --client 可在 client 还没连上时预先登记，连上后自动生效。
+
   forward list [--oneline] [--json]
       默认表格；--oneline 给 tab bar（仅 up，⇅端口）；--json 输出状态文档。
 
@@ -97,16 +105,31 @@ forward — herdr 端口转发管理（一期：ssh -L）
       列出 herdr saved machines 与激活状态（[✓] 当前 / [·] 曾激活 / [ ] 未激活）。
       --json 输出合并视图（数组）；--short 每机器一行 TSV（供面板渲染）。
 
-  forward machines activate <id|label>
+  forward machines activate <id|label> [--install]
       激活一台 saved machine：同机直接标记；远端先只读 SSH 探测其插件根与 state 目录，
-      探测到已装插件则写激活记录 + 把 tab bar 指向该机器（幂等）。
-      未装插件 / 连不上时打印可复制的下一步命令，不写记录。
+      探测到已装插件则写激活记录 + 配好该机器的键位 + 启动桥接（该机器上登记的端口
+      映射随即出现在本机 localhost）。
+      未装插件时：交互终端里询问是否代装，--install 直接代装；否则打印可复制的命令。
 
   forward machines deactivate <id|all>
       停用：清 active 并把 tab bar 恢复为本机路径；all 同时删除全部激活记录。
 
   forward machines doctor
       对当前 active 的机器重新探测：路径漂移则重写记录与 tab bar；连不上则只报告。
+
+  forward bridge up|down <machine-id|all>
+  forward bridge status [--json]
+      client 侧：启停到某台机器的桥接（通常由 machines activate/deactivate 自动完成）。
+      server 侧：status 显示当前连着的 client 与各 client 映射的实时状态。
+  forward bridge serve | run <machine-id>
+      内部入口：serve 由 client 经 SSH 调起；run 是 client 侧前台 supervisor。
+
+  forward ports [--json]
+      列出本机经 localhost 可达的 TCP 监听端口（面板一键映射用）。
+
+  forward open-url [URL]
+      Ctrl+click localhost 链接的落点：有 client 在线时映射端口并在 client 上打开，
+      否则用本机浏览器打开。
 
   forward doctor [--fix] [--prune]
       探活并报告；--fix 按探活结果修正 status；--prune 清理死进程记录。
@@ -133,7 +156,7 @@ _hf_resolve_target() {
     return 0
   fi
   if [[ -z "${machine}" ]]; then
-    die 4 "缺少目标机器：请传 --machine LABEL（走 machines.toml 解析）或 --ssh-target user@host:22。"
+    die 4 "缺少目标机器：请传 --machine LABEL（走 machines.toml 解析）或 --ssh-target user@host:22；若要把本机端口映射到 attach 过来的 client，加 --client。"
   fi
 
   local has_resolver=""
@@ -154,13 +177,45 @@ _hf_resolve_target() {
   printf '%s\n' "${resolved}"
 }
 
+# _hf_add_client <local_port> <remote_port>：登记一条 client 映射（client 的 localhost:<local>
+#   → 本机 localhost:<remote>）。真正的监听由 client 侧桥接打开；本命令只写期望集合，
+#   桥接会话在 1 秒内同步过去。stdout 只输出 id（与 tunnel 映射同一契约）。
+_hf_add_client() {
+  local local_port="${1-}"
+  local remote_port="${2-}"
+  if ((local_port < 1024)); then
+    die "${EXIT_USAGE}" "client 映射的本地端口需 ≥ 1024（client 侧以普通用户监听）：${local_port}。请换一个，如 forward add $((local_port + 10000)):${remote_port} --client。"
+  fi
+  local record=""
+  record="$(jq -c -n --argjson lp "${local_port}" --argjson rp "${remote_port}" \
+    '{local_port: $lp, remote_host: "localhost", remote_port: $rp, mode: "client", status: "starting"}')"
+  forward_add_record "${record}"
+
+  local live=""
+  if declare -F bridge_any_live >/dev/null; then
+    live="$(bridge_any_live)"
+  fi
+  if [[ ${live} == "yes" ]]; then
+    printf '已登记：client 的 localhost:%s → 本机 localhost:%s（client 在线，约 1 秒内生效）。\n' "${local_port}" "${remote_port}" >&2
+  else
+    printf '已登记：client 的 localhost:%s → 本机 localhost:%s。\n' "${local_port}" "${remote_port}" >&2
+    printf '当前没有 client 连着本机；在 client 上激活本机（Port Forward 面板选中本机，或 forward machines activate <本机>）后自动生效。\n' >&2
+  fi
+  printf 'f-%s\n' "${local_port}"
+}
+
 cmd_add() {
   local spec=""
   local machine=""
   local ssh_target=""
+  local client=""
 
   while (($# > 0)); do
     case "$1" in
+    --client)
+      client="yes"
+      shift
+      ;;
     --machine)
       (($# >= 2)) || die "${EXIT_USAGE}" "--machine 需要一个 LABEL 值。用法：forward add <local>:<remote> --machine LABEL"
       machine="$2"
@@ -201,12 +256,33 @@ cmd_add() {
   if [[ "${spec}" =~ ^([0-9]+):([0-9]+)$ ]]; then
     local_port="${BASH_REMATCH[1]}"
     remote_port="${BASH_REMATCH[2]}"
+  elif [[ "${spec}" =~ ^([0-9]+)$ ]]; then
+    local_port="${BASH_REMATCH[1]}"
+    remote_port="${BASH_REMATCH[1]}"
   else
-    die "${EXIT_USAGE}" "端口对格式非法：${spec}。应为 <local>:<remote>（如 3000:9443，两段数字）。"
+    die "${EXIT_USAGE}" "端口格式非法：${spec}。应为 <port> 或 <local>:<remote>（如 5173 或 3000:9443）。"
   fi
 
   _hf_require_port "${local_port}" "本地端口"
   _hf_require_port "${remote_port}" "远端端口"
+
+  # 没给目标时：本机有 client 在线（经桥接 attach）就默认映射到 client ——
+  # 远程开发的常态是「在 B 上起服务，在 A 的浏览器里打开」。
+  if [[ -z ${client} && -z ${machine} && -z ${ssh_target} ]]; then
+    if declare -F bridge_any_live >/dev/null; then
+      client="$(bridge_any_live)"
+    fi
+  fi
+  if [[ -n ${client} ]]; then
+    if [[ -n ${machine} || -n ${ssh_target} ]]; then
+      die "${EXIT_USAGE}" "--client 与 --machine/--ssh-target 互斥：client 映射的目标恒为本机 localhost。"
+    fi
+    if ! declare -F bridge_merge_live >/dev/null; then
+      die 127 "缺少 ${FORWARD_LIB}/bridge.sh（client 映射依赖桥接模块）。请确认插件检出完整后重试。"
+    fi
+    _hf_add_client "${local_port}" "${remote_port}"
+    return 0
+  fi
 
   local target=""
   target="$(_hf_resolve_target "${machine}" "${ssh_target}")"
@@ -262,9 +338,29 @@ cmd_add() {
 
 # --- list ---
 
-_hf_oneline() {
+# _hf_view_json -> stdout: 展示用 forwards 数组
+#   = 本机记录（client 映射合入桥接实时状态）+ 本机作为 client 经桥接生效中的映射（mode=bridge）。
+#   bridge.sh 缺失时退化为原始记录。
+_hf_view_json() {
   local forwards=""
   forwards="$(forward_list_json)"
+  if ! declare -F bridge_merge_live >/dev/null; then
+    printf '%s\n' "${forwards}"
+    return 0
+  fi
+  local merged="" remote=""
+  merged="$(bridge_merge_live "${forwards}")"
+  remote="$(bridge_client_forwards_json)"
+  if [[ ${remote} == "[]" ]]; then
+    printf '%s\n' "${merged}"
+    return 0
+  fi
+  printf '%s\n%s\n' "${merged}" "${remote}" | jq -c -s 'add'
+}
+
+_hf_oneline() {
+  local forwards=""
+  forwards="$(_hf_view_json)"
 
   # 优先复用 T3 的纯函数（A.3 扩展）
   local has_render=""
@@ -317,18 +413,23 @@ _hf_oneline() {
 
 _hf_list_table() {
   local forwards=""
-  forwards="$(forward_list_json)"
+  forwards="$(_hf_view_json)"
   printf '%-10s %-14s %-12s %-10s %-8s %s\n' "LOCAL" "REMOTE" "MACHINE" "STATUS" "PID" "SSH_TARGET"
+  # MACHINE 列：client 映射 = 「client」（监听在 attach 过来的 client 上）；
+  #             bridge 映射 = 「<机器>(桥接)」（本机作为 client、目标在那台机器上）。
   local rows=""
   set +o errexit
   rows="$(printf '%s' "${forwards}" | jq -r '
     sort_by(.local_port)[] |
     [ (.local_port | tostring),
       ((.remote_host // "127.0.0.1") + ":" + (.remote_port | tostring)),
-      (if (.machine // "") == "" then "-" else .machine end),
+      (if .mode == "client" then (if (.client // "") == "" then "client" else "client:" + .client end)
+       elif .mode == "bridge" then ((.machine // "-") + "(桥接)")
+       elif (.machine // "") == "" then "-" else .machine end),
       (.status // "-"),
       (if .pid == null then "-" else (.pid | tostring) end),
-      (if (.ssh_target // "") == "" then "-" else .ssh_target end)
+      (if .mode == "client" then (if (.status_reason // "") == "" then "-" else .status_reason end)
+       elif (.ssh_target // "") == "" then "-" else .ssh_target end)
     ] | @tsv
   ')"
   set -o errexit
@@ -377,7 +478,7 @@ cmd_list() {
     ;;
   json)
     local forwards=""
-    forwards="$(forward_list_json)"
+    forwards="$(_hf_view_json)"
     # M3（review）：引用 FORWARD_STATE_VERSION 常量，不硬编码 1（值与 lib/state.sh 单一权威一致）
     printf '%s' "${forwards}" | jq -S -c --argjson v "${FORWARD_STATE_VERSION:-1}" '{version: $v, forwards: .}'
     ;;
@@ -418,6 +519,14 @@ cmd_remove() {
   # 先确认存在（不存在 die 3，且不动隧道）
   local record=""
   record="$(forward_get "${id}")"
+
+  # client 映射在本机没有进程：删记录即可，桥接会话 1 秒内把 client 侧监听撤掉
+  local mode=""
+  mode="$(printf '%s' "${record}" | jq -r '.mode // "tunnel"')"
+  if [[ ${mode} == "client" ]]; then
+    forward_remove_record "${id}"
+    return 0
+  fi
 
   local has_stop=""
   has_stop="$(_hf_has_func tunnel_stop)"
@@ -481,12 +590,14 @@ cmd_doctor() {
     else
       tunnel_doctor
     fi
+    _hf_doctor_client
     return 0
   fi
 
   # 内置最小实现：只用冻结 API + probe_tcp
   local forwards=""
   forwards="$(forward_list_json)"
+  forwards="$(printf '%s' "${forwards}" | jq -c '[.[] | select(.mode != "client")]')"
 
   local count=0
   local up_count=0
@@ -558,7 +669,31 @@ cmd_doctor() {
   done <<<"${rows}"
 
   log info "doctor 完成：共 ${count} 条，up=${up_count}，degraded=${degraded_count}，down=${down_count}，修正=${fixed_count}，清理=${pruned_count}。"
+  _hf_doctor_client
   # 诊断成功即 exit 0（即使有 down 记录）——E2E run-inside.sh 用 set -e，不能因 down 中断
+  return 0
+}
+
+# _hf_doctor_client：client 映射的监听在 client 上，本机探不到；报告桥接回报的实时状态
+_hf_doctor_client() {
+  declare -F bridge_merge_live >/dev/null || return 0
+  local forwards="" view=""
+  forwards="$(forward_list_json)"
+  view="$(bridge_merge_live "${forwards}")"
+  local rows=""
+  rows="$(printf '%s' "${view}" | jq -r '
+    .[] | select(.mode == "client")
+    | [.id, (.local_port | tostring), .status,
+       (if .status == "waiting" then "(没有 client 连着；client 连上后自动生效)"
+        elif .status == "pending" then "(client 在线，等待其回报)"
+        elif (.status_reason // "") != "" then "(" + .status_reason + ")"
+        else "(client " + (.client // "?") + " 回报)" end)] | @tsv
+  ')"
+  local row=""
+  while IFS= read -r row; do
+    [[ -n ${row} ]] || continue
+    printf '%s\n' "${row}" | awk -F'\t' '{printf "%s\t%s\tclient:%s\t%s\n", $1, $2, $3, $4}'
+  done <<<"${rows}"
   return 0
 }
 
@@ -612,6 +747,197 @@ cmd_bootstrap() {
     die 127 "缺少 ${script}（OOTB 安装脚本）。本机手动安装：bash scripts/install-tabbar.sh && bash scripts/install-keys.sh。请确认插件检出完整后重试。"
   fi
   exec bash "${script}" "$@"
+}
+
+# --- bridge（A.3.3：client ↔ server 桥接） ---
+
+_hf_bridge_require() {
+  if ! declare -F bridge_serve >/dev/null; then
+    die 127 "缺少 ${FORWARD_LIB}/bridge.sh（桥接模块）。请确认插件检出完整后重试（herdr plugin install zzjcool/herdr-forward --yes）。"
+  fi
+}
+
+# _hf_default_plugin_state_dir -> stdout: herdr 给本插件分配的 state 目录（按 manifest id 推导）
+#   经 SSH 调起的 `bridge serve` 不在插件上下文里；client 总会显式传 HERDR_PLUGIN_STATE_DIR，
+#   这里只兜手动调用，避免落到与面板分叉的 ~/.local/state/herdr-forward。
+_hf_default_plugin_state_dir() {
+  local id="zzjcool:forward"
+  local manifest="${FORWARD_ROOT}/herdr-plugin.toml"
+  if [[ -f ${manifest} ]]; then
+    local line=""
+    while IFS= read -r line; do
+      if [[ ${line} =~ ^[[:space:]]*id[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+        id="${BASH_REMATCH[1]}"
+        break
+      fi
+    done <"${manifest}"
+  fi
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/herdr/plugins/${id//:/%3A}"
+}
+
+cmd_bridge_status() {
+  local json=""
+  if [[ ${1-} == "--json" ]]; then
+    json="yes"
+    shift
+  fi
+  if (($# > 0)); then
+    die "${EXIT_USAGE}" "用法：forward bridge status [--json]"
+  fi
+  local clients="" sessions=""
+  clients="$(bridge_clients_json)"
+  sessions="$(bridge_sessions_json)"
+  if [[ -n ${json} ]]; then
+    jq -c -n --argjson c "${clients}" --argjson s "${sessions}" '{clients: $c, sessions: $s}'
+    return 0
+  fi
+  local rows=""
+  printf '本机作为 client（把远端端口映射到本机 localhost）：\n'
+  rows="$(printf '%s' "${clients}" | jq -r '
+    .[] | "  \(.label // .machine)  \(.target)  " +
+      (if .running | not then "未运行" else .state end) +
+      (if (.reason // "") != "" and .state != "connected" then "（\(.reason)）" else "" end) +
+      "  映射 \([.forwards[]? | select(.state == "up")] | length)/\([.forwards[]?] | length)"
+  ')"
+  printf '%s\n' "${rows:-  （无）}"
+  printf '本机作为 server（client 经桥接 attach 进来）：\n'
+  rows="$(printf '%s' "${sessions}" | jq -r '
+    .[] | "  client \(.client_host // "?")（\(.client_label // "")）" +
+      (if .live then "在线" else "心跳超时" end) +
+      "  映射 up \([.status[]? | select(.state == "up")] | length)"
+  ')"
+  printf '%s\n' "${rows:-  （无）}"
+}
+
+cmd_bridge() {
+  _hf_bridge_require
+  if (($# == 0)); then
+    die "${EXIT_USAGE}" "缺少 bridge 子命令。用法：forward bridge up|down|status|serve|run"
+  fi
+  local sub="$1"
+  shift
+  case "${sub}" in
+  serve)
+    if [[ -z ${HERDR_PLUGIN_STATE_DIR:-} ]]; then
+      HERDR_PLUGIN_STATE_DIR="$(_hf_default_plugin_state_dir)"
+      export HERDR_PLUGIN_STATE_DIR
+    fi
+    bridge_serve
+    ;;
+  run)
+    (($# == 1)) || die "${EXIT_USAGE}" "用法：forward bridge run <machine-id>"
+    bridge_run "$1"
+    ;;
+  up)
+    (($# == 1)) || die "${EXIT_USAGE}" "用法：forward bridge up <machine-id>"
+    bridge_up "$1" "${FORWARD_ROOT}/bin/forward"
+    ;;
+  down)
+    (($# == 1)) || die "${EXIT_USAGE}" "用法：forward bridge down <machine-id|all>"
+    if [[ $1 == "all" ]]; then
+      local mids="" mid=""
+      mids="$(bridge_clients_json | jq -r '.[].machine')"
+      while IFS= read -r mid; do
+        [[ -n ${mid} ]] || continue
+        bridge_down "${mid}"
+      done <<<"${mids}"
+    else
+      bridge_down "$1"
+    fi
+    ;;
+  status) cmd_bridge_status "$@" ;;
+  *) die "${EXIT_USAGE}" "未知 bridge 子命令：${sub}。可用：up / down / status / serve / run。" ;;
+  esac
+}
+
+# --- ports ---
+
+cmd_ports() {
+  if ! declare -F ports_listening_json >/dev/null; then
+    die 127 "缺少 ${FORWARD_LIB}/ports.sh。请确认插件检出完整后重试。"
+  fi
+  local ports=""
+  ports="$(ports_listening_json)"
+  if [[ ${1-} == "--json" ]]; then
+    printf '%s\n' "${ports}"
+    return 0
+  fi
+  if (($# > 0)); then
+    die "${EXIT_USAGE}" "用法：forward ports [--json]"
+  fi
+  local forwards=""
+  forwards="$(forward_list_json)"
+  printf '%-7s %-16s %-20s %s\n' "PORT" "ADDR" "PROCESS" "FORWARDED"
+  local rows=""
+  rows="$(jq -r -n --argjson p "${ports}" --argjson f "${forwards}" '
+    ($f | map(select(.mode == "client") | {key: (.remote_port | tostring), value: .local_port}) | from_entries) as $m
+    | $p[] | [(.port | tostring), .addr, (if .process == "" then "-" else .process end),
+              (if $m[.port | tostring] then "client:\($m[.port | tostring])" else "-" end)] | @tsv
+  ')"
+  local row=""
+  while IFS= read -r row; do
+    [[ -n ${row} ]] || continue
+    printf '%s\n' "${row}" | awk -F'\t' '{printf "%-7s %-16s %-20s %s\n", $1, $2, $3, $4}'
+  done <<<"${rows}"
+}
+
+# --- open-url（link handler 的落点） ---
+
+_hf_open_locally() {
+  local url="${1-}"
+  if command -v xdg-open >/dev/null 2>&1; then
+    exec xdg-open "${url}"
+  elif command -v open >/dev/null 2>&1; then
+    exec open "${url}"
+  fi
+  die 127 "本机没有 xdg-open/open，无法打开 ${url}。"
+}
+
+# cmd_open_url [url]：Ctrl+click localhost 链接。
+#   有 client 经桥接在线 = 用户是从另一台机器 attach 进来的：本机浏览器对他没有意义，
+#   于是确保该端口已映射到 client，再请 client 在它自己的浏览器里打开。
+cmd_open_url() {
+  local url="${1:-${HERDR_PLUGIN_CLICKED_URL:-}}"
+  if [[ -z ${url} ]]; then
+    die "${EXIT_USAGE}" "缺少 URL。用法：forward open-url http://localhost:3000"
+  fi
+  local live=""
+  if declare -F bridge_any_live >/dev/null; then
+    live="$(bridge_any_live)"
+  fi
+  if [[ ${live} != "yes" || ! ${url} =~ ^(https?)://(localhost|127\.0\.0\.1)(:([0-9]{1,5}))?(.*)$ ]]; then
+    _hf_open_locally "${url}"
+  fi
+  local scheme="${BASH_REMATCH[1]}"
+  local port="${BASH_REMATCH[4]}"
+  local rest="${BASH_REMATCH[5]}"
+  if [[ -z ${port} ]]; then
+    port=80
+    [[ ${scheme} == "https" ]] && port=443
+  fi
+
+  local forwards="" lp=""
+  forwards="$(forward_list_json)"
+  lp="$(printf '%s' "${forwards}" | jq -r --argjson rp "${port}" \
+    'first(.[] | select(.mode == "client" and .remote_port == $rp) | .local_port) // empty')"
+  if [[ -z ${lp} ]]; then
+    lp="${port}"
+    if ((lp < 1024)); then
+      lp=$((port + 10000))
+    fi
+    local id_taken=""
+    id_taken="$(printf '%s' "${forwards}" | jq -r --argjson lp "${lp}" 'any(.[]; .local_port == $lp) | tostring')"
+    if [[ ${id_taken} == "true" ]]; then
+      die 2 "本机映射表里端口 ${lp} 已被另一条记录占用，无法自动映射 ${url}。请用 forward add <空闲端口>:${port} --client 后再点击。"
+    fi
+    _hf_add_client "${lp}" "${port}" >/dev/null
+  fi
+  local target_url="${scheme}://localhost:${lp}${rest}"
+  bridge_enqueue_open "${target_url}"
+  if declare -F notify_toast >/dev/null; then
+    notify_toast "Port Forward" "在 client 上打开 ${target_url}"
+  fi
+  printf '已请 client 打开 %s\n' "${target_url}"
 }
 
 # --- machines（herdr saved machines + 跨机激活；M2 归属） ---
@@ -691,11 +1017,36 @@ _hf_install_keys() {
   return "${rc}"
 }
 
-# _hf_machines_reload_hint <target>：激活/停用后告诉用户下一步（面板 §2.4 也复用它）
+# _hf_reload_herdr -> stdout "yes"（已重载本机 herdr server）/ 空
+#   server 侧重载会把 tab bar 的变化推给已连接的 client（真 TUI 自动化测试实测），
+#   用户不必再手动 reload-config。只在以 herdr 插件身份运行时做（HERDR_PLUGIN_ID
+#   由 herdr 注入）：终端里手敲的命令 / 测试不去重载用户真实的 server。
+_hf_reload_herdr() {
+  [[ -n ${HERDR_PLUGIN_ID:-} && -n ${HERDR_BIN_PATH:-} ]] || return 0
+  local rc=0
+  set +o errexit
+  _bridge_bounded 15 "${HERDR_BIN_PATH}" server reload-config >/dev/null 2>&1
+  rc=$?
+  set -o errexit
+  if ((rc == 0)); then
+    printf 'yes\n'
+  fi
+  return 0
+}
+
+# _hf_machines_reload_hint <target>：激活/停用后让 tab bar 生效（能自动重载就自动，否则告诉用户）
 _hf_machines_reload_hint() {
   local target="${1-}"
-  printf '\n下一步：在 herdr 里执行 reload-config（或重启 herdr）使 tab bar 生效。\n'
-  printf '  tab bar command 由 herdr server 执行；跨机时它读的是 %s 上的插件与状态。\n' "${target:-该机器}"
+  local reloaded=""
+  if declare -F _bridge_bounded >/dev/null; then
+    reloaded="$(_hf_reload_herdr)"
+  fi
+  if [[ ${reloaded} == "yes" ]]; then
+    printf '\n已自动重载 herdr 配置：tab bar 已切换（它由 herdr server 执行，查看 %s 时读的是那台机器上的状态）。\n' "${target:-该机器}"
+  else
+    printf '\n下一步：在 herdr 里执行 reload-config（或重启 herdr）使 tab bar 生效。\n'
+    printf '  tab bar command 由 herdr server 执行；跨机时它读的是 %s 上的插件与状态。\n' "${target:-该机器}"
+  fi
   printf '  回滚：forward machines deactivate all\n'
 }
 
@@ -786,13 +1137,151 @@ _hf_machines_probe_fields() {
   PROBE_REASON="$(machines_kv_get "${kv}" HF_REASON)"
 }
 
+# _hf_confirm <prompt> -> stdout yes|no：交互终端单键确认（安全默认 no；非终端恒 no）
+_hf_confirm() {
+  local prompt="${1-}"
+  if [[ ! -t 0 ]]; then
+    printf 'no\n'
+    return 0
+  fi
+  printf '%s ' "${prompt}" >&2
+  local ans=""
+  set +o errexit
+  IFS= read -r -n 1 ans
+  set -o errexit
+  printf '\n' >&2
+  if [[ ${ans} == "y" || ${ans} == "Y" ]]; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+
+# _hf_remote_run <target> <timeout_s> <remote_cmd>：非交互 ssh（BatchMode，沿用用户 ssh 配置）
+#   输出原样透传到 stdout，返回 ssh 的退出码。
+_hf_remote_run() {
+  local target="${1-}"
+  local secs="${2-}"
+  local remote="${3-}"
+  local dest=""
+  dest="$(bridge_ssh_destination "${target}")"
+  local -a args=(-n -o BatchMode=yes -o ConnectTimeout=10)
+  if [[ -n ${HERDR_FORWARD_SSH_CONFIG:-} ]]; then
+    args=(-F "${HERDR_FORWARD_SSH_CONFIG}" "${args[@]}")
+  fi
+  local rc=0
+  set +o errexit
+  _bridge_bounded "${secs}" ssh "${args[@]}" "${dest}" "${remote}"
+  rc=$?
+  set -o errexit
+  return "${rc}"
+}
+
+# _hf_remote_herdr_cmd <herdr 参数串> -> stdout: 远端命令（herdr 不在非交互 PATH 时补 ~/.local/bin）
+_hf_remote_herdr_cmd() {
+  local rest="${1-}"
+  # shellcheck disable=SC2016 # $HOME/$PATH 必须由远端 shell 展开
+  printf 'if command -v herdr >/dev/null 2>&1; then herdr %s; else PATH="$HOME/.local/bin:$PATH" herdr %s; fi\n' "${rest}" "${rest}"
+}
+
+# _hf_remote_install <target>：在远端执行 herdr plugin install（仅在用户同意后调用）
+_hf_remote_install() {
+  local target="${1-}"
+  local src="${HERDR_FORWARD_INSTALL_SOURCE:-zzjcool/herdr-forward}"
+  local q_src="" remote=""
+  q_src="$(_bridge_sq "${src}")"
+  remote="$(_hf_remote_herdr_cmd "plugin install ${q_src} --yes")"
+  printf '正在 %s 上安装插件（herdr plugin install %s --yes；首次需要 git clone，约半分钟）…\n' "${target}" "${src}"
+  local rc=0
+  set +o errexit
+  _hf_remote_run "${target}" 300 "${remote}" 2>&1 | sed 's/^/  │ /'
+  rc="${PIPESTATUS[0]}"
+  set -o errexit
+  return "${rc}"
+}
+
+# _hf_remote_setup_ui <target> <root> <state>：让远端的键位立即可用
+#   herdr 不把 client 的自定义命令键位带到远端（「Local custom command keybindings are
+#   not sent」），A 查看 B 时 prefix+f 找的是 **B 自己 config** 里的绑定。B 的 startup
+#   hook 会在 B 的 server 下次启动时自动装，这里立刻代跑一次，再让 B 的 server 重载。
+_hf_remote_setup_ui() {
+  local target="${1-}"
+  local root="${2-}"
+  local sdir="${3-}"
+  local q_root="" q_state="" q_hook="" remote=""
+  q_root="$(_bridge_sq "HERDR_PLUGIN_ROOT=${root}")"
+  q_state="$(_bridge_sq "HERDR_PLUGIN_STATE_DIR=${sdir}")"
+  q_hook="$(_bridge_sq "${root}/scripts/startup-hook.sh")"
+  remote="env ${q_root} ${q_state} bash ${q_hook}"
+  local out="" rc=0
+  set +o errexit
+  out="$(_hf_remote_run "${target}" 60 "${remote}" 2>&1)"
+  rc=$?
+  set -o errexit
+  if ((rc != 0)); then
+    printf '  ⚠ 远端键位配置未完成（rc=%s）；可在 %s 上手动运行 %s/scripts/bootstrap.sh。\n' "${rc}" "${target}" "${root}"
+    return 0
+  fi
+  if [[ ${out} == *"键位已就绪"* ]]; then
+    local reload=""
+    reload="$(_hf_remote_herdr_cmd "server reload-config")"
+    set +o errexit
+    _hf_remote_run "${target}" 30 "${reload}" >/dev/null 2>&1
+    rc=$?
+    set -o errexit
+    if ((rc == 0)); then
+      printf '  远端键位已装好并已重载：查看 %s 时按 prefix+f 打开 Port Forward 面板。\n' "${target}"
+    else
+      printf '  远端键位已写入；查看 %s 时按 prefix+q（reload config）后即可用 prefix+f。\n' "${target}"
+    fi
+  elif [[ ${out} == *"已被其它命令占用"* ]]; then
+    printf '  ⚠ 远端默认键位 prefix+f 已被占用，未覆盖；请在 %s 上运行 %s/scripts/bootstrap.sh --add-key prefix+<键>。\n' "${target}" "${root}"
+  else
+    printf '  远端键位已就绪：查看 %s 时按 prefix+f 打开 Port Forward 面板。\n' "${target}"
+  fi
+  return 0
+}
+
+# _hf_bridge_start <id> <target>：启动到该机器的桥接，并停掉指向其它机器的桥接（单 active）
+_hf_bridge_start() {
+  local id="${1-}"
+  local target="${2-}"
+  declare -F bridge_up >/dev/null || return 0
+  local others="" other=""
+  others="$(bridge_clients_json | jq -r --arg id "${id}" '.[] | select(.machine != $id) | .machine')"
+  while IFS= read -r other; do
+    [[ -n ${other} ]] || continue
+    bridge_down "${other}"
+  done <<<"${others}"
+  local out="" rc=0
+  set +o errexit
+  out="$(bridge_up "${id}" "${FORWARD_ROOT}/bin/forward" 2>&1)"
+  rc=$?
+  set -o errexit
+  if ((rc == 0)); then
+    printf '  %s 在 %s 上登记的端口映射会出现在本机 localhost（forward bridge status 查看）。\n' "${out}" "${target}"
+  else
+    printf '  ⚠ 桥接未能启动：%s\n' "${out}"
+  fi
+  return 0
+}
+
 cmd_machines_activate() {
   _hf_machines_require
 
   local arg=""
   local config_override=""
+  local install=""
   while (($# > 0)); do
     case "$1" in
+    --install | --yes)
+      install="yes"
+      shift
+      ;;
+    --no-install)
+      install="no"
+      shift
+      ;;
     --config)
       (($# >= 2)) || die "${EXIT_USAGE}" "--config 需要一个路径值。"
       config_override="$2"
@@ -864,6 +1353,27 @@ cmd_machines_activate() {
   kv="$(machines_ssh_probe_plugin "${target}")"
   _hf_machines_probe_fields "${kv}"
 
+  # ③' absent + 用户同意 → 代装后重新探测（「递命令不代装」的原则只针对未经同意的情形）
+  if [[ ${PROBE_STATUS} == "absent" && ${install} != "no" ]] && declare -F bridge_ssh_destination >/dev/null; then
+    if [[ -z ${install} ]]; then
+      printf 'SSH 连上了 %s，但该机器上还没有安装 herdr-forward 插件。\n' "${target}" >&2
+      install="$(_hf_confirm "现在在 ${target} 上安装吗？（herdr plugin install zzjcool/herdr-forward）[y/N]")"
+    fi
+    if [[ ${install} == "yes" ]]; then
+      local install_rc=0
+      set +o errexit
+      _hf_remote_install "${target}"
+      install_rc=$?
+      set -o errexit
+      if ((install_rc != 0)); then
+        die 4 "在 ${target} 上安装插件失败（rc=${install_rc}）。可手动执行：ssh ${target} 'herdr plugin install zzjcool/herdr-forward --yes'，装好后重跑 forward machines activate ${arg}。"
+      fi
+      printf '安装完成，重新探测…\n'
+      kv="$(machines_ssh_probe_plugin "${target}")"
+      _hf_machines_probe_fields "${kv}"
+    fi
+  fi
+
   case "${PROBE_STATUS}" in
   present)
     printf '探测命中：插件根 %s\n' "${PROBE_ROOT:-<未报告>}"
@@ -877,7 +1387,7 @@ cmd_machines_activate() {
     printf 'SSH 连上了 %s，但该机器上**没有**安装 herdr-forward 插件。\n' "${target}" >&2
     printf '请在 %s 上执行（本命令不会替你装）：\n' "${target}" >&2
     printf "  ssh %s 'herdr plugin install zzjcool/herdr-forward --yes'\n" "${target}" >&2
-    printf '装完后回到本机重跑：forward machines activate %s\n' "${arg}" >&2
+    printf '装完后回到本机重跑：forward machines activate %s（或直接 forward machines activate %s --install 让本命令代装）\n' "${arg}" "${arg}" >&2
     die 4 "目标机器未安装 herdr-forward 插件（absent）：${target}。已给出安装命令，装好后重试。"
     ;;
   no-herdr)
@@ -926,7 +1436,29 @@ cmd_machines_activate() {
 
   printf '已激活：%s（%s）\n' "${id}" "${target}"
   printf '  tab bar 已指向该机器：%s\n' "${PROBE_ROOT}"
+  if declare -F bridge_up >/dev/null; then
+    _hf_remote_setup_ui "${target}" "${PROBE_ROOT}" "${PROBE_STATE}"
+    _hf_bridge_start "${id}" "${target}"
+    printf '  远程开发：在 %s 上按 prefix+f，选中监听端口即映射到本机 localhost（或在那边运行 forward add <端口>）。\n' "${target}"
+  fi
   _hf_machines_reload_hint "${target}"
+}
+
+# _hf_bridge_stop <id|all>：停桥接（client 侧监听随会话一并释放）；桥接模块缺失时静默
+_hf_bridge_stop() {
+  local which="${1-}"
+  declare -F bridge_down >/dev/null || return 0
+  if [[ ${which} == "all" ]]; then
+    local mids="" mid=""
+    mids="$(bridge_clients_json | jq -r '.[].machine')"
+    while IFS= read -r mid; do
+      [[ -n ${mid} ]] || continue
+      bridge_down "${mid}"
+    done <<<"${mids}"
+  else
+    bridge_down "${which}"
+  fi
+  return 0
 }
 
 cmd_machines_deactivate() {
@@ -972,12 +1504,14 @@ cmd_machines_deactivate() {
   if [[ "${arg}" == "all" ]]; then
     # all：清 active + 删全部记录（§2.3「all 清空并删全部记录」）→ 回到初始态
     machines_activation_reset
+    _hf_bridge_stop all
     printf '已停用全部 machine 并清空激活记录。\n'
   else
     local id=""
     id="$(machines_resolve_id "${arg}")"
     # 记录必须存在，否则用户打错 id 会静默「成功」
     machines_activation_get "${id}" >/dev/null
+    _hf_bridge_stop "${id}"
 
     if [[ "${active}" != "${id}" ]]; then
       # 非当前 active：只想清掉这台的历史记录（tab bar 不动）
@@ -1080,6 +1614,20 @@ cmd_machines_doctor() {
     return 0
   fi
 
+  # 桥接：远端 active 机器应当有一条在跑的桥接；没跑就拉起来（supervisor 自带断线重连）
+  if declare -F bridge_running >/dev/null; then
+    local br_running="" br_state=""
+    br_running="$(bridge_running "${active}")"
+    if [[ ${br_running} == "yes" ]]; then
+      br_state="$(bridge_clients_json | jq -r --arg id "${active}" \
+        'first(.[] | select(.machine == $id) | "\(.state)\(if (.reason // "") != "" and .state != "connected" then "（" + .reason + "）" else "" end)") // "?"')"
+      printf '  bridge      : 运行中，%s\n' "${br_state}"
+    else
+      printf '  bridge      : 未运行，正在启动…\n'
+      _hf_bridge_start "${active}" "${target}"
+    fi
+  fi
+
   # 远端记录：重探测（只读）。stale 路径 -> 重写记录 + 重写 tab bar；unreachable -> 只报告。
   printf '\n正在重新探测 %s（只读，最多约 15 秒）…\n' "${target}"
   local kv=""
@@ -1151,7 +1699,7 @@ cmd_machines() {
   help | --help | -h)
     printf '用法：forward machines <list|activate|deactivate|doctor>\n'
     printf '  list [--json] [--short]      列出 saved machines 与激活状态\n'
-    printf '  activate <id|label>         激活（远端先只读 SSH 探测）\n'
+    printf '  activate <id|label> [--install]  激活（远端先只读 SSH 探测；未装插件可代装）并启动桥接\n'
     printf '  deactivate <id|all>         停用并把 tab bar 恢复本机路径\n'
     printf '  doctor                      重探测 active 机器（stale 路径检测）\n'
     ;;
@@ -1185,6 +1733,9 @@ main() {
   watch) cmd_watch "$@" ;;
   bootstrap) cmd_bootstrap "$@" ;;
   machines) cmd_machines "$@" ;;
+  bridge) cmd_bridge "$@" ;;
+  ports) cmd_ports "$@" ;;
+  open-url) cmd_open_url "$@" ;;
   help | --help | -h)
     usage
     return 0

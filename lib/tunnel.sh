@@ -327,8 +327,11 @@ tunnel_doctor() {
   esac
   require_cmd jq
 
+  # client 映射（A.3.3）的监听在 attach 过来的 client 上，本机既无进程也探不到端口：
+  # 若混进来会被判 down，--prune 还会把用户登记的映射删掉。
   local json
   json="$(forward_list_json)"
+  json="$(jq -c '[.[] | select(.mode != "client")]' <<<"${json}")"
   local count
   count="$(jq 'length' <<<"${json}")"
 

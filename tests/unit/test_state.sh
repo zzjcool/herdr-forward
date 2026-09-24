@@ -246,6 +246,18 @@ _jqf "${out}" '.[0].publish.url'
 t_eq "null" "${got}" "publish.url 一期恒 null"
 _jqf "${out}" '.[0].created_unix | type'
 t_eq "number" "${got}" "created_unix 数字"
+_jqf "${out}" '.[0].mode'
+t_eq "tunnel" "${got}" "mode 缺省为 tunnel（旧调用方不传 mode）"
+
+t_it "add 保留 mode=client；未知 mode 归一为 tunnel"
+_reset_state
+forward_add_record '{"local_port":5173,"remote_port":5173,"mode":"client"}'
+forward_add_record '{"local_port":5174,"remote_port":5174,"mode":"bogus","ssh_target":"u@g:22"}'
+_capture state_load
+_jqf "${out}" '[.[] | .mode] | join(",")'
+t_eq "client,tunnel" "${got}" "client 保留、非法值归一"
+_reset_state
+forward_add_record '{"local_port":3000,"remote_port":9443,"machine":"gpu","ssh_target":"u@g:22"}'
 
 t_it "add 重复 local_port -> die 2（不覆盖，含下一步建议）"
 _capture_src 'forward_add_record "{\"local_port\":3000,\"remote_port\":1,\"ssh_target\":\"u@g:22\"}"'

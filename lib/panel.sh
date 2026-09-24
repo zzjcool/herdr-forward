@@ -317,8 +317,32 @@ _panel_count_json() {
 
 # --- 渲染 -------------------------------------------------------------------
 
+# 渲染时记下的可选对象（f<n> / d<n> 两键操作按「上一帧看到的序号」取值）
+PANEL_LISTEN_PORTS=""  # 每行一个端口：LISTENING 段的 f1..f9
+PANEL_REMOVABLE_IDS="" # 每行一个 id：FORWARDS 段可删除的 1..9
+PANEL_CLIENT_LIVE=""   # yes = 有 client 经桥接在线（本机是被 attach 的 server）
+PANEL_FLASH=""         # 上一次操作的结果，下一帧顶部显示一次
+
+# _panel_render_client：本机被 client 经桥接 attach 时，显示是谁连着（A.3.3）
+_panel_render_client() {
+  PANEL_CLIENT_LIVE=""
+  declare -F bridge_sessions_json >/dev/null 2>&1 || return 0
+  local sessions=""
+  sessions="$(bridge_sessions_json 2>/dev/null || true)"
+  [[ -n "${sessions}" ]] || return 0
+  local who=""
+  who="$(printf '%s' "${sessions}" | jq -r '[.[] | select(.live) | "\(.client_host)"] | join(", ")' 2>/dev/null || true)"
+  [[ -n "${who}" ]] || return 0
+  PANEL_CLIENT_LIVE="yes"
+  _panel_fnote "CLIENT  ${who} 已连接 · 本机端口可映射到它的 localhost（远程开发）"
+  return 0
+}
+
 # _panel_render_forwards：上半屏（forward 映射表格）—— 写入帧缓冲，不做 I/O
+#   client 映射（A.3.3）的状态取桥接实时回报；本机作为 client 经桥接生效的映射
+#   （mode=bridge）也列出，但不编号 —— 它们由对端机器登记，在那边删。
 _panel_render_forwards() {
+  PANEL_REMOVABLE_IDS=""
   if ! declare -F forward_list_json >/dev/null 2>&1; then
     _panel_fnote "FORWARDS"
     _panel_fnote "  （状态层不可用：缺少 lib/state.sh；在插件根下运行即可）"
@@ -328,25 +352,106 @@ _panel_render_forwards() {
   local json=""
   json="$(forward_list_json 2>/dev/null || true)"
   [[ -n "${json}" ]] || json='[]'
+  if declare -F bridge_merge_live >/dev/null 2>&1; then
+    local merged="" remote=""
+    merged="$(bridge_merge_live "${json}" 2>/dev/null || true)"
+    [[ -z "${merged}" ]] || json="${merged}"
+    remote="$(bridge_client_forwards_json 2>/dev/null || true)"
+    if [[ -n "${remote}" && "${remote}" != "[]" ]]; then
+      json="$(printf '%s\n%s\n' "${json}" "${remote}" | jq -c -s 'add' 2>/dev/null || printf '%s' "${json}")"
+    fi
+  fi
 
   local count=""
   count="$(_panel_count_json "${json}")"
   _panel_fnote "FORWARDS (${count})"
   if ((count == 0)); then
-    _panel_fnote "  （无映射）终端里运行 forward add 3000:3000 --machine <label> 添加。"
+    if [[ "${PANEL_CLIENT_LIVE}" == "yes" ]]; then
+      _panel_fnote "  （无映射）按 f+序号 把下面的监听端口映射到 client，或运行 forward add <端口>。"
+    else
+      _panel_fnote "  （无映射）终端里运行 forward add 3000:3000 --machine <label> 添加。"
+    fi
     return 0
   fi
 
-  _panel_ffmt '  %-6s %-22s %-9s %-7s\n' "LOCAL" "REMOTE" "STATUS" "PID"
-  while IFS=$'\t' read -r lp rp st pid; do
-    [[ -z "${lp}" ]] && continue
-    _panel_ffmt '  %-6s %-22s %-9s %-7s\n' "${lp}" "${rp}" "${st}" "${pid}"
+  _panel_ffmt '  %-2s %-13s %-22s %-9s %s\n' "#" "LOCAL" "REMOTE" "STATUS" "NOTE"
+  local n=0 num="" id="" mode="" lp="" rp="" st="" note=""
+  while IFS=$'\t' read -r id mode lp rp st note; do
+    [[ -z "${id}" ]] && continue
+    num="-"
+    if [[ "${mode}" != "bridge" ]] && ((n < 9)); then
+      n=$((n + 1))
+      num="${n}"
+      PANEL_REMOVABLE_IDS+="${id}"$'\n'
+    fi
+    _panel_ffmt '  %-2s %-13s %-22s %-9s %s\n' "${num}" "${lp}" "${rp}" "${st}" "${note}"
   done < <(printf '%s' "${json}" | jq -r '
-    .[] | [ (.local_port | tostring),
-            ((.remote_host // "127.0.0.1") + ":" + (.remote_port | tostring)),
-            (.status // "-"),
-            (if .pid == null then "-" else (.pid | tostring) end) ] | @tsv
+    sort_by(.local_port)[] |
+    [ .id, (.mode // "tunnel"),
+      (if .mode == "client" then "client:" + (.local_port | tostring) else (.local_port | tostring) end),
+      (if .mode == "bridge" then (.machine // "?") + ":" + (.remote_port | tostring)
+       else (.remote_host // "127.0.0.1") + ":" + (.remote_port | tostring) end),
+      (.status // "-"),
+      (if .mode == "client" then
+         (if (.status_reason // "") != "" then .status_reason
+          elif .status == "waiting" then "等待 client 连上"
+          elif (.client // "") != "" then "→ " + .client + " 的 localhost" else "" end)
+       elif .mode == "bridge" then "经桥接（在 " + (.machine // "?") + " 上登记）"
+       elif .pid == null then "-" else "pid " + (.pid | tostring) end) ] | @tsv
   ' 2>/dev/null || true)
+  if [[ -n "${PANEL_REMOVABLE_IDS}" ]]; then
+    _panel_fnote "${PANEL_DIM}  d+序号 删除映射${PANEL_RESET}"
+  fi
+  return 0
+}
+
+# _panel_render_listening：有 client 在线时列出本机还没映射的监听端口（f1..f9 一键映射）
+_panel_render_listening() {
+  PANEL_LISTEN_PORTS=""
+  [[ "${PANEL_CLIENT_LIVE}" == "yes" ]] || return 0
+  declare -F ports_listening_json >/dev/null 2>&1 || return 0
+  local ports="" forwards=""
+  ports="$(ports_listening_json 2>/dev/null || true)"
+  [[ -n "${ports}" ]] || return 0
+  forwards="$(forward_list_json 2>/dev/null || true)"
+  [[ -n "${forwards}" ]] || forwards='[]'
+  local rows=""
+  rows="$(jq -r -n --argjson p "${ports}" --argjson f "${forwards}" '
+    ([$f[] | select(.mode == "client") | .remote_port]) as $done
+    | [$p[] | select(.port as $x | $done | index($x) | not)][0:9][]
+    | [(.port | tostring), (if .process == "" then "-" else .process end)] | @tsv
+  ' 2>/dev/null || true)"
+  _panel_fnote "──────────────────────────────────────────────────────────────"
+  if [[ -z "${rows}" ]]; then
+    _panel_fnote "LISTENING  （本机没有其它监听端口；起个 dev server 后这里会出现）"
+    return 0
+  fi
+  _panel_fnote "LISTENING  本机监听端口 · f+序号 映射到 client 的 localhost"
+  local i=0 port="" proc=""
+  while IFS=$'\t' read -r port proc; do
+    [[ -n "${port}" ]] || continue
+    i=$((i + 1))
+    PANEL_LISTEN_PORTS+="${port}"$'\n'
+    _panel_ffmt '  f%s  %-6s %s\n' "${i}" "${port}" "${proc}"
+  done <<<"${rows}"
+  return 0
+}
+
+# _panel_bridge_desc <machine-id> -> stdout: 该机器桥接状态的简短说明（无桥接模块/无记录则空）
+_panel_bridge_desc() {
+  local id="${1-}"
+  declare -F bridge_clients_json >/dev/null 2>&1 || return 0
+  local clients=""
+  clients="$(bridge_clients_json 2>/dev/null || true)"
+  [[ -n "${clients}" ]] || return 0
+  printf '%s' "${clients}" | jq -r --arg id "${id}" '
+    first(.[] | select(.machine == $id)
+      | if .running | not then "桥接未运行"
+        elif .state == "connected" then
+          "桥接已连接 · \([.forwards[]? | select(.state == "up")] | length) 个映射"
+        elif .state == "retrying" then "桥接重连中"
+        else "桥接连接中" end) // empty
+  ' 2>/dev/null || true
   return 0
 }
 
@@ -357,6 +462,8 @@ _panel_render_forwards() {
 #   未设时说明是普通命令行环境，不是故障，不打扰用户。
 _panel_machines_omitted_hint() {
   [[ -n "${HERDR_BIN_PATH:-}" ]] || return 0
+  # 有 client 经桥接 attach 时本机是被远程开发的那台：没有自己的 saved machines 是常态
+  [[ "${PANEL_CLIENT_LIVE}" != "yes" ]] || return 0
   _panel_fnote "${PANEL_DIM}  未列出 saved machines（可能 herdr machine list 失败，详见日志或手动运行 ${HERDR_BIN_PATH} machine list --json）${PANEL_RESET}"
   return 0
 }
@@ -380,7 +487,13 @@ panel_render() {
 
   _panel_fnote "herdr-forward · Port Forward   刷新 ${PANEL_REFRESH_S}s · r 立即刷新 · x 退出"
   _panel_fnote "──────────────────────────────────────────────────────────────"
+  if [[ -n "${PANEL_FLASH}" ]]; then
+    _panel_fnote "${PANEL_FLASH}"
+    PANEL_FLASH=""
+  fi
+  _panel_render_client
   _panel_render_forwards
+  _panel_render_listening
 
   if ((total > 0)); then
     _panel_fnote "──────────────────────────────────────────────────────────────"
@@ -397,7 +510,9 @@ panel_render() {
       case "${state}" in
       active)
         mark="[✓]"
-        desc="（当前活动 · tab bar 指向该机）"
+        local bdesc=""
+        bdesc="$(_panel_bridge_desc "${id}")"
+        desc="（当前活动 · tab bar 指向该机${bdesc:+ · ${bdesc}}）"
         _panel_ffmt '  %s %s. %-16s %-20s %s\n' "${mark}" "${i}" "${label}" "${target}" "${desc}"
         ;;
       local)
@@ -424,7 +539,14 @@ panel_render() {
   fi
 
   _panel_fnote "──────────────────────────────────────────────────────────────"
-  _panel_fnote "按键: 1-9 选择机器（激活前会确认） · r 刷新 · a 添加转发用法 · x 退出"
+  local keys="按键: 1-9 选择机器（激活前会确认）"
+  if [[ -n "${PANEL_LISTEN_PORTS}" ]]; then
+    keys+=" · f+序号 映射端口"
+  fi
+  if [[ -n "${PANEL_REMOVABLE_IDS}" ]]; then
+    keys+=" · d+序号 删除映射"
+  fi
+  _panel_fnote "${keys} · r 刷新 · a 添加转发用法 · x 退出"
 
   _panel_flush
   return 0
@@ -446,8 +568,16 @@ panel_handle_key() {
     return 0
     ;;
   a | A)
-    _panel_hint "添加转发：终端里运行 'forward add <local>:<remote> [--machine LABEL] [--ssh-target user@host:22]'（一期不在面板内嵌表单）。"
+    _panel_hint "添加转发：终端里运行 'forward add <port>'（有 client 连着时映射到它的 localhost）或 'forward add <local>:<remote> --machine LABEL|--ssh-target user@host:22'。"
     printf 'none\n'
+    return 0
+    ;;
+  f | F)
+    printf 'pick-forward\n'
+    return 0
+    ;;
+  d | D)
+    printf 'pick-remove\n'
     return 0
     ;;
   *) : ;; # 其余：交给下面的数字分派 / none 兑底
@@ -579,6 +709,83 @@ _panel_act() {
     _panel_note "  ⏳ 停用中…"
     _panel_probe deactivate "${id}"
   fi
+  # 激活的输出（代装进度、桥接状态、下一步）要让人看完：下一帧会整屏重画。
+  # 这一键不丢弃：交给主循环当作下一次按键（按 x 直接退出、按 r 就是刷新）。
+  _panel_note "  （按任意键返回面板）"
+  local k=""
+  IFS= read -r -n 1 -t 120 k || true
+  PANEL_PENDING_KEY="${k}"
+  return 0
+}
+
+PANEL_PENDING_KEY=""
+
+# _panel_forward_bin -> stdout: bin/forward 路径（找不到则空）
+_panel_forward_bin() {
+  if [[ -n "${FORWARD_ROOT:-}" && -x "${FORWARD_ROOT}/bin/forward" ]]; then
+    printf '%s\n' "${FORWARD_ROOT}/bin/forward"
+  else
+    command -v forward 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _panel_pick <pick-forward|pick-remove>：读第二个键（1-9）并执行对应 CLI
+#   与机器激活一样只 fork CLI 子命令；结果放进 PANEL_FLASH，在下一帧顶部显示。
+_panel_pick() {
+  local kind="${1-}"
+  local list=""
+  if [[ "${kind}" == "pick-forward" ]]; then
+    list="${PANEL_LISTEN_PORTS}"
+  else
+    list="${PANEL_REMOVABLE_IDS}"
+  fi
+  if [[ -z "${list}" ]]; then
+    if [[ "${kind}" == "pick-forward" ]]; then
+      PANEL_FLASH="  没有可映射的监听端口（需要有 client 经桥接连着本机）。"
+    else
+      PANEL_FLASH="  没有可删除的映射。"
+    fi
+    return 0
+  fi
+  _panel_note "  输入序号 1-9（其它键取消）"
+  local k=""
+  IFS= read -r -n 1 -t 10 k || true
+  if [[ ! "${k}" =~ ^[1-9]$ ]]; then
+    PANEL_FLASH="  （已取消）"
+    return 0
+  fi
+  local item=""
+  item="$(printf '%s' "${list}" | sed -n "${k}p")"
+  if [[ -z "${item}" ]]; then
+    PANEL_FLASH="  没有序号 ${k}。"
+    return 0
+  fi
+  local bin=""
+  bin="$(_panel_forward_bin)"
+  if [[ -z "${bin}" ]]; then
+    PANEL_FLASH="  ⚠ 找不到 forward 可执行文件。"
+    return 0
+  fi
+  local msg="" rc=0
+  set +o errexit
+  if [[ "${kind}" == "pick-forward" ]]; then
+    msg="$("${bin}" add "${item}" --client 2>&1)"
+  else
+    msg="$("${bin}" remove "${item}" 2>&1)"
+  fi
+  rc=$?
+  set -o errexit
+  msg="${msg//$'\n'/ }"
+  if ((rc == 0)); then
+    if [[ "${kind}" == "pick-forward" ]]; then
+      PANEL_FLASH="  ✓ 已映射本机 ${item} → client 的 localhost:${item}"
+    else
+      PANEL_FLASH="  ✓ 已删除 ${item}"
+    fi
+  else
+    PANEL_FLASH="  ⚠ 失败（rc=${rc}）：${msg:0:160}"
+  fi
   return 0
 }
 
@@ -609,10 +816,15 @@ panel_main() {
 
     key=""
     rrc=0
-    set +o errexit
-    IFS= read -r -n 1 -t "${refresh}" key
-    rrc=$?
-    set -o errexit
+    if [[ -n "${PANEL_PENDING_KEY}" ]]; then
+      key="${PANEL_PENDING_KEY}"
+      PANEL_PENDING_KEY=""
+    else
+      set +o errexit
+      IFS= read -r -n 1 -t "${refresh}" key
+      rrc=$?
+      set -o errexit
+    fi
 
     if [[ "${rrc}" -gt 128 ]]; then
       continue # 超时 = 自动刷新（forward 状态可能是别的 pane 改的）
@@ -631,6 +843,9 @@ panel_main() {
       ;;
     activating:* | deactivating:*)
       _panel_act "${action%%:*}" "${action#*:}"
+      ;;
+    pick-forward | pick-remove)
+      _panel_pick "${action}"
       ;;
     *)
       : # none：未知键静默忽略，下一轮重绘（不提示噪音）

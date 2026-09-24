@@ -190,6 +190,8 @@ EOF
 config_path=""
 state_dir=""
 dry_run=0
+# tab bar / 键位任一真的写进了 config 就置 1（决定是否自动 reload-config）
+HOOK_CONFIG_CHANGED=0
 while (($# > 0)); do
   case "$1" in
   --config)
@@ -308,6 +310,7 @@ if [[ "${installer_rc}" -eq 0 ]]; then
     _hook_log info "startup: tab bar 条目已存在，跳过（幂等）"
   else
     _hook_log info "startup: tab bar 条目已写入 ${config_path}；执行 reload-config 后生效"
+    HOOK_CONFIG_CHANGED=1
   fi
   printf '%s\n' \
     "提示：tab bar 条目已就绪。若你的 herdr client 跑在另一台机器（跨机 attach），" \
@@ -420,6 +423,7 @@ _hook_install_keys() {
   fi
 
   _hook_log info "startup: 键位已写入 ${config_path}（prefix+f / prefix+shift+f / prefix+alt+f）；执行 reload-config 后生效"
+  HOOK_CONFIG_CHANGED=1
   printf '%s\n' \
     "提示：herdr-forward 键位已就绪：" \
     "  prefix+f        打开 Port Forward 面板" \
@@ -427,11 +431,76 @@ _hook_install_keys() {
     "  prefix+alt+f    探活检查（Doctor）" \
     "换键：<插件根>/scripts/bootstrap.sh --config ${config_path} --add-key prefix+<你的键>" \
     "（--list-key / --doctor-key 同理）。" \
-    "这些键位在 **client** 的 config —— 无论 attach 哪台 server 都生效；" \
+    "这些键位写在本机 config：查看本机时生效；herdr 不把 client 的自定义命令键位带到远端，" \
+    "查看 saved machine 时用的是那台机器自己的键位（在 Port Forward 面板里激活它会自动配好）；" \
     "执行 reload-config（herdr 里 prefix+q / herdr server reload-config）后可用。"
   return 0
 }
 
 _hook_install_keys
+
+# ===========================================================================
+# 写过 config 就让本机 herdr server 立刻重载
+# ===========================================================================
+# 自定义命令键位由 server「广播」给 client：hook 在 server 读完 config 之后才写入键位，
+# 不重载的话 prefix+f 在用户手动 reload-config 之前一直无效（真 TUI 自动化测试实测）。
+# server 侧重载同时会把 tab bar 的变化推给已连接的 client。
+# 只在确由 herdr 以插件身份拉起时做（HERDR_PLUGIN_ID 由 herdr 注入）：在 herdr pane
+# 里手动跑这个脚本或测试，不能去重载用户真实的 server。
+_hook_reload_config() {
+  ((dry_run == 0)) || return 0
+  ((HOOK_CONFIG_CHANGED == 1)) || return 0
+  [[ -n "${HERDR_PLUGIN_ID:-}" && -n "${HERDR_BIN_PATH:-}" ]] || return 0
+  local -a cmd=("${HERDR_BIN_PATH}" server reload-config)
+  if command -v timeout >/dev/null 2>&1; then
+    cmd=(timeout 15 "${cmd[@]}")
+  fi
+  local out="" rc=0
+  set +o errexit
+  out="$("${cmd[@]}" 2>&1)"
+  rc=$?
+  set -o errexit
+  if [[ "${rc}" -eq 0 ]]; then
+    _hook_log info "startup: 已自动 reload-config，键位与 tab bar 立即生效"
+    printf '%s\n' "提示：已自动重载 herdr 配置 —— 现在就可以按 prefix+f。"
+  else
+    _hook_warn "自动 reload-config 失败（rc=${rc}）：${out}；请在 herdr 里执行 reload-config 让键位生效。"
+  fi
+  return 0
+}
+
+_hook_reload_config
+
+# ===========================================================================
+# 远程开发（ARCHITECTURE §A.3.3）：active 是远端机器时拉起到它的桥接
+# ===========================================================================
+# 桥接 supervisor 是 setsid 出去的后台进程，`bridge up` 本身秒回（已在运行则直接
+# 返回），不拖慢 server 启动；它失败只记日志。机器上若没有 active 的远端机器（B 侧
+# 通常如此），这里什么都不做。
+_hook_bridge_up() {
+  ((dry_run == 0)) || return 0
+  [[ "${activation_plan}" == "remote" ]] || return 0
+  declare -F machines_activation_active >/dev/null 2>&1 || return 0
+  local fwd="${SELF_DIR}/../bin/forward"
+  [[ -x "${fwd}" && -f "${_lib_dir}/bridge.sh" ]] || return 0
+  local active=""
+  set +o errexit
+  active="$(machines_activation_active 2>/dev/null)"
+  set -o errexit
+  [[ -n "${active}" ]] || return 0
+  local out="" rc=0
+  set +o errexit
+  out="$("${fwd}" bridge up "${active}" 2>&1)"
+  rc=$?
+  set -o errexit
+  if [[ "${rc}" -eq 0 ]]; then
+    _hook_log info "startup: 桥接 → ${active}：${out}"
+  else
+    _hook_warn "到 ${active} 的桥接未能启动（rc=${rc}）：${out}；可稍后运行 forward machines doctor 重试。"
+  fi
+  return 0
+}
+
+_hook_bridge_up
 
 exit 0

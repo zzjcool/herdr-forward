@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # lib/state.sh — forwards.json 读写（唯一状态权威）
 # A.2 数据契约：{version:1, forwards:[{id,local_port,remote_host,remote_port,machine,
-#   ssh_target,pid,control_socket,status,created_unix,publish:{pid,url,started_unix}}]}
+#   ssh_target,pid,control_socket,status,created_unix,mode,publish:{pid,url,started_unix}}]}
+#   mode（A.3.3 追加）：tunnel = 本机 ssh -L（默认，旧记录缺字段即 tunnel）；
+#   client = 监听在 attach 过来的 client（A）的 localhost，由桥接会话代为打开。
 # A.3 冻结签名：state_file / state_load / state_save / forward_add_record /
 #   forward_remove_record / forward_get / forward_list_json / forward_set_status
 #
@@ -196,6 +198,7 @@ forward_add_record() {
         control_socket: (.control_socket // ""),
         status: (.status // "starting"),
         created_unix: (.created_unix // $now),
+        mode: (if .mode == "client" then "client" else "tunnel" end),
         publish: {pid: null, url: null, started_unix: null}
       }
     ' 2>/dev/null)"

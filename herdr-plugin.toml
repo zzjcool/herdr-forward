@@ -58,11 +58,12 @@ title = "Port Forward: Doctor (check tunnels)"
 command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" doctor']
 
 # link_handler 的 action 必须指向本插件已声明的 action（SCOUT-FACTS §2.2），
-# 故单独声明 open-url（一期语义：Ctrl+click localhost 链接 → 打开浏览器）。
+# 故单独声明 open-url：Ctrl+click localhost 链接 → 有 client 经桥接 attach 时先把端口
+# 映射到 client 再请它在自己的浏览器里打开（A.3.3），否则用本机浏览器打开。
 [[actions]]
 id = "open-url"
 title = "Port Forward: Open link in browser"
-command = ["/bin/sh", "-c", 'url="$HERDR_PLUGIN_CLICKED_URL"; if [ -z "$url" ]; then exit 1; fi; if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$url"; elif command -v open >/dev/null 2>&1; then exec open "$url"; else exit 1; fi']
+command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" open-url']
 
 # bootstrap —— OOTB 一键装 UI（tab bar 状态条 + 键绑定）。
 # 用户 link 后可在任意 pane 执行：
@@ -78,9 +79,13 @@ command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}
 # panes —— Port Forward 面板（表格 + 交互式增删）
 # ---------------------------------------------------------------------------
 
+# 面板一行约 70 列：默认的半屏 popup 会把行折断，给足宽高。
 [[panes]]
 id = "ports"
 title = "Port Forward"
+placement = "popup"
+width = "80%"
+height = "80%"
 command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" watch']
 
 # ---------------------------------------------------------------------------

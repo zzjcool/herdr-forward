@@ -200,10 +200,17 @@ _stage
 _fw add
 t_exit_ok 64 "${rc}" "缺参 -> 64"
 
-t_it "add 端口对格式错误 -> exit 64"
+t_it "add 单端口是 <port>:<port> 的简写"
 _stage
 _fw add "3000" --ssh-target "u@h:22"
-t_exit_ok 64 "${rc}" "无冒号 -> 64"
+t_exit_ok 0 "${rc}" "单端口 -> 0"
+_jq_state '.forwards[0] | "\(.local_port):\(.remote_port)"'
+t_eq "3000:3000" "${got}" "本地与远端同端口"
+
+t_it "add 端口对格式错误 -> exit 64"
+_stage
+_fw add "3000:" --ssh-target "u@h:22"
+t_exit_ok 64 "${rc}" "缺远端端口 -> 64"
 _stage
 _fw add "0:3000" --ssh-target "u@h:22"
 t_exit_ok 64 "${rc}" "端口 0 -> 64"
