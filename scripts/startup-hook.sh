@@ -26,6 +26,7 @@ readonly PROG_NAME="${0##*/}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SELF_DIR
 readonly TABBAR_INSTALLER="${SELF_DIR}/install-tabbar.sh"
+readonly KEYS_INSTALLER="${SELF_DIR}/install-keys.sh"
 
 # 复用插件自己的 log（写入 $HERDR_PLUGIN_STATE_DIR/logs/forward.log；env 缺失退 stderr）
 _lib_dir="${SELF_DIR}/../lib"
@@ -154,7 +155,8 @@ usage() {
   cat <<'EOF'
 用法: startup-hook.sh [选项]
 
-herdr [[startup]] 钩子：检测到 tab bar 状态条缺失时自动执行 install-tabbar.sh。
+herdr [[startup]] 钩子：自动补上本插件的 UI —— tab bar 状态条 + 键位。
+检测到缺失时分别执行 install-tabbar.sh / install-keys.sh（两者都幂等）。
 恒 exit 0（startup 失败不阻塞 herdr server）。
 
 选项:
@@ -164,6 +166,12 @@ herdr [[startup]] 钩子：检测到 tab bar 状态条缺失时自动执行 inst
                   install-tabbar.sh 按 XDG 推导）。写进 tab bar command 的 env 前缀。
   --dry-run       只预览，不修改文件
   --help          显示本帮助
+
+键位（autokeys）：默认装 prefix+f / prefix+shift+f / prefix+alt+f（plugin_action）。
+键位条目写到**本机（client）** config —— plugin_action 由「当前所选 server」解析，
+与 tab bar 的 active-machine/B 路径逻辑无关，故 active machine 存在时键位照装。
+若默认键位已被别的命令占用，startup 采取保守策略：**跳过本次自动安装**并打印冲突
+说明 + 换键命令，绝不覆盖你已有的绑定（手动补装用 bootstrap.sh --add-key ...）。
 
 绝对路径解析：hook 在 server 上跑，tab bar command 也在 server 上执行，因此
 install-tabbar.sh 自动解析出的「本机绝对路径」就是正确的 server 路径（不存在 $HERDR_PLUGIN_ROOT
@@ -306,12 +314,124 @@ if [[ "${installer_rc}" -eq 0 ]]; then
     "那台机器需要单独运行 <插件根>/scripts/bootstrap.sh --config <A 的 config> " \
     "--plugin-root <本机（server B）的插件根> --state-dir <本机（server B）的插件 state 目录> " \
     "—— server 侧无法代写 client 配置。"
-  exit 0
+  # 不 exit：继续走键位段（autokeys）。两段互相独立，各自幂等、各自降级。
+else
+  _hook_warn "tab bar 自动安装失败（rc=${installer_rc}，config=${config_path}）；已跳过，herdr server 不受影响。"
+  printf '%s\n' "${installer_out}" >&2 || true
+  printf '%s\n' \
+    "下一步：手动运行 <插件根>/scripts/install-tabbar.sh --config ${config_path} 查看具体原因；" \
+    "跨机（client 在另一台机器）时请在 client 机器运行 <插件根>/scripts/bootstrap.sh。" >&2
 fi
 
-_hook_warn "tab bar 自动安装失败（rc=${installer_rc}，config=${config_path}）；已跳过，herdr server 不受影响。"
-printf '%s\n' "${installer_out}" >&2 || true
-printf '%s\n' \
-  "下一步：手动运行 <插件根>/scripts/install-tabbar.sh --config ${config_path} 查看具体原因；" \
-  "跨机（client 在另一台机器）时请在 client 机器运行 <插件根>/scripts/bootstrap.sh。" >&2
+# ===========================================================================
+# autokeys：自动装键位（prefix+f / prefix+shift+f / prefix+alt+f）
+# =========================================================================
+#
+# 为什么键位可以无脑写「本机 config」，而 tab bar 要走 active-machine 分支？
+#   tab bar 的 command 在 **server** 上执行，active 指向远端时 command 必须写远端
+#   插件路径（见上面的 _hook_activation_plan）。而 [[keys.command]] 是
+#   type="plugin_action" 的键绑定：按下去由 herdr 把 action 投递给「**当前所选的**
+#   server」（本机 server，或 attach 的远端 server），action 自身再去碰它那侧的
+#   插件。所以键位条目永远属于 **client 的** config —— 本机 config 就是正确落点，
+#   与 tab bar 的 B 路径逻辑无关。这就是「active machine 存在时键位照装」的原因。
+#   （后人若把这两段合并成同一路径推导，会写出「键位指向 B 的插件根」的错误实现。）
+#
+# 冲突礼仪（用户已认可）：install-keys.sh 的契约是「键位被占用 → 告警但照装」，
+# 那是手动安装时合适的（用户主动、能看到告警、可换键）。但 startup 是**无人值守**
+# 的自动路径：此时把我们的绑定叠到用户已有的同键绑定上，会被感知为「自动覆盖了
+# 我的键位」——不可接受。故 startup 采取保守策略：**检测到冲突就跳过本次键位
+# 安装**并把冲突写进通知，绝不覆盖用户已有绑定。
+#
+# 探测手法（复用 install-keys.sh 自己的判定逻辑，不重写）：跑一次 install-keys.sh
+# 的 **--dry-run** 并合并 stdout+stderr：
+#   * 已装（marker 命中）→ 输出 "already installed" → 幂等跳过
+#   * 默认键被非本插件的命令占用 → 其 stderr 打印 "is already bound" → 冲突
+#   * 无冲突 → dry-run 正常产出预览（不落盘）
+# 为什么用 dry-run 而不是直接真装：真装的冲突告警出现在**写入之后**（太晚），
+# 无法在覆盖前刹车。dry-run 复用同一段 python 判定，且本来就支持。
+# 已知边界：install-keys.sh 的 3 条键位是**原子**写入的（其 self-check 要求
+# add/list/doctor 恰好 3 条），无法只装其中 2 条，故冲突时只能整体跳过 —— 这是
+# 当前 install-keys.sh 契约下的最保守做法，通知里明确告知换键命令供手动补装。
+_hook_install_keys() {
+  if [[ ! -f "${KEYS_INSTALLER}" ]]; then
+    _hook_warn "缺少 ${KEYS_INSTALLER}；跳过键位自动安装。请在 client 机器运行 scripts/install-keys.sh。"
+    return 0
+  fi
+
+  local probe_rc=0 probe_out=""
+  # 探测恒定用 --dry-run（与 hook 自己的 --dry-run 无关）：目的是「不落盘地」拿到
+  # install-keys.sh 的幂等/冲突判定。若把 hook 的 ${dry_flag} 传进来，常规启动路径
+  # 会变成真装 —— 那样冲突就发生在写入之后，无法在覆盖前刹车。
+  set +o errexit
+  probe_out="$(bash "${KEYS_INSTALLER}" --config "${config_path}" --dry-run 2>&1)"
+  probe_rc=$?
+  set -o errexit
+
+  # install-keys.sh 幂等：marker 命中时用 "already installed" 文案（英文，契约稳定）
+  if [[ "${probe_rc}" -eq 0 && "${probe_out}" == *"already installed"* ]]; then
+    _hook_log info "startup: 键位已存在，跳过（幂等）"
+    return 0
+  fi
+
+  # 探测本身失败（非法 TOML / python3 缺失 / 目录不可写）→ 降级，不阻塞 server。
+  if [[ "${probe_rc}" -ne 0 ]]; then
+    _hook_warn "键位自动安装前探测失败（rc=${probe_rc}，config=${config_path}）；已跳过键位安装，herdr server 不受影响。"
+    printf '%s\n' "${probe_out}" >&2 || true
+    printf '%s\n' \
+      "下一步：手动运行 <插件根>/scripts/install-keys.sh --config ${config_path} 查看具体原因。" >&2
+    return 0
+  fi
+
+  # 冲突礼仪：默认键位被非本插件的命令占用 → 整体跳过，绝不覆盖。
+  if [[ "${probe_out}" == *"is already bound"* ]]; then
+    local occupied=""
+    # 从 install-keys.sh 自己的告警文案里抽出冲突键（`key 'prefix+f' is already bound`），
+    # 去重后列进通知；抽不到也不致命（仍走保守跳过 + 通用说明）。
+    occupied="$(printf '%s\n' "${probe_out}" | sed -n "s/.*key '\([^']*\)' is already bound.*/\1/p" | sort -u | paste -sd ', ' - || true)"
+    _hook_warn "键位冲突：${occupied:-默认键位已被占用} 已有别的绑定；为避免覆盖你的键位，已跳过自动装键位。"
+    printf '%s\n' \
+      "提示：检测到以下默认键位已被其它命令占用：${occupied:-（见上方 install-keys 告警）}。" \
+      "为避免覆盖你已有的绑定，本次**未自动安装** herdr-forward 键位。" \
+      "若要装到别的键上，请手动运行：" \
+      "  <插件根>/scripts/bootstrap.sh --config ${config_path} --add-key prefix+<你的键>" \
+      "（可一并传 --list-key / --doctor-key）"
+    return 0
+  fi
+
+  # 无冲突 → 真装（再跑一次同样命令，不带 --dry-run）。
+  # dry-run 语义：探测已预览过内容，这里绝不落盘。
+  if ((dry_run)); then
+    _hook_log info "startup: [dry-run] 将写入键位（prefix+f / prefix+shift+f / prefix+alt+f）到 ${config_path}，未落盘"
+    return 0
+  fi
+
+  local install_rc=0 install_out=""
+  set +o errexit
+  install_out="$(bash "${KEYS_INSTALLER}" --config "${config_path}" 2>&1)"
+  install_rc=$?
+  set -o errexit
+
+  if [[ "${install_rc}" -ne 0 ]]; then
+    _hook_warn "键位自动安装失败（rc=${install_rc}，config=${config_path}）；已跳过，herdr server 不受影响。"
+    printf '%s\n' "${install_out}" >&2 || true
+    printf '%s\n' \
+      "下一步：手动运行 <插件根>/scripts/install-keys.sh --config ${config_path} 查看具体原因。" >&2
+    return 0
+  fi
+
+  _hook_log info "startup: 键位已写入 ${config_path}（prefix+f / prefix+shift+f / prefix+alt+f）；执行 reload-config 后生效"
+  printf '%s\n' \
+    "提示：herdr-forward 键位已就绪：" \
+    "  prefix+f        打开 Port Forward 面板" \
+    "  prefix+shift+f  列出当前转发" \
+    "  prefix+alt+f    探活检查（Doctor）" \
+    "换键：<插件根>/scripts/bootstrap.sh --config ${config_path} --add-key prefix+<你的键>" \
+    "（--list-key / --doctor-key 同理）。" \
+    "这些键位在 **client** 的 config —— 无论 attach 哪台 server 都生效；" \
+    "执行 reload-config（herdr 里 prefix+q / herdr server reload-config）后可用。"
+  return 0
+}
+
+_hook_install_keys
+
 exit 0

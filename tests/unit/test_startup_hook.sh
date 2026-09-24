@@ -164,6 +164,94 @@ except Exception:
 PY
 }
 
+# --- autokeys 助手：断言 startup hook 自动装键位的效果 -------------------------
+# keys_count <toml> -> 本插件 keys.command 条目数（文件缺失/非法 TOML 记 0，不中断）
+keys_count() {
+  python3 - "${1-}" <<'PY' 2>/dev/null || true
+import os, sys, tomllib
+if not os.path.exists(sys.argv[1]):
+    print(0)
+    raise SystemExit(0)
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+print(sum(1 for e in ((doc.get("keys") or {}).get("command") or [])
+          if isinstance(e, dict) and str(e.get("command", "")).startswith("zzjcool:forward.")))
+PY
+}
+
+# key_of <toml> <action-command> -> 该 action 的 key（无则空）
+key_of() {
+  python3 - "${1-}" "${2-}" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        doc = tomllib.load(fh)
+    for e in ((doc.get("keys") or {}).get("command") or []):
+        if isinstance(e, dict) and e.get("command") == sys.argv[2]:
+            print(e.get("key", ""))
+            break
+except Exception:
+    pass
+PY
+}
+
+# keys_marker_count <toml> -> install-keys 的幂等标记出现次数
+keys_marker_count() { grep -c 'herdr-forward: keybindings' "${1-}" 2>/dev/null || true; }
+
+# 断言助手：先把命令替换的结果落到本地变量再比较。
+# 为什么不直接 `t_eq "x" "$(keys_count ...)"`：shellcheck -o all 的 SC2312
+# （不要用命令替换的返回值遮蔽外层命令），本文件其它用例也是「先赋值再断言」风格。
+assert_keys_count() { # <want> <toml> <msg>
+  local want="${1-}" have=""
+  have="$(keys_count "${2-}")"
+  t_eq "${want}" "${have}" "${3-}"
+}
+assert_key_is() { # <want> <toml> <action-command> <msg>
+  local want="${1-}" have=""
+  have="$(key_of "${2-}" "${3-}")"
+  t_eq "${want}" "${have}" "${4-}"
+}
+assert_marker_count() { # <want> <toml> <msg>
+  local want="${1-}" have=""
+  have="$(keys_marker_count "${2-}")"
+  t_eq "${want}" "${have}" "${3-}"
+}
+assert_tabbar_count() { # <want> <toml> <msg>
+  local want="${1-}" have=""
+  have="$(tabbar_count "${2-}")"
+  t_eq "${want}" "${have}" "${3-}"
+}
+assert_tabbar_cmd() { # <want> <toml> <msg>
+  local want="${1-}" have=""
+  have="$(tabbar_command "${2-}")"
+  t_eq "${want}" "${have}" "${3-}"
+}
+assert_md5() { # <want> <toml> <msg>
+  local want="${1-}" have=""
+  have="$(md5 "${2-}")"
+  t_eq "${want}" "${have}" "${3-}"
+}
+
+# seed_keys_only <config>：只装键位（不碰 tab bar），并清掉备份。
+# 用途：让「以 tab bar 为焦点」的既有用例保持单一变量 —— 键位已装（marker 存在）
+# 时 hook 的键位段不会写入，从而不干扰 tab bar 的 md5/备份断言。
+seed_keys_only() {
+  bash "${ROOT}/scripts/install-keys.sh" --config "${1-}" >/dev/null 2>&1 || true
+  rm -f "${1-}".bak.*
+}
+
+# preinstall_ui <config>：用真实安装器把 tab bar + 键位都装好，并清掉其备份。
+# 用途：把用例的起点固定在「已全装」，从而只观察目标行为（幂等/冲突），
+# 不被首次安装的 tab bar 改动干扰。
+preinstall_ui() {
+  bash "${ROOT}/scripts/install-tabbar.sh" --config "${1-}" --state-dir "${WORK}/state" >/dev/null 2>&1 || true
+  seed_keys_only "${1-}"
+}
+
 t_it "裸跑：在 XDG_CONFIG_HOME/herdr/config.toml 自动装 tab bar 条目"
 printf 'theme = "dark"\n' >"${DEFAULT_CONFIG}"
 run_hook
@@ -197,6 +285,9 @@ text = (
 with open(path, "w", encoding="utf-8") as fh:
     fh.write(text)
 PY
+# 本用例只考察 tab bar 幂等：先把键位也装好（marker 存在），使 hook 的 autokeys
+# 段不写入、不产生备份，从而「未产生备份 / 内容未变」的断言保持单一变量。
+seed_keys_only "${config2}"
 before2="$(md5 "${config2}")"
 run_hook --config "${config2}"
 t_exit_ok 0 "${rc}" "退出 0"
@@ -226,6 +317,8 @@ with open(path, "w", encoding="utf-8") as fh:
     fh.write(text)
 PY
 expectedHook="$(expected_cmd "${ROOT_PHYS}" "${WORK}/state")"
+# 同上：键位预先装好（marker），使本用例只观察 tab bar 自愈时的备份内容。
+seed_keys_only "${configNoEnvF}"
 noenv_before="$(md5 "${configNoEnvF}")"
 run_hook --config "${configNoEnvF}"
 t_exit_ok 0 "${rc}" "退出 0"
@@ -259,6 +352,8 @@ t_it "旧格式（\$HERDR_PLUGIN_ROOT 字面量）：hook 自动升级为 env �
 # 旧格式在 tab bar 执行时 env 缺失 → 静默空白；重跑 hook 应自愈。
 configLegacy="${WORK}/legacy.toml"
 inject_legacy_entry "${configLegacy}"
+# 同上：键位预先装好，隔离 tab bar 自愈用例的变量。
+seed_keys_only "${configLegacy}"
 legacy_before="$(md5 "${configLegacy}")"
 run_hook --config "${configLegacy}"
 t_exit_ok 0 "${rc}" "退出 0"
@@ -451,6 +546,8 @@ setup_m3_sandbox() {
   mkdir -p "${SANDBOX}/scripts" "${SANDBOX}/lib" "${SANDBOX}/bin" "${M3_STATE}" "${WORK}/m3"
   cp "${ROOT}/scripts/startup-hook.sh" "${SANDBOX}/scripts/startup-hook.sh"
   cp "${ROOT}/scripts/install-tabbar.sh" "${SANDBOX}/scripts/install-tabbar.sh"
+  # autokeys：hook 现在也调 install-keys.sh（同一 scripts/ 目录），沙箱必须齐备
+  cp "${ROOT}/scripts/install-keys.sh" "${SANDBOX}/scripts/install-keys.sh"
   cp "${ROOT}/lib/common.sh" "${SANDBOX}/lib/common.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' >"${SANDBOX}/bin/forward"
   chmod +x "${SANDBOX}/bin/forward"
@@ -676,5 +773,167 @@ else
   t_eq "${real_want}" "${real_got}" \
     "真 machines_activation_load 读出的 active → 写 B 路径（联调点）"
 fi
+
+# ---------------------------------------------------------------------------
+# autokeys（任务 §1/§4）：startup hook 自动装键位
+#
+# 契约：
+#   ① 无键位 → 装 3 条 + 通知（三键位名 / 换键参数 / reload）
+#   ② 已有 marker → 幂等跳过，不写、不备份
+#   ③ 默认键被别的命令占用 → 保守跳过自动装 + 冲突说明（绝不覆盖）
+#   ④ 降级（config 不可写 / 缺 install-keys.sh）恒 exit 0
+#   ⑤ active machine 分支 → tab bar 指 B、键位照装本机 config
+# 全部只写临时副本；真实 ~/.config/herdr 不被触碰。
+# ---------------------------------------------------------------------------
+
+t_describe "startup-hook.sh（autokeys：自动装键位）"
+
+KEYS_WORK="${WORK}/autokeys"
+mkdir -p "${KEYS_WORK}"
+
+# 缺 install-keys.sh 的确定性插件根（验证降级链）
+KEYS_MISSING_SANDBOX=""
+setup_keys_missing_sandbox() {
+  local sb="${WORK}/keys-missing-plugin"
+  rm -rf "${sb}"
+  mkdir -p "${sb}/scripts" "${sb}/lib" "${sb}/bin"
+  cp "${ROOT}/scripts/startup-hook.sh" "${sb}/scripts/startup-hook.sh"
+  cp "${ROOT}/scripts/install-tabbar.sh" "${sb}/scripts/install-tabbar.sh"
+  cp "${ROOT}/lib/common.sh" "${sb}/lib/common.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"${sb}/bin/forward"
+  chmod +x "${sb}/bin/forward"
+  KEYS_MISSING_SANDBOX="${sb}"
+}
+
+t_it "① 无键位 → 自动装 3 条 + 通知（三键位名 / 换键参数 / reload）"
+configK1="${KEYS_WORK}/fresh.toml"
+printf 'theme = "dark"\n' >"${configK1}"
+run_hook --config "${configK1}"
+t_exit_ok 0 "${rc}" "退出 0（startup 契约）"
+assert_keys_count "3" "${configK1}" "自动装好 3 条键位"
+assert_key_is "prefix+f" "${configK1}" "zzjcool:forward.add" "add -> prefix+f"
+assert_key_is "prefix+shift+f" "${configK1}" "zzjcool:forward.list" "list -> prefix+shift+f"
+assert_key_is "prefix+alt+f" "${configK1}" "zzjcool:forward.doctor" "doctor -> prefix+alt+f"
+assert_marker_count "1" "${configK1}" "幂等标记恰好 1 处"
+# 通知进 stdout（plugin log）：三键位名 + 换键参数 + reload 提醒
+t_contains "prefix+f" "${out}" "通知列出 prefix+f"
+t_contains "prefix+shift+f" "${out}" "通知列出 prefix+shift+f"
+t_contains "prefix+alt+f" "${out}" "通知列出 prefix+alt+f"
+t_contains "--add-key" "${out}" "通知说明如何换键（--add-key）"
+t_contains "reload" "${out}" "通知含 reload 提醒"
+# 键位与 tab bar 同文件共存（两段互不干扰）
+assert_tabbar_count "1" "${configK1}" "tab bar 条目也在（两段共存）"
+
+# 幂等：再跑两次仍 3 条、marker 1 处、无新增备份
+keys_before_md5="$(md5 "${configK1}")"
+rm -f "${configK1}".bak.*
+run_hook --config "${configK1}"
+run_hook --config "${configK1}"
+t_exit_ok 0 "${rc}" "重复运行退出 0"
+assert_keys_count "3" "${configK1}" "仍只 3 条"
+assert_marker_count "1" "${configK1}" "标记仍 1 处"
+assert_md5 "${keys_before_md5}" "${configK1}" "重复运行未改文件"
+keys_bak="$(find "${KEYS_WORK}" -maxdepth 1 -name 'fresh.toml.bak.*' -print -quit)"
+t_eq "" "${keys_bak}" "幂等再跑未产生备份"
+
+t_it "② 已有键位（marker）→ 跳过不重复（不写、不备份）"
+configK2="${KEYS_WORK}/present.toml"
+printf 'theme = "dark"\n' >"${configK2}"
+preinstall_ui "${configK2}"
+beforeK2="$(md5 "${configK2}")"
+run_hook --config "${configK2}"
+t_exit_ok 0 "${rc}" "退出 0"
+assert_md5 "${beforeK2}" "${configK2}" "内容未变（marker 命中 → 幂等）"
+assert_keys_count "3" "${configK2}" "仍 3 条（未翻倍）"
+assert_marker_count "1" "${configK2}" "标记仍 1 处"
+bakK2="$(find "${KEYS_WORK}" -maxdepth 1 -name 'present.toml.bak.*' -print -quit)"
+t_eq "" "${bakK2}" "未产生备份"
+
+t_it "③ 默认键被别的命令占用 → 跳过自动装 + 冲突说明（绝不覆盖用户绑定）"
+configK3="${KEYS_WORK}/conflict.toml"
+cat >"${configK3}" <<'EOF'
+theme = "dark"
+
+[[keys.command]]
+key = "prefix+f"
+type = "plugin_action"
+command = "other.plugin.apply"
+description = "foreign"
+EOF
+run_hook --config "${configK3}"
+t_exit_ok 0 "${rc}" "冲突时仍退出 0（startup 不得阻塞 server）"
+assert_keys_count "0" "${configK3}" "未装本插件键位（保守跳过，避免同键叠绑定）"
+assert_key_is "prefix+f" "${configK3}" "other.plugin.apply" "用户已有绑定原样保留"
+# 冲突说明：stdout 通知 + stderr warn 至少一处点名冲突键与「跳过」
+t_contains "prefix+f" "${out}${err}" "说明里点名冲突键 prefix+f"
+t_match "跳过|冲突|occupied|already bound" "${out}${err}" "说明里含跳过/冲突字样"
+t_contains "--add-key" "${out}${err}" "给出换键命令（--add-key）"
+# 冲突键在通知里被明确列出（从 installer 告警文案抽取）
+t_contains "prefix+f" "${out}" "通知列出被占用的键"
+
+t_it "④ 降级：config 目录不可写 → 键位不写，hook 恒 exit 0"
+if [[ "${EUID}" -eq 0 ]]; then
+  t_skip "以 root 运行，chmod 500 无法构造不可写场景"
+else
+  ro_keys_dir="${KEYS_WORK}/ro"
+  mkdir -p "${ro_keys_dir}"
+  chmod 500 "${ro_keys_dir}"
+  run_hook --config "${ro_keys_dir}/config.toml"
+  chmod 700 "${ro_keys_dir}"
+  t_exit_ok 0 "${rc}" "不可写时仍 exit 0"
+  t_file_absent "${ro_keys_dir}/config.toml" "降级未写出 config"
+  t_match "无法|失败|降级|skip|warn|原因|error" "${err}" "有降级提示"
+fi
+
+t_it "④b 降级：缺 install-keys.sh → 键位跳过，tab bar 照装，exit 0"
+setup_keys_missing_sandbox
+configK4="${KEYS_WORK}/missing-installer.toml"
+printf 'theme = "dark"\n' >"${configK4}"
+rc=0
+out="$(env -u HERDR_CONFIG_PATH HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+  HERDR_PLUGIN_ROOT="${KEYS_MISSING_SANDBOX}" HERDR_PLUGIN_STATE_DIR="${WORK}/state" \
+  HERDR_PLUGIN_EVENT=startup \
+  bash "${KEYS_MISSING_SANDBOX}/scripts/startup-hook.sh" --config "${configK4}" 2>"${WORK}/assert-stderr")" || rc=$?
+err="$(cat "${WORK}/assert-stderr" 2>/dev/null || true)"
+t_exit_ok 0 "${rc}" "缺安装器仍 exit 0"
+assert_keys_count "0" "${configK4}" "键位未装（安装器缺失）"
+assert_tabbar_count "1" "${configK4}" "tab bar 仍自动装（两段互不拖累）"
+t_match "install-keys|键位" "${err}" "提示缺 install-keys.sh"
+
+t_it "⑤ active machine（远端 B）→ tab bar 指 B，键位照装本机 config"
+setup_m3_sandbox stub
+write_activation "m-remote" "${REMOTE_RECORD}"
+printf 'theme = "dark"\n' >"${M3_CONFIG}"
+run_hook_m3
+t_exit_ok 0 "${rc}" "退出 0"
+m3k_want="$(expected_cmd "${B_ROOT}" "${B_STATE}")"
+assert_tabbar_cmd "${m3k_want}" "${M3_CONFIG}" "tab bar 仍指向 B（不受键位段影响）"
+assert_keys_count "3" "${M3_CONFIG}" "active machine 下键位照装（本机 config）"
+assert_key_is "prefix+f" "${M3_CONFIG}" "zzjcool:forward.add" "键位 = 默认 prefix+f（不因 active 改路径）"
+assert_marker_count "1" "${M3_CONFIG}" "幂等标记 1 处"
+# 幂等再跑：tab bar 与键位都不变
+m3k_before="$(md5 "${M3_CONFIG}")"
+run_hook_m3
+t_exit_ok 0 "${rc}" "再跑退出 0"
+assert_keys_count "3" "${M3_CONFIG}" "再跑仍 3 条"
+assert_tabbar_cmd "${m3k_want}" "${M3_CONFIG}" "tab bar 不变"
+assert_md5 "${m3k_before}" "${M3_CONFIG}" "再跑整文件未变（两段都幂等）"
+
+t_it "--dry-run：不装键位（只预览）、不落盘"
+configK5="${KEYS_WORK}/dry.toml"
+printf 'theme = "dark"\n' >"${configK5}"
+run_hook --config "${configK5}" --dry-run
+t_exit_ok 0 "${rc}" "dry-run 退出 0"
+assert_keys_count "0" "${configK5}" "dry-run 未写入键位"
+assert_tabbar_count "0" "${configK5}" "dry-run 未写 tab bar"
+bakK5="$(find "${KEYS_WORK}" -maxdepth 1 -name 'dry.toml.bak.*' -print -quit)"
+t_eq "" "${bakK5}" "dry-run 未建备份"
+
+t_it "--help 提及键位与冲突策略（文档防漂移）"
+rc=0
+out="$(bash "${HOOK}" --help 2>/dev/null)" || rc=$?
+t_exit_ok 0 "${rc}" "--help 退出 0"
+t_contains "prefix+f" "${out}" "--help 列出默认键位"
+t_contains "install-keys" "${out}" "--help 提到 install-keys"
 
 t_done
