@@ -266,6 +266,30 @@ in your browser. herdr only recognises URLs that carry a scheme, so the link
 must be written as `http://localhost:3000` — a bare `localhost:3000` will not be
 clickable.
 
+## Troubleshooting
+
+**The panel shows no machines** (the `MACHINES` section is missing or empty)
+while `forward machines list` works in a plain terminal — run the read-only
+field diagnostic and paste its `--json` output into your issue:
+
+```sh
+bash scripts/diagnose-panel.sh          # human-readable report
+bash scripts/diagnose-panel.sh --json   # machine-readable verdict
+```
+
+It prints, without changing anything: `HERDR_BIN_PATH` and the herdr version,
+the raw `machine list --json` output with its exit code, the plugin state dir and
+activation record, `machines_view_json`, the non-interactive panel render, and
+the plugin log tail. Run it **from inside a herdr pane** — the variables herdr
+injects there (`HERDR_PANE_ID`, `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`) are
+exactly what a plain terminal lacks, and that difference is the usual cause.
+
+Saved-machine targets **may be `ssh://user@host:port` URIs** (what `herdr machine
+add` stores), not bare `user@host`. Older builds passed the scheme straight to
+`ssh`, which then failed to resolve the host; the A-machine fixture for that
+shape lives in `tests/unit/test_machines_uri_targets.sh` and the container-side
+`A3` stage of `scripts/e2e/run-inside.sh`.
+
 ## Usage
 
 ```sh
