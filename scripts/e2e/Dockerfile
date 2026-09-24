@@ -15,12 +15,14 @@ FROM docker.io/library/archlinux:latest
 #              socat 的 EXEC:/bin/cat（或 while-read 脚本）fork-per-conn 提供真回显，
 #              即契约 §C.3 里「同容器后台 echo 进程」的可靠落地
 # coreutils/util-linux  timeout/pgrep/ss 等测试原语
+# tmux         run-two-machines.sh 的 UI 阶段：给真 herdr TUI client 当虚拟终端
+#              （send-keys 按键、capture-pane 读屏）
 # shellcheck/shfmt 不用 pacman 版：下方用二进制固定版本覆盖（见注释）
 RUN pacman -Sy --noconfirm \
   openssh jq python openbsd-netcat socat bash coreutils util-linux \
-  iproute2 \
+  iproute2 tmux \
   && pacman -Scc --noconfirm \
-  && command -v jq nc socat sshd ssh-keygen bash python3
+  && command -v jq nc socat sshd ssh-keygen bash python3 tmux
 
 # shellcheck 与 shfmt 用二进制固定版本覆盖 pacman 版：
 # pacman 的 shfmt 是滚动更新（实测 3.14.x），与宿主/开发者常用 3.10 对同一构造

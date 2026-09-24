@@ -171,6 +171,20 @@ else
   指引：安装并启动 docker，或安装 bubblewrap（bwrap）；两者都没有时 E2E 无法闭环。"
 fi
 
+# 5b：两机远程开发 E2E（ARCHITECTURE §A.3.3）—— 两个容器各跑真 herdr + 真 sshd。
+# 需要 docker 与容器内可跑的宿主 herdr（§C.4 模式 A）；脚本以 127 表示前置条件不满足，
+# 此时显式 WARN 跳过（远程开发的数据面仍由 integration 层的 test_bridge_roundtrip 覆盖）。
+if [[ "${E2E_PATH}" == "docker" && -f scripts/e2e/run-two-machines.sh ]]; then
+  echo "   两机远程开发 E2E：scripts/e2e/run-two-machines.sh"
+  two_rc=0
+  bash scripts/e2e/run-two-machines.sh || two_rc=$?
+  if [[ "${two_rc}" -eq 127 ]]; then
+    warn "两机 E2E 前置条件不满足（无宿主 herdr 或其在容器内跑不起来），已显式跳过"
+  elif [[ "${two_rc}" -ne 0 ]]; then
+    fail "两机远程开发 E2E 失败（rc=${two_rc}）"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 6/6 e2e 完整性哨兵 + 红线检查
 # ---------------------------------------------------------------------------
@@ -250,7 +264,7 @@ redline_herdr_env() { # 返回 0 = 命中红线
 }
 
 E2E_SCRIPTS=()
-for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh scripts/e2e/run-inside.sh scripts/e2e/Dockerfile; do
+for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh scripts/e2e/run-inside.sh scripts/e2e/Dockerfile scripts/e2e/run-two-machines.sh; do
   [[ -f "${f}" ]] && E2E_SCRIPTS+=("${f}")
 done
 
@@ -265,18 +279,18 @@ redline_probe() { # redline_probe <check_fn> <file> <msg>
   return 0
 }
 
-for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh; do
+for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh scripts/e2e/run-two-machines.sh; do
   redline_probe redline_home_mount "${f}" "mount/bind 参数疑似挂载真实 \$HOME（§C.2.1）"
 done
-for f in scripts/e2e/run-docker.sh scripts/e2e/run-inside.sh scripts/e2e/Dockerfile; do
+for f in scripts/e2e/run-docker.sh scripts/e2e/run-inside.sh scripts/e2e/Dockerfile scripts/e2e/run-two-machines.sh; do
   redline_probe redline_publish "${f}" "出现 --publish/-p/EXPOSE，容器不得发布端口（§C.2.5）"
 done
-for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh; do
+for f in scripts/e2e/run-docker.sh scripts/e2e/run-bwrap.sh scripts/e2e/run-two-machines.sh; do
   redline_probe redline_host_net "${f}" "使用 host 网络（§C.2.5）"
 done
 redline_probe redline_bwrap_netns scripts/e2e/run-bwrap.sh \
   "bwrap 调用缺少 --unshare-net（§C.2.5）"
-for f in scripts/e2e/run-inside.sh scripts/e2e/run-bwrap.sh; do
+for f in scripts/e2e/run-inside.sh scripts/e2e/run-bwrap.sh scripts/e2e/run-two-machines.sh; do
   redline_probe redline_herdr_env "${f}" \
     "引用 herdr 但未 unset HERDR_SOCKET_PATH（会连到宿主真实 server；§C.2 + SCOUT-FACTS §1.1）"
 done
