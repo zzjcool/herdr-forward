@@ -279,6 +279,20 @@ Ctrl+click（SGR 1006 鼠标序列）在 A 上打开 → 断网重连 → A 的 
 - LISTENING 曾列出绑在 127.0.0.11（容器 DNS）等非 127.0.0.1 地址上的端口，经 localhost 连不到
   → 只列 127.0.0.1 / ::1 / 通配地址。
 
+**真实用户反馈后补的（`scripts/e2e/run-real-install.sh` 用真 GitHub 安装复现，先红后绿）**：
+- startup hook 只在 server 启动时跑（install / link / enable / reload 都不触发），往**正在运行**
+  的 herdr 里装插件后 prefix+f 毫无反应 → manifest 加 `[[build]]`（`scripts/postinstall.sh`）：
+  install 时写入键位并 `herdr server reload-config`（键位先于注册写入并重载是安全的：按键时才
+  解析 action，隔离 herdr 实测）；恒 exit 0，不挡 install；tab bar 仍由 startup hook 负责
+  （build 跑在注册之前，路径未必是最终位置）。
+- 面板里按 Enter 会直接关掉面板（`read -n 1` 读到的回车是空串，被当成 EOF）→ 只有真正的 EOF
+  才退出。
+- 还没有 saved machine 时面板只剩一句「machine list 可能失败」→ 区分「herdr 成功返回空列表」
+  （引导 `herdr machine add`）与真失败（保留排障提示，带 rc）。
+- 两层回归：容器 E2E 照搬用户键位（prefix = ctrl+space、reload = prefix+q）并按「先开 herdr、
+  再装插件」的顺序走；`run-real-install.sh`（opt-in 出网，HERDR_E2E_ONLINE=1）在本机隔离 HOME
+  里做真实的 GitHub 安装与原地升级。
+
 ### A.4 herdr-plugin.toml 冻结声明（开工时填入）
 
 ```toml

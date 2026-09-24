@@ -67,11 +67,16 @@ setups:
 ./scripts/bootstrap.sh --dry-run  # preview first, writes nothing
 ```
 
-**A. `herdr plugin install` → reload → done (the common case).** Plugin install
-is the only install step. If your herdr server and your herdr client run on the
-same machine (the common local case), the plugin's `[[startup]]` hook runs
-`scripts/startup-hook.sh` once the server is up and **automatically** installs
-both UI pieces:
+**A. `herdr plugin install` → done (the common case).** Plugin install is the
+only install step, and you do not need to restart herdr: the plugin's `[[build]]`
+step (`scripts/postinstall.sh`, listed in the install preview) writes the three
+keybindings and runs `herdr server reload-config`, so `prefix+f` works in the
+herdr you already have open. (`[[startup]]` hooks only run when a herdr server
+starts — not on install, link, enable or reload — so without this step a fresh
+install would have no keys until the next restart.) If your herdr server and
+your herdr client run on the same machine (the common local case), the plugin's
+`[[startup]]` hook then runs `scripts/startup-hook.sh` whenever the server starts
+and **automatically** installs both UI pieces:
 
 - the **tab bar status entry**, and
 - the **three keybindings** — `prefix+f` (Port Forward panel), `prefix+shift+f`
