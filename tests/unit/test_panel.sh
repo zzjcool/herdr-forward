@@ -40,6 +40,9 @@ PLUGIN_ROOT="${WORK}/plugin"
 STATE_DIR="${WORK}/state"
 FAKE_BIN="${WORK}/fakebin"
 HARNESS="${WORK}/harness.sh"
+# tput 调用留痕（断言 _panel_clear 不再 fork tput）：shim 写这里，测试尾部读它
+tput_log="${WORK}/tput.log"
+: >"${tput_log}"
 
 # 事实 #1 schema 的最小 machine list（fake herdr CLI 输出）。
 # 注意：真 herdr machine list --json 的字段是 "target"（非 ssh_target），
@@ -97,7 +100,14 @@ EOF
 #!/usr/bin/env bash
 printf 'FWD %s\n' "$*"
 EOF
-  chmod +x "${FAKE_BIN}/watch" "${FAKE_BIN}/herdr" "${FAKE_BIN}/forward"
+  # fake tput：任何一次调用都留痕（PATH 前置，遮住 /usr/bin/tput）。
+  # panel 修复的目标之一就是「每帧不再 fork tput」——这个 shim 就是行为级哨兵。
+  cat >"${FAKE_BIN}/tput" <<'EOF'
+#!/usr/bin/env bash
+printf 'tput %s\n' "$*" >>"${HF_TPUT_LOG:-/dev/null}"
+exit 0
+EOF
+  chmod +x "${FAKE_BIN}/watch" "${FAKE_BIN}/herdr" "${FAKE_BIN}/forward" "${FAKE_BIN}/tput"
 }
 
 # --- 捕获（可指定 stdin 文件） ---
@@ -116,6 +126,7 @@ _cap() { # _cap <stdin-file> <cmd...>
 
 # _pl_run <stdin-file> <code-string>：在确定性 env 下跑 panel 子进程
 # （timeout 兜底：任何挂死都变成可诊断的 rc，不会拖死 CI）。
+# HF_HERDR_BIN 可覆盖 HERDR_BIN_PATH（诊断用例需要「未设置」形态）。
 _pl_run() {
   local input="${1-}"
   local code="${2-}"
@@ -124,13 +135,39 @@ _pl_run() {
   _cap "${input}" env \
     HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" \
     HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
-    HERDR_BIN_PATH="${FAKE_BIN}/herdr" \
+    HERDR_BIN_PATH="${HF_HERDR_BIN:-${FAKE_BIN}/herdr}" \
     HF_FAKE_MACHINES="${HF_FAKE_MACHINES:-${DEFAULT_MACHINES}}" \
     HF_VIEW_FILE="${HF_VIEW_FILE:-}" \
     HF_KEY="${HF_KEY:-}" \
+    HF_TPUT_LOG="${tput_log}" \
     PANEL_REFRESH_S=1 \
     PATH="${FAKE_BIN}:${PATH}" \
     timeout 20 bash "${HARNESS}" "${PLUGIN_ROOT}" "${code_file}"
+}
+
+# _pl_run_nobin <stdin-file> <code-string>：同 _pl_run 但**不设** HERDR_BIN_PATH
+# （Bug 2 诊断用例：``缺 HERDR_BIN_PATH → 纯省略无提示'' 的前提）
+_pl_run_nobin() {
+  local input="${1-}"
+  local code="${2-}"
+  local code_file="${WORK}/code.sh"
+  printf '%s\n' "${code}" >"${code_file}"
+  _cap "${input}" env -u HERDR_BIN_PATH \
+    HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" \
+    HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
+    HF_HERDR_SHIM="" \
+    HF_KEY="${HF_KEY:-}" \
+    HF_TPUT_LOG="${tput_log}" \
+    PANEL_REFRESH_S=1 \
+    PATH="${FAKE_BIN}:${PATH}" \
+    timeout 20 bash "${HARNESS}" "${PLUGIN_ROOT}" "${code_file}"
+}
+
+# _assert_nseq <expected-count> <needle> <haystack> <msg>：次数断言（先落变量，避开 SC2312）
+_assert_nseq() {
+  local n=""
+  n="$(_nseq "${2-}" "${3-}")"
+  t_eq "${1-}" "${n}" "${4-}"
 }
 
 # _assert_absent <needle> <haystack> <msg>
@@ -147,6 +184,58 @@ _line_of() { printf '%s\n' "${1-}" | grep -F -- "${2-}" | head -1 || true; }
 
 # _count <needle> <haystack>
 _count() { printf '%s\n' "${2-}" | grep -c -F -- "${1-}" || true; }
+
+# _nseq <needle> <haystack>：出现**次数**（grep -o 逐次计数，不受「同一行多次」影响）。
+# 控制序列与正文常写在同一行，_count 会把它们算成 1 行，故终端序列断言必须用这个。
+_nseq() {
+  local n=""
+  n="$(printf '%s' "${2-}" | grep -o -F -- "${1-}" 2>/dev/null | wc -l || true)"
+  n="${n//[[:space:]]/}"
+  printf '%s\n' "${n:-0}"
+}
+
+# _ord <needle> <haystack>：needle 首次出现的字节偏移（无则空）
+_ord() {
+  local off=""
+  off="$(printf '%s' "${2-}" | grep -abo -F -- "${1-}" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  printf '%s\n' "${off:-}"
+}
+
+# _assert_order <needle-a> <needle-b> <haystack> <msg>：断言 a 在 b 之前出现
+_assert_order() {
+  local oa="" ob=""
+  oa="$(_ord "${1-}" "${3-}")"
+  ob="$(_ord "${2-}" "${3-}")"
+  if [[ -n "${oa}" && -n "${ob}" && "${oa}" -lt "${ob}" ]]; then
+    t_pass "${4-}"
+  else
+    t_fail_note "${4-}（顺序断言失败：前@${oa:-?} 后@${ob:-?}）"
+  fi
+}
+
+# assert_clear_sequence：清屏序列必须能真正抹掉旧帧
+#   要么 `\033[2J`（整屏）、要么 `\033[H\033[J`（home + 清到尾）—— 任一即可，
+#   但必须至少出现一个「抹除」序列，否则行数变少时旧帧会留残影。
+assert_clear_sequence() {
+  local msg="${1:-清屏序列含抹除指令}"
+  local clr="${SEQ_CLR}"
+  local combined="${SEQ_HOME}${SEQ_ERASE_TAIL}"
+
+  if [[ "${out}" == *"${clr}"* ]]; then
+    t_pass "${msg}（\\033[2J）"
+  elif [[ "${out}" == *"${combined}"* ]]; then
+    t_pass "${msg}（\\033[H\\033[J）"
+  else
+    local shown=""
+    shown="$(printf '%s' "${out}" | cat -v)"
+    t_fail_note "${msg}：输出里既无 \\033[2J 也无 \\033[H\\033[J（实际：${shown}）"
+  fi
+}
+
+# assert_plain_clear_emitted [msg]：TERM 未设路径下的宽松版（只看有抹除类序列）
+assert_plain_clear_emitted() {
+  assert_clear_sequence "${1:-TERM 未设时清屏仍可用}"
+}
 
 DIM="$(printf '\033[2m')"
 
@@ -235,6 +324,52 @@ _pl_run /dev/null "panel_render"
 t_exit_ok 0 "${rc}" "有 saved machines 无状态文件 exit 0"
 t_contains "[ ] 1. test-probe" "${out}" "未激活置灰行（来自 herdr list 透传）"
 t_contains "FORWARDS" "${out}" "forwards 段仍在"
+
+t_describe "lib/panel.sh：machines 段省略时的诊断提示（Bug 2）"
+
+# 为什么需要它：machines_herdr_list_json 的 warn 只进日志文件，用户在面板里看不到。
+# 面板是唯一入口，段位静默消失 = 用户无从知道是「真的没配」还是「herdr 命令挂了」。
+# 提示文本必须给出可直接复制排障的命令，否则用户还是只能猜。
+t_it "空列表 + HERDR_BIN_PATH 已设 → 追加灰字提示行"
+stage
+HF_FAKE_MACHINES="[]"
+_pl_run /dev/null "panel_render"
+t_exit_ok 0 "${rc}" "exit 0（提示不得让面板失败）"
+hint_line="$(_line_of "${out}" "未列出 saved machines")"
+t_contains "未列出 saved machines" "${out}" "提示行出现"
+_assert_absent "MACHINES (" "${out}" "仍不渲染 machines 段（省略不变）"
+t_contains "${DIM}" "${hint_line}" "提示行置灰"
+t_contains "machine list --json" "${hint_line}" "提示给出可复制跳命令"
+t_contains "${FAKE_BIN}/herdr" "${hint_line}" "提示里代入真实 HERDR_BIN_PATH"
+unset HF_FAKE_MACHINES
+
+t_it "HERDR_BIN_PATH 缺失 → 纯省略，不加提示（未在插件运行时里）"
+stage
+_pl_run_nobin /dev/null "panel_render"
+t_exit_ok 0 "${rc}" "exit 0"
+_assert_absent "未列出 saved machines" "${out}" "无 HERDR_BIN_PATH 时不吓人"
+_assert_absent "MACHINES (" "${out}" "machines 段仍省略"
+t_contains "FORWARDS" "${out}" "forwards 段仍在（面板可用）"
+
+t_it "有 saved machines 时不加提示（避免了狼来了）"
+stage
+_pl_run /dev/null "panel_render"
+t_exit_ok 0 "${rc}" "exit 0"
+t_contains "MACHINES (" "${out}" "machines 段正常渲染"
+_assert_absent "未列出 saved machines" "${out}" "有机器时不提示"
+
+t_it "herdr list 失败（rc=7）+ HERDR_BIN_PATH 已设 → 提示行出现"
+stage
+cat >"${FAKE_BIN}/herdr" <<'EOF'
+#!/usr/bin/env bash
+echo 'herdr: server not running' >&2
+exit 7
+EOF
+chmod +x "${FAKE_BIN}/herdr"
+_pl_run /dev/null "panel_render"
+t_exit_ok 0 "${rc}" "herdr 挂掉也不拖趴面板"
+t_contains "未列出 saved machines" "${out}" "失败时也给提示（用户可见）"
+t_contains "FORWARDS" "${out}" "forwards 段仍正常（面板可用优先）"
 
 t_it "local（同机短路激活）行：也是 [✓] + 不置灰 + 本机说明"
 VIEW_LOCAL="${WORK}/view-local-render.json"
@@ -483,6 +618,244 @@ _pl_run /dev/null "${SNIP_PROBE_REAL}"
 t_exit_ok 0 "${rc}" "exit 0"
 t_contains "machines activate m1" "${out}" "走 ${PLUGIN_ROOT}/bin/forward"
 
+t_describe "lib/panel.sh：终端序列（备用屏 + 光标隐藏，Bug 1 抖动修复）"
+
+# 终端控制序列常量（与 lib/panel.sh 的实现必须逐字一致）。
+# 用 $'...' 直接构造（不再套 $(printf '%b')）：避免嵌套命令替换（SC2312），
+# 也让断言里的字面量一眼可读。
+SEQ_ALT_ON=$'\033[?1049h'   # 进备用屏
+SEQ_ALT_OFF=$'\033[?1049l'  # 出备用屏
+SEQ_CUR_HIDE=$'\033[?25l'   # 隐藏光标
+SEQ_CUR_SHOW=$'\033[?25h'   # 显示光标
+SEQ_SAVE=$'\033[22;0;0t'    # 保存光标
+SEQ_RESTORE=$'\033[23;0;0t' # 恢复光标
+SEQ_HOME=$'\033[H'          # 光标 home
+SEQ_CLR=$'\033[2J'          # 整屏清除
+SEQ_ERASE_TAIL=$'\033[J'    # 清到屏幕末尾
+
+# --- 终端序列用例的公共片段 ---
+# 为什么要 stub _panel_probe_stdout_tty：单测的 stdout 被 _cap 捕获（是管道），
+# 真实的 [[ -t 1 ]] 会是假 —— 必须把这个 I/O 缝打开，否则测不到序列。
+# （该缝是**退出码式**：return 0 = stdout 是 tty；若写成 printf 'yes'，
+#  命令替换重定向 stdout 会让 [[ -t 1 ]] 永远为假 —— 实测踩过。）
+# panel_is_tty（stdin 缝）同样 stub，因为测试用文件喂 stdin。
+read -r -d '' SNIP_SEQ_MAIN <<'CODE' || true
+panel_is_tty() { printf 'yes\n'; }
+_panel_probe_stdout_tty() { _PANEL_OUT_TTY=yes; return 0; }
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+panel_render() { printf 'RENDER\n'; }
+panel_main
+CODE
+
+# _seq_assert_pair <msg>：断言四类序列各只一次，且上/下屏与隐/显光标成对出现
+_seq_assert_pair() {
+  local msg="${1:-}"
+  local n_on="" n_off="" n_hide="" n_show=""
+  n_on="$(_nseq "${SEQ_ALT_ON}" "${out}")"
+  n_off="$(_nseq "${SEQ_ALT_OFF}" "${out}")"
+  n_hide="$(_nseq "${SEQ_CUR_HIDE}" "${out}")"
+  n_show="$(_nseq "${SEQ_CUR_SHOW}" "${out}")"
+  t_eq "1" "${n_on}" "${msg}：上屏只发一次"
+  t_eq "1" "${n_off}" "${msg}：下屏只发一次"
+  t_eq "1" "${n_hide}" "${msg}：隐藏光标只发一次"
+  t_eq "1" "${n_show}" "${msg}：显示光标只发一次"
+  _assert_order "${SEQ_ALT_ON}" "${SEQ_ALT_OFF}" "${out}" "${msg}：上屏在下屏之前（配对）"
+  _assert_order "${SEQ_CUR_HIDE}" "${SEQ_CUR_SHOW}" "${out}" "${msg}：隐藏光标在显示光标之前（配对）"
+}
+
+t_it "panel_main 进入时发上屏序列；退出时（EOF）发下屏序列，且成对"
+stage
+_pl_run /dev/null "${SNIP_SEQ_MAIN}"
+t_exit_ok 0 "${rc}" "EOF 退出 0"
+t_contains "${SEQ_ALT_ON}" "${out}" "进入备用屏（\\033[?1049h）"
+t_contains "${SEQ_CUR_HIDE}" "${out}" "隐藏光标（\\033[?25l）"
+t_contains "${SEQ_SAVE}" "${out}" "保存光标（\\033[22;0;0t）"
+t_contains "${SEQ_CUR_SHOW}" "${out}" "恢复光标可见（\\033[?25h）"
+t_contains "${SEQ_RESTORE}" "${out}" "恢复光标（\\033[23;0;0t）"
+t_contains "${SEQ_ALT_OFF}" "${out}" "退出备用屏（\\033[?1049l）"
+_seq_assert_pair "EOF 路径"
+
+# 上屏必须先于第一帧渲染（否则第一帧会画在旧屏上）。
+t_it "上屏序列先于第一帧渲染（不先画后切屏）"
+stage
+_pl_run /dev/null "${SNIP_SEQ_MAIN}"
+_assert_order "${SEQ_ALT_ON}" "RENDER" "${out}" "备用屏先于首帧"
+_assert_order "${SEQ_SAVE}" "RENDER" "${out}" "保存光标先于首帧"
+_assert_order "${SEQ_CUR_HIDE}" "RENDER" "${out}" "隐藏光标先于首帧"
+
+# x 退出（quit 路径）也必须恢复终端。
+t_it "x 退出路径也恢复终端（quit 与 EOF 同样经 trap EXIT）"
+stage
+printf 'x' >"${WORK}/in-x-seq"
+_pl_run "${WORK}/in-x-seq" "${SNIP_SEQ_MAIN}"
+t_exit_ok 0 "${rc}" "x 退出 0"
+_seq_assert_pair "x 退出路径"
+
+# 异常（set -e 下的非零退出）也必须经 trap EXIT 恢复。
+t_it "异常退出（内部 die）也恢复终端（trap EXIT 覆盖所有 return 路径）"
+stage
+read -r -d '' SNIP_SEQ_DIE <<'CODE' || true
+panel_is_tty() { printf 'yes\n'; }
+_panel_probe_stdout_tty() { _PANEL_OUT_TTY=yes; return 0; }
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+panel_render() { printf 'RENDER\n'; exit 3; }
+panel_main
+CODE
+set +o errexit
+_pl_run /dev/null "${SNIP_SEQ_DIE}"
+set -o errexit
+t_exit_ok 3 "${rc}" "panel_render 里的 exit 3 透传"
+t_contains "${SEQ_ALT_OFF}" "${out}" "异常退出也退出备用屏"
+t_contains "${SEQ_CUR_SHOW}" "${out}" "异常退出也恢复光标"
+_assert_nseq 1 "${SEQ_ALT_OFF}" "${out}" "异常路径下屏不重复"
+
+# 非 TTY：一个控制序列都不许发（现有契约：管道/文件拿到的仍是纯文本）。
+t_it "非 TTY（stdin 非终端）时不发任何终端序列（现有契约）"
+stage
+read -r -d '' SNIP_SEQ_NOTTY <<'CODE' || true
+panel_is_tty() { return 0; }
+_panel_probe_stdout_tty() { _PANEL_OUT_TTY=yes; return 0; }
+set +o errexit
+panel_main
+_mrc=$?
+set -o errexit
+printf 'MAIN-RC=%s\n' "${_mrc}"
+CODE
+_pl_run /dev/null "${SNIP_SEQ_NOTTY}"
+t_exit_ok 0 "${rc}" "非 TTY 不报错"
+t_contains "MAIN-RC=1" "${out}" "panel_main 返回 1（cmd_watch 退化信号）"
+_assert_absent "${SEQ_ALT_ON}" "${out}" "非 TTY 不发上屏"
+_assert_absent "${SEQ_ALT_OFF}" "${out}" "非 TTY 不发下屏"
+_assert_absent "${SEQ_CUR_HIDE}" "${out}" "非 TTY 不发隐藏光标"
+_assert_absent "${SEQ_CUR_SHOW}" "${out}" "非 TTY 不发显示光标"
+
+# stdout 非终端（管道）时也不发序列：否则重定向到文件会写进一堆控制字符。
+t_it "stdout 非终端时不发任何终端序列（重定向/管道契约）"
+stage
+read -r -d '' SNIP_SEQ_OUTPIPE <<'CODE' || true
+panel_is_tty() { printf 'yes\n'; }
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+panel_render() { printf 'RENDER\n'; }
+panel_main
+CODE
+_pl_run /dev/null "${SNIP_SEQ_OUTPIPE}"
+t_exit_ok 0 "${rc}" "exit 0"
+t_contains "RENDER" "${out}" "仍正常渲染"
+_assert_absent "${SEQ_ALT_ON}" "${out}" "stdout 非 tty 不发上屏"
+_assert_absent "${SEQ_ALT_OFF}" "${out}" "stdout 非 tty 不发下屏"
+
+# 无 TERM 也不能挂（本机 TERM 未设时 tput 会直接失败 rc=2）。
+t_it "TERM 未设时不挂：上/下屏与清屏均正常（纯 printf 不依赖 terminfo）"
+stage
+read -r -d '' SNIP_SEQ_NOTERM <<'CODE' || true
+panel_is_tty() { printf 'yes\n'; }
+_panel_probe_stdout_tty() { _PANEL_OUT_TTY=yes; return 0; }
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+panel_render() { printf 'RENDER\n'; }
+panel_main
+CODE
+printf '%s\n' "${SNIP_SEQ_NOTERM}" >"${WORK}/noterm-code.sh"
+printf 'x' >"${WORK}/in-x-noterm"
+set +o errexit
+out="$(env -u TERM HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
+  HERDR_BIN_PATH="${FAKE_BIN}/herdr" HF_VIEW_FILE="${VIEW_3}" HF_TPUT_LOG="${tput_log}" \
+  PANEL_REFRESH_S=1 PATH="${FAKE_BIN}:${PATH}" \
+  timeout 20 bash "${HARNESS}" "${PLUGIN_ROOT}" "${WORK}/noterm-code.sh" <"${WORK}/in-x-noterm" 2>/dev/null)"
+rc=$?
+set -o errexit
+t_exit_ok 0 "${rc}" "TERM 未设仍 exit 0（不挂、不崩）"
+t_contains "RENDER" "${out}" "TERM 未设仍能渲染"
+t_contains "${SEQ_ALT_ON}" "${out}" "TERM 未设仍发上屏（ANSI 不依赖 terminfo）"
+t_contains "${SEQ_ALT_OFF}" "${out}" "TERM 未设仍发下屏"
+_seq_assert_pair "TERM 未设"
+
+t_describe "lib/panel.sh：_panel_clear 与帧缓冲（Bug 1 抖动修复）"
+
+# _panel_clear 的核心修复：不再每帧 fork tput（两帧/3s = 每秒 2 个进程）。
+# 行为断言的关键：单测里 stdout 不是 tty（被 _cap 捕获），所以必须用 stdout-tty 缝
+# （_panel_probe_stdout_tty）把清屏分支打开；否则 _panel_clear 直接 return，测了个寂寞。
+t_it "_panel_clear 用纯 printf（stdout 是 tty 时零 tput fork）"
+stage
+: >"${tput_log}"
+read -r -d '' SNIP_CLEAR_TTY <<'CODE' || true
+_panel_probe_stdout_tty() { _PANEL_OUT_TTY=yes; return 0; }
+_panel_clear
+CODE
+_pl_run /dev/null "${SNIP_CLEAR_TTY}"
+t_exit_ok 0 "${rc}" "_panel_clear exit 0"
+if [[ -s "${tput_log}" ]]; then
+  _tlog="$(tr '\n' ';' <"${tput_log}")"
+  t_fail_note "_panel_clear 仍 fork tput（tput.log: ${_tlog}）"
+else
+  t_pass "_panel_clear 不再 fork tput（零子进程）"
+fi
+t_contains "${SEQ_HOME}" "${out}" "清屏发光标 home（\\033[H）"
+assert_clear_sequence
+
+# 行为断言：PATH 里完全没有 tput（也没有 TERM）时，清屏仍必须工作（ANSI 不靠 terminfo）。
+t_it "PATH 无 tput（且无 TERM）时仍正常清屏（行为级）"
+stage
+# 构造「除 tput 外都有」的 PATH：逐项 symlink /usr/bin，跳过 tput / busybox。
+# 比手写白名单稳健（common.sh 会用到哪些命令不由本测试锁定）。
+mkdir -p "${WORK}/no-tput-bin"
+rm -f "${WORK}/no-tput-bin"/*
+for _bin in /usr/bin/* /bin/*; do
+  [[ -e "${_bin}" ]] || continue
+  _base="$(basename "${_bin}")"
+  [[ "${_base}" == "tput" ]] && continue
+  ln -sf "${_bin}" "${WORK}/no-tput-bin/${_base}" 2>/dev/null || true
+done
+printf '%s\n' "${SNIP_CLEAR_TTY}" >"${WORK}/clear-code.sh"
+set +o errexit
+out="$(env -u TERM HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
+  PATH="${WORK}/no-tput-bin" \
+  timeout 20 bash "${HARNESS}" "${PLUGIN_ROOT}" "${WORK}/clear-code.sh" 2>/dev/null)"
+rc=$?
+set -o errexit
+if [[ -x "${WORK}/no-tput-bin/tput" ]]; then
+  t_fail_note "no-tput-bin 里居然有 tput（用例前提被破坏）"
+else
+  t_pass "测试 PATH 里确实没有 tput"
+fi
+t_exit_ok 0 "${rc}" "无 tput 的 PATH 下 exit 0（不挂）"
+t_contains "${SEQ_HOME}" "${out}" "无 tput 也发了清屏序列"
+assert_clear_sequence
+
+# 帧缓冲（双缓冲思想）：整帧在变量里拼好、单次输出，避免行间输出与清屏交错
+t_it "panel_render 整帧单次输出（_panel_flush 只调一次）"
+stage
+VIEW_FRAME="${WORK}/view-frame.json"
+printf '%s\n' '[{"id":"m1","label":"aa","target":"t@h:22","enabled":true,"state":"inactive"},{"id":"m2","label":"bb","target":"t2@h:22","enabled":true,"state":"active"}]' >"${VIEW_FRAME}"
+read -r -d '' SNIP_FRAME <<'CODE' || true
+machines_view_json() { cat "${HF_VIEW_FILE}"; }
+flush_count=0
+note_count=0
+_panel_flush() { flush_count=$((flush_count + 1)); printf '%s' "${PANEL_FRAME}"; }
+_panel_note() { note_count=$((note_count + 1)); printf '%s\n' "$*"; }
+panel_render
+printf 'FLUSH=%s\n' "${flush_count}"
+printf 'NOTE=%s\n' "${note_count}"
+CODE
+HF_VIEW_FILE="${VIEW_FRAME}"
+_pl_run /dev/null "${SNIP_FRAME}"
+t_exit_ok 0 "${rc}" "panel_render exit 0"
+t_contains "FLUSH=1" "${out}" "整帧只 flush 一次（不是逐行输出）"
+t_contains "NOTE=0" "${out}" "panel_render 不直接调 _panel_note（无行间 I/O 交错）"
+t_contains "FORWARDS" "${out}" "帧内容完整（forwards 段）"
+t_contains "MACHINES (2)" "${out}" "帧内容完整（machines 段）"
+t_contains "[ ] 1. aa" "${out}" "帧内容完整（未激活行）"
+t_contains "[✓] 2. bb" "${out}" "帧内容完整（active 行）"
+
+# 实时状态行（_panel_note）必须仍立即落屏：SSH 探测最长 15s，不能等到帧刷完才显示。
+t_it "_panel_note 仍直接落屏（探测中占位不能等帧 flush）"
+stage
+read -r -d '' SNIP_NOTE <<'CODE' || true
+_panel_note "LIVE-LINE"
+CODE
+_pl_run /dev/null "${SNIP_NOTE}"
+t_exit_ok 0 "${rc}" "exit 0"
+t_contains "LIVE-LINE" "${out}" "_panel_note 立即输出（不经帧缓冲）"
+
 t_describe "cmd_watch：TTY 分流（非 TTY 退化为旧 watch，E2E 兼容）"
 
 t_it "stdin 非 TTY → exec watch -n 3 forward list（现有行为不变）"
@@ -545,8 +918,8 @@ EOF
   set -o errexit
 
   plain=""
-  # 剥 ANSI / CR，得到人可读的交互轨迹
-  plain="$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//' "${pty_out}" 2>/dev/null || true)"
+  # 剥 ANSI / CR，得到人可读的交互轨迹（含 `?` 形式的 DEC 私有序列）
+  plain="$(sed $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g; s/\r//' "${pty_out}" 2>/dev/null || true)"
   # 为什么真 pty（而不是继续 stub）：单测里 panel_confirm / panel_render 都被替换，
   # 而「终端下 line-read 会等回车」这类 UX 坑只在真 tty 里出现（本用例就是它的闸门）。
   t_contains "继续? [y/N]" "${plain}" "面板用真 pty 渲染并弹出确认提示"
@@ -558,6 +931,55 @@ EOF
     t_pass "pty 会话退出 0（无挂死、无 timeout 杀）"
   else
     t_fail_note "pty 会话非零退出（rc=${pty_rc}）；见 ${pty_out}"
+  fi
+
+  # --- 真 pty 下的终端序列审计（Bug 1 的核心闸门） ---
+  # 这是整个修复最直接的证据：在**真实终端**里，上/下屏、光标隐藏各只能发生一次。
+  _raw="$(cat "${pty_out}")"
+  # _assert_cnt <expected> <needle> <msg>：在**未剥 ANSI 的原始 pty 输出**里数出现次数
+  # （内部赋值，避免 SC2312）
+  _assert_cnt() {
+    local n=""
+    n="$(_nseq "${2-}" "${_raw}")"
+    t_eq "${1-}" "${n}" "${3-}"
+  }
+  _assert_cnt 1 "${SEQ_ALT_ON}" "pty: 进入备用屏恰好一次"
+  _assert_cnt 1 "${SEQ_ALT_OFF}" "pty: 退出备用屏恰好一次（会话结束已恢复）"
+  _assert_cnt 1 "${SEQ_CUR_HIDE}" "pty: 隐藏光标恰好一次"
+  _assert_cnt 1 "${SEQ_CUR_SHOW}" "pty: 显示光标恰好一次"
+  _assert_order "${SEQ_ALT_ON}" "${SEQ_ALT_OFF}" "${_raw}" "pty: 上屏在下屏之前"
+  _assert_order "${SEQ_CUR_HIDE}" "${SEQ_CUR_SHOW}" "${_raw}" "pty: 隐藏光标在显示光标之前"
+
+  # 闪烁滥用审计：每帧只允许 `\033[H` + 一个抹除序列，
+  # 不得出现「裸 \033[2J（无 home）」「\033[K 擦行」「\033[?25 以外の光标控制」。
+  _home_clr="${SEQ_HOME}${SEQ_CLR}"
+  _home_erase="${SEQ_HOME}${SEQ_ERASE_TAIL}"
+  _n_clr="$(_nseq "${SEQ_CLR}" "${_raw}")"
+  _n_home_clr="$(_nseq "${_home_clr}" "${_raw}")"
+  _n_home_erase="$(_nseq "${_home_erase}" "${_raw}")"
+  _n_home="$(_nseq "${SEQ_HOME}" "${_raw}")"
+  if [[ "${_n_clr}" == "$((_n_home_clr + _n_home_erase))" ]]; then
+    t_pass "pty: 无裸 \\033[2J（每次抹除都紧跟 home：home+2J 或 home+J）"
+  else
+    t_fail_note "pty: 抹除序列与 home 不配对（2J=${_n_clr} home+2J=${_n_home_clr} home+J=${_n_home_erase}）"
+  fi
+  if [[ "${_n_home}" -ge 1 && "${_n_home}" == "${_n_clr}" ]]; then
+    t_pass "pty: home 与抹除一一对应（每帧一次，无多余重绘）"
+  else
+    t_fail_note "pty: home 与抹除数量不等（home=${_n_home} 抹除=${_n_clr}）"
+  fi
+  if [[ "${_raw}" == *"$(printf '\033[K')"* ]]; then
+    t_fail_note "pty: 出现 \\033[K 擦行（属闪烁滥用，应全屏重绘）"
+  else
+    t_pass "pty: 无 \\033[K 擦行序列"
+  fi
+  # 除 \033[?25l/h 与 \033[?1049h/l 外，不得有别的 DEC 私有模式切换
+  _other_decs="$(printf '%s' "${_raw}" | grep -o -E $'\x1b\\[\?[0-9]+[hl]' 2>/dev/null | grep -v -E '\?25[hl]|\?1049[hl]' || true)"
+  if [[ -z "${_other_decs}" ]]; then
+    t_pass "pty: 无其他 DEC 私有模式切换（不滥用闪烁序列）"
+  else
+    _other_shown="$(printf '%s' "${_other_decs}" | tr '\n' ';')"
+    t_fail_note "pty: 出现意外 DEC 序列（${_other_shown}）"
   fi
 fi
 
