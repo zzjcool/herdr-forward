@@ -86,11 +86,31 @@ STATE_FILE="${STATE_DIR}/activated-machines.json"
 # （UserKnownHostsFile 指向 TMP + accept-new），再 exec 真的 /usr/bin/ssh。
 # 这样 M1 的 ssh_probe_run 调用签名一字未改，探测链路（真 ssh / 真 sshd / 真远端命令）
 # 完全真实；wrapper 只是替用户把「这台主机已信任」这个既存状态补上。
+#
+# 额外两件事（Bug 3 闸门）：wrapper 还负责（a）把完整 argv 记进日志、（b）**拒绝**
+# 仍带 `ssh://` 的目标。为什么要（b）：本机 OpenSSH 10.5 恰好**内建**支持 `ssh://` URI，
+# 会让「scheme 未剥」的 bug 在自己的机器上无声通过（实测：reverted 版也能连上）。
+# 而用户 A 机的 ssh 不支持该形态，报 `Could not resolve` —— 这正是 bug 3 的现场。
+# 故 wrapper 显式模拟 A 机的严格行为，让「scheme 残留」必然变成失败（否则这个
+# 集成用例没有牙齿，正是它当初漏测的原因）。
 # ---------------------------------------------------------------------------
 mkdir -p "${WORK}/bin"
+export SSH_ARGV_LOG="${WORK}/ssh-argv.log"
 # shellcheck disable=SC2016  # wrapper 里的 "$@" 必须留给 wrapper 自己展开（不是宿主的）
 cat >"${WORK}/bin/ssh" <<EOF
 #!/bin/sh
+# 记录完整 argv（每行一条，便于断言 -p / 目标主机）
+{ printf 'ARGV' >>"\${SSH_ARGV_LOG:-/dev/null}"; for a in "\$@"; do printf ' <%s>' "\$a" >>"\${SSH_ARGV_LOG:-/dev/null}"; done; printf '\\n' >>"\${SSH_ARGV_LOG:-/dev/null}"; } 2>/dev/null || true
+# 模拟用户 A 机的 ssh：目标里还带 ssh:// scheme 则解析失败
+for a in "\$@"; do
+  case "\$a" in
+  ssh://*)
+    printf 'ssh: Could not resolve hostname %s: Name or service not known\\n' "\$a" >&2
+    exit 255
+    ;;
+  *) ;;
+  esac
+done
 exec /usr/bin/ssh \\
   -o UserKnownHostsFile='${HOME}/.ssh/known_hosts' \\
   -o StrictHostKeyChecking=accept-new \\
@@ -291,17 +311,23 @@ PYEOF
 v=""
 
 # --- 假 herdr（宿主侧 machine list --json）：saved machine 指向 127.0.0.2 sshd ---
-cat >"${WORK}/bin/herdr" <<EOF
+# 带两台：
+#   m-loop  裸 host:port 形态（既有回归）
+#   m-uri   **ssh:// URI 形态**（Bug 3 的真实形态：herdr machine add 接受 ssh://）
+# 两者指向同一个 sshd，所以「URI 能跑通」只能归功于 scheme 剥除。
+HERDR_MACHINES_JSON="[{\"id\":\"m-loop\",\"label\":\"loop-remote\",\"target\":\"${SSH_USER}@127.0.0.2:${SSHD_PORT}\",\"session\":\"default\",\"enabled\":true,\"selected\":false},{\"id\":\"m-uri\",\"label\":\"nj-mac\",\"target\":\"ssh://${SSH_USER}@127.0.0.2:${SSHD_PORT}\",\"session\":\"default\",\"enabled\":true,\"selected\":false}]"
+write_host_herdr() {
+  cat >"${WORK}/bin/herdr" <<EOF
 #!/usr/bin/env bash
 if [[ "\$1" == "machine" && "\$2" == "list" ]]; then
-  cat <<'JSON'
-[{"id":"m-loop","label":"loop-remote","target":"${SSH_USER}@127.0.0.2:${SSHD_PORT}","session":"default","enabled":true,"selected":false}]
-JSON
+  printf '%s\\n' '${HERDR_MACHINES_JSON}'
   exit 0
 fi
 exit 127
 EOF
-chmod +x "${WORK}/bin/herdr"
+  chmod +x "${WORK}/bin/herdr"
+}
+write_host_herdr
 export HERDR_BIN_PATH="${WORK}/bin/herdr"
 
 # --- ssh-agent（M1 的 ssh 调用不带 -F /dev/null，但走 agent 最稳） ---
@@ -362,9 +388,53 @@ _cap mkdir -p "${STATE_DIR}"
 _fw machines list --json
 t_exit_ok 0 "${rc}" "list --json rc"
 _jo 'length'
-t_eq "1" "${v}" "一台 machine"
-_jo '.[0].state'
-t_eq "inactive" "${v}" "未激活"
+t_eq "2" "${v}" "两台 machine（裸 host + ssh:// URI）"
+_jo '.[] | select(.id=="m-loop") | .state'
+t_eq "inactive" "${v}" "裸 host 未激活"
+_jo '.[] | select(.id=="m-uri") | .state'
+t_eq "inactive" "${v}" "ssh:// URI 未激活"
+
+# Bug 3 集成闸门：以 A 机真实形态（ssh:// URI）跑完整 A→B 激活链路。
+# 修复前：scheme 未被剥，ssh 收到主机名 "ssh://user@host" → Could not resolve → 必败。
+t_describe "Bug 3：ssh:// URI target 的真实激活链路（A 机形态）"
+
+if [[ "${HAVE_M1}" -eq 1 ]]; then
+  t_it "ssh:// URI target：resolve_id + is_local + 真 ssh 探测全链路打通"
+  _cap rm -f "${STATE_FILE}" "${HERDR_CONFIG_PATH}"
+  : >"${SSH_ARGV_LOG}"
+  _fw machines activate nj-mac
+  t_exit_ok 0 "${rc}" "activate rc=0（ssh:// 已正确剥 scheme，未出现 Could not resolve）"
+  if [[ "${rc}" -ne 0 ]]; then
+    t_fail_note "activate 失败：${err}"
+  fi
+  # argv 闸门（核心断言）：交给 ssh 的目标绝不能带 scheme；端口必须由 -p 传。
+  argvlog="$(cat "${SSH_ARGV_LOG}" 2>/dev/null || true)"
+  if [[ -n "${argvlog}" ]]; then
+    t_pass "ssh 至少被调用一次（ARGV 已记录）"
+  else
+    t_fail_note "ssh 一次未调用（ARGV 日志为空）"
+  fi
+  t_contains "<${SSH_USER}@127.0.0.2>" "${argvlog}" "ssh 目标已剥 ssh://（argv 逐字）"
+  t_contains "<-p> <${SSHD_PORT}>" "${argvlog}" "端口由 -p 传递"
+  if [[ "${argvlog}" == *"ssh://"* ]]; then
+    _bad_uri="$(printf '%s' "${argvlog}" | grep -o 'ssh://[^ ]*' | head -1 || true)"
+    t_fail_note "传给了 ssh 带 ssh:// 的实参（A 机 ssh 会 Could not resolve）：${_bad_uri}"
+  else
+    t_pass "ssh argv 里无 ssh:// 残留（Bug 3 的根因已消）"
+  fi
+
+  t_file_exists "${STATE_FILE}" "写了激活记录"
+  _jf "${STATE_FILE}" '.active'
+  t_eq "m-uri" "${v}" "active=m-uri"
+  _jf "${STATE_FILE}" '.machines["m-uri"].ssh_target'
+  t_eq "ssh://${SSH_USER}@127.0.0.2:${SSHD_PORT}" "${v}" "记录保留原始 ssh:// target（显示层原样）"
+  _jf "${STATE_FILE}" '.machines["m-uri"].server_root'
+  t_eq "${REMOTE_PLUGIN_ROOT}" "${v}" "探测真实命中了远端插件根"
+  _tb "${HERDR_CONFIG_PATH}"
+  t_contains "${REMOTE_PLUGIN_ROOT}/bin/forward" "${v}" "tab bar 已切到远端（端到端生效）"
+else
+  t_skip "M1 合入后：ssh:// URI 真实激活链路（本文件已就绪）"
+fi
 
 # ---------------------------------------------------------------------------
 t_describe "probe 链路（M1 的 lib/ssh-probe.sh 合入后为真探测）"
