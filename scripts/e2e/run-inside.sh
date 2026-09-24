@@ -391,6 +391,284 @@ t_file_absent "${SOCKET_PATH}" "remove 后 control socket 已删"
 cli_cleanup
 
 # ---------------------------------------------------------------------------
+# A3) A 机器场景（saved machine target = ssh:// URI 形态）—— 漏测固化的容器侧闸门
+#
+# 为什么要单独一段：B 机器上 `herdr machine add` 造出的 target 是裸 `user@host`，
+# 于是容器里 59 条断言全绿却在 A 上炸（A 的真实 target 是 `ssh://user@host:port`）。
+# 本段用 A 的**全量真实数据**（5 台，含中文 label「GPU机器」）当 fake herdr 的输出，
+# 把「数据层 → 面板渲染 → 非交互 watch 退化 → ssh 探测 argv」整条链在容器里跑一遍。
+#
+# 只读保证：fake herdr 只回放 JSON（不连真 server）；ssh 用 shim 捕获 argv 后立即失败
+# （**绝不真连任何主机**，也不碰宿主/saved machine）。
+# ---------------------------------------------------------------------------
+t_describe "A3) A 机器场景（ssh:// URI target，含中文 label）"
+
+A_STAGE_DIR="${HOME}/a-scenario"
+A_STATE_DIR="${A_STAGE_DIR}/state"
+A_BIN_DIR="${A_STAGE_DIR}/bin"
+rm -rf "${A_STAGE_DIR}"
+mkdir -p "${A_STATE_DIR}" "${A_BIN_DIR}"
+
+# A 机器实测 `herdr machine list --json` 原样摘录（pretty 格式 + 字段顺序都保留）
+A_FIXTURE="${A_STAGE_DIR}/machine-list.json"
+cat >"${A_FIXTURE}" <<'AJSON'
+[
+  {
+    "id": "191645f46cf4bc677a393cf0ca51d193",
+    "label": "nj-mac",
+    "target": "ssh://zheng@nj.rssyes.com:31415",
+    "session": "default",
+    "enabled": true,
+    "selected": false
+  },
+  {
+    "id": "0b5ecacd1e138809455cdf60fb00d81a",
+    "label": "devcloud",
+    "target": "ssh://root@devcloud.zzj.cool:2222",
+    "session": "default",
+    "enabled": true,
+    "selected": false
+  },
+  {
+    "id": "7bfb921a0d1e6f759797e467b3360f87",
+    "label": "nj-hw",
+    "target": "ssh://zzjcool@nj.rssyes.com:31416",
+    "session": "default",
+    "enabled": true,
+    "selected": false
+  },
+  {
+    "id": "413b9711c1552bba29c9ace8ff8dc5a4",
+    "label": "nj-host",
+    "target": "ssh://chieh@nj.rssyes.com:31417",
+    "session": "default",
+    "enabled": true,
+    "selected": false
+  },
+  {
+    "id": "8048d128c5b8a78a7bc10743a4c85853",
+    "label": "GPU机器",
+    "target": "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000",
+    "session": "default",
+    "enabled": true,
+    "selected": false
+  }
+]
+AJSON
+
+# A 形态 fake herdr：`machine list --json` 回放上面的 fixture（其余子命令 127）
+cat >"${A_BIN_DIR}/herdr" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1-}" == "machine" && "\${2-}" == "list" ]]; then
+  cat '${A_FIXTURE}'
+  exit 0
+fi
+if [[ "\${1-}" == "--version" ]]; then
+  echo 'herdr-a-scenario-fixture (E2E)'
+  exit 0
+fi
+exit 127
+EOF
+chmod +x "${A_BIN_DIR}/herdr"
+
+# ssh shim：只记 argv、恒失败（绝不真连）
+A_SSH_LOG="${A_STAGE_DIR}/ssh-argv.log"
+: >"${A_SSH_LOG}"
+cat >"${A_BIN_DIR}/ssh" <<'ASHIM'
+#!/usr/bin/env bash
+printf 'ARGV' >>"${A_SSH_LOG:?}"
+for a in "$@"; do printf ' <%s>' "$a" >>"${A_SSH_LOG}"; done
+printf '\n' >>"${A_SSH_LOG}"
+printf 'a-scenario-fixture: no real connection\n' >&2
+exit 255
+ASHIM
+chmod +x "${A_BIN_DIR}/ssh"
+export A_SSH_LOG
+
+# fake watch：非交互 watch 退化路径的断言目标（真 watch(1) 会挂住不收尾）
+cat >"${A_BIN_DIR}/watch" <<'AWTCH'
+#!/usr/bin/env bash
+printf 'FAKE-WATCH %s\n' "$*"
+AWTCH
+chmod +x "${A_BIN_DIR}/watch"
+
+A_ENV=(
+  "HERDR_BIN_PATH=${A_BIN_DIR}/herdr"
+  "HERDR_PLUGIN_STATE_DIR=${A_STATE_DIR}"
+  "HERDR_PLUGIN_CONFIG_DIR=${A_STAGE_DIR}/config"
+)
+
+# worker-15 修复探测（输出式；判据：带 scheme 的 target 必须解析出自己的端口）
+A_SCHEME_FIX="no"
+A_SCHEME_PROBE=""
+run env "${A_ENV[@]}" bash -c \
+  "source '${WORK_DIR}/lib/common.sh' >/dev/null 2>&1; source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1; ssh_probe_parse_target 'ssh://probe.invalid:1'"
+A_SCHEME_PROBE="${out}"
+if [[ "${A_SCHEME_PROBE}" == "probe.invalid 1" ]]; then
+  A_SCHEME_FIX="yes"
+else
+  log "A3：lib/ssh-probe.sh 尚未剥 ssh://（worker-15 未合入）→ argv 精确断言记 expected-red SKIP"
+fi
+
+t_it "fixture 自检：5 台机器、target 全 ssh:// URI、label 顺序含中文"
+run jq -r '[.[].target | startswith("ssh://")] | all' "${A_FIXTURE}"
+t_eq "true" "${out}" "target 全是 ssh:// 形态（A 的真实数据形状）"
+run jq -r '[.[].label] | join(",")' "${A_FIXTURE}"
+t_eq "nj-mac,devcloud,nj-hw,nj-host,GPU机器" "${out}" "5 台 label 顺序与中文 label 正确"
+
+t_it "machines_herdr_list_json 解析 A 形态：5 台，target 逐字保留"
+run env "${A_ENV[@]}" bash -c \
+  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_herdr_list_json | jq -r 'length'"
+t_exit_ok 0 "${rc}" "数据层调用成功（stderr：${err}）"
+t_eq "5" "${out}" "透传 5 台"
+run env "${A_ENV[@]}" bash -c \
+  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_herdr_list_json | jq -r '[.[].target] | join(\"\n\")'"
+t_eq "ssh://zheng@nj.rssyes.com:31415
+ssh://root@devcloud.zzj.cool:2222
+ssh://zzjcool@nj.rssyes.com:31416
+ssh://chieh@nj.rssyes.com:31417
+ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "5 台 target 全部逐字保留"
+
+t_it "machines_view_json：5 台 inactive，target 原文保留（面板数据入口）"
+run env "${A_ENV[@]}" bash -c \
+  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_view_json"
+t_exit_ok 0 "${rc}" "view 调用成功"
+A_VIEW="${out}"
+run bash -c "printf '%s' '${A_VIEW}' | jq -r 'length'"
+t_eq "5" "${out}" "视图 5 条"
+run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[].state] | join(\",\")'"
+t_eq "inactive,inactive,inactive,inactive,inactive" "${out}" "全 inactive"
+run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.id==\"8048d128c5b8a78a7bc10743a4c85853\") | .target] | join(\",\")'"
+t_eq "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "GPU机器 target 原文保留"
+
+t_it "中文 label 在容器 locale 下 jq 往返不乱码（UTF-8 字节级）"
+run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.label==\"GPU机器\")] | length'"
+t_eq "1" "${out}" "中文 label 精确匹配命中（未被转义/乱码）"
+run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.label==\"GPU机器\")][0].label' | wc -c"
+t_eq "10" "${out}" "9 字节 UTF-8 + 换行（未被转成 \\uXXXX）"
+run env LC_ALL=C LANG=C bash -c \
+  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_view_json | jq -r '[.[] | select(.label==\"GPU机器\")][0].label' | wc -c"
+t_exit_ok 0 "${rc}" "LC_ALL=C 下数据层仍可用"
+
+t_it "bin/forward machines list：表格含 5 台（含中文 label 与 ssh:// target）"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list
+t_exit_ok 0 "${rc}" "machines list rc=0（stderr：${err}）"
+t_contains "nj-mac" "${out}" "表格含 nj-mac"
+t_contains "devcloud" "${out}" "表格含 devcloud"
+t_contains "nj-hw" "${out}" "表格含 nj-hw"
+t_contains "nj-host" "${out}" "表格含 nj-host"
+t_contains "GPU机器" "${out}" "表格含中文 label GPU机器"
+t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "表格里 nj-mac 的 target 是 ssh:// 原文"
+t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "表格里 GPU机器 的 target 是 ssh:// 原文"
+t_contains "[ ] 未激活" "${out}" "全部标为未激活（A 的真实初始状态）"
+
+t_it "bin/forward machines list --json / --short：5 台且 target 原文"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --json
+t_exit_ok 0 "${rc}" "list --json rc=0"
+run bash -c "printf '%s' '${out}' | jq -r 'length'"
+t_eq "5" "${out}" "--json 5 条"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --short
+t_exit_ok 0 "${rc}" "list --short rc=0"
+t_contains "GPU机器" "${out}" "--short 含中文 label"
+t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "--short 含 ssh:// target 原文"
+
+t_it "watch 非交互退化：exec watch -n 3 forward list（面板不开，脚本化零回归）"
+# cmd_watch 在 `[[ -t 0 ]]` 为假时 exec `watch -n 3 forward list`。这里用探针脚本把
+# stdin 接到 /dev/null（容器里 run-inside.sh 的 stdin 本身不保证非 TTY），并把
+# ${A_BIN_DIR}/watch 放到 PATH 最前拦下真 watch(1)（真 watch 在非 tty 下会
+# "failed to open terminal" 退出 126，而且它会挂住不收尾）。
+cat >"${A_STAGE_DIR}/watch-probe.sh" <<EOF
+set -Eeuo pipefail
+export HERDR_BIN_PATH='${A_BIN_DIR}/herdr'
+export HERDR_PLUGIN_STATE_DIR='${A_STATE_DIR}'
+export HERDR_PLUGIN_CONFIG_DIR='${A_STAGE_DIR}/config'
+export PATH="${A_BIN_DIR}:\${PATH}"
+exec bash '${WORK_DIR}/bin/forward' watch </dev/null
+EOF
+run bash "${A_STAGE_DIR}/watch-probe.sh"
+t_exit_ok 0 "${rc}" "watch（非 TTY）rc=0（stderr：${err}）"
+t_contains "FAKE-WATCH" "${out}" "走的是 watch(1)（未进交互面板）"
+t_contains "-n 3" "${out}" "刷新间隔 3s"
+t_contains "list" "${out}" "目标是 forward list"
+
+# 面板渲染（非交互直出 panel_render：pane 里渲染的就是这段文本）。
+# 探针一律达成文件用 `bash <file>` 跑，自己 export 所需变量：避免把长串 env 前缀
+# 写进命令行（可读性 + shellcheck/shfmt 友好），也避免 PATH 相互干扰。
+cat >"${A_STAGE_DIR}/render.sh" <<EOF
+set -Eeuo pipefail
+export HERDR_BIN_PATH='${A_BIN_DIR}/herdr'
+export HERDR_PLUGIN_STATE_DIR='${A_STATE_DIR}'
+export HERDR_PLUGIN_CONFIG_DIR='${A_STAGE_DIR}/config'
+source '${WORK_DIR}/lib/common.sh' >/dev/null 2>&1 || true
+source '${WORK_DIR}/lib/state.sh' >/dev/null 2>&1 || true
+source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1 || true
+source '${WORK_DIR}/lib/panel.sh' >/dev/null 2>&1 || true
+panel_render
+EOF
+t_it "面板渲染（非交互直出）：MACHINES (5) 含 5 台机器与中文 label"
+run bash "${A_STAGE_DIR}/render.sh"
+t_exit_ok 0 "${rc}" "panel_render rc=0（stderr：${err}）"
+t_contains "MACHINES (5)" "${out}" "面板列出 5 台（这就是 A 上应该看到的输出）"
+t_contains "nj-mac" "${out}" "面板含 nj-mac"
+t_contains "nj-host" "${out}" "面板含 nj-host"
+t_contains "GPU机器" "${out}" "面板含中文 label GPU机器"
+t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "面板 target 显示 ssh:// 原文"
+t_contains "未激活" "${out}" "全部标为未激活"
+
+t_it "激活 ssh:// target：探测命令 argv 组装（ssh shim 捕获，不真连）"
+# 期待（M1 冻结形状）：ssh -n -o BatchMode=yes -o ConnectTimeout=8 [-p PORT] HOST REMOTE_CMD
+# worker-15 未合入时 HOST 会带着 ssh:// 前缀且无 -p —— 那是 A 的实测症状，此处记为 expected-red。
+: >"${A_SSH_LOG}"
+cat >"${A_STAGE_DIR}/argv.sh" <<EOF
+set -Eeuo pipefail
+export PATH="${A_BIN_DIR}:\${PATH}"
+export A_SSH_LOG='${A_SSH_LOG}'
+source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1
+ssh_probe_run 'ssh://zheng@nj.rssyes.com:31415' 'REMOTE_LIST_CMD_FIXTURE'
+EOF
+run bash "${A_STAGE_DIR}/argv.sh"
+t_exit_ok 0 "${rc}" "ssh_probe_run 恒 return 0（stderr：${err}）"
+A_ARGV="$(cat "${A_SSH_LOG}" 2>/dev/null || true)"
+t_contains "ARGV <-n>" "${A_ARGV}" "argv 起点是 ssh shim 的 -n（非交互，不吃 stdin）"
+t_contains "BatchMode=yes" "${A_ARGV}" "带 BatchMode=yes（绝不弹密码）"
+t_contains "ConnectTimeout=8" "${A_ARGV}" "带有界连接超时"
+t_contains "REMOTE_LIST_CMD_FIXTURE" "${A_ARGV}" "远端命令作为最后一个实参"
+if [[ "${A_SCHEME_FIX}" == "yes" ]]; then
+  t_contains "<-p> <31415>" "${A_ARGV}" "显式端口 -p 31415（nj-mac:31415）"
+  t_contains "<zheng@nj.rssyes.com>" "${A_ARGV}" "host 无 ssh:// 前缀"
+  A_ARGV_SCHEME="no"
+  if [[ "${A_ARGV}" == *ssh://* ]]; then
+    A_ARGV_SCHEME="yes"
+  fi
+  t_eq "no" "${A_ARGV_SCHEME}" "argv 中不含 ssh:// scheme"
+else
+  t_contains "ssh://zheng@nj.rssyes.com:31415" "${A_ARGV}" "当前 main 症状复现：整串被当 host（worker-15 修复后本断言改为 -p 31415）"
+  t_skip "expected-red：ssh:// 剥前缀 + -p 31415 归 worker-15（lib/ssh-probe.sh）；合入后本段自动转绿"
+fi
+
+t_it "激活链路不假装 present（shim 恒失败 -> 绝不写指向 A 的假路径）"
+cat >"${A_STAGE_DIR}/bridge.sh" <<EOF
+set -Eeuo pipefail
+export PATH="${A_BIN_DIR}:\${PATH}"
+export A_SSH_LOG='${A_SSH_LOG}'
+source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1
+source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1
+machines_ssh_probe_plugin 'ssh://zheng@nj.rssyes.com:31415'
+EOF
+run bash "${A_STAGE_DIR}/bridge.sh"
+t_exit_ok 0 "${rc}" "探测桥 rc=0"
+t_contains "HF_STATUS=" "${out}" "输出 §2.1 冻结的 KV 契约"
+t_isnt "HF_STATUS=present" "${out}" "绝不假装 present"
+t_file_absent "${A_STATE_DIR}/activated-machines.json" "未写激活记录（不产生指向 A 的假路径）"
+
+t_it "配置隔离：A 段的 HERDR_BIN_PATH 不泄漏到后续阶段（B/C/D 用各自环境）"
+run bash -c "printf '%s' '${HERDR_BIN_PATH:-<unset>}'"
+t_eq "<unset>" "${out}" "A 段的 fake herdr 只经 env 前缀注入，未污染全局"
+
+# 收尾：本段的 fake herdr / shim 不进后续阶段（B/C/D 仍用各自的环境）
+rm -rf "${A_STAGE_DIR}"
+
+# ---------------------------------------------------------------------------
 # B) 容器内完整基线（Dockerfile 已装齐 shellcheck/shfmt/jq，宿主缺工具不阻塞）
 # ---------------------------------------------------------------------------
 t_describe "B) 容器内完整基线（lint + unit + integration）"
