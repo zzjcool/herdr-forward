@@ -910,7 +910,12 @@ EOF
   # 一次性写入 + script 内重定向后，交互顺序完全由面板的 read 循环决定。
   printf '2yx' >"${WORK}/pty-keys"
   set +o errexit
-  HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
+  # 显式 env -u HERDR_BIN_PATH：本用例想走的是「无 M2 herdr 数据源 → 降级读
+  # activated-machines.json」路径。但 herdr 插件运行时（或 CI）可能带着宿主的
+  # HERDR_BIN_PATH，那样 machines.sh 会去问真 herdr，列表台数与断言（MACHINES (2)）
+  # 就对不上——本用例曾因此 env 敏感地 flake（main 上同样复现）。
+  env -u HERDR_BIN_PATH \
+    HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_ROOT="${PLUGIN_ROOT}" \
     PANEL_REFRESH_S=2 \
     timeout 40 script -qec "${PLUGIN_ROOT}/bin/forward watch; echo PANEL-EXIT=\$?" /dev/null \
     <"${WORK}/pty-keys" >"${pty_out}" 2>&1
