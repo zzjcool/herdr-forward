@@ -330,17 +330,14 @@ t_describe "lib/panel.sh：machines 段省略时的诊断提示（Bug 2）"
 # 为什么需要它：machines_herdr_list_json 的 warn 只进日志文件，用户在面板里看不到。
 # 面板是唯一入口，段位静默消失 = 用户无从知道是「真的没配」还是「herdr 命令挂了」。
 # 提示文本必须给出可直接复制排障的命令，否则用户还是只能猜。
-t_it "空列表 + HERDR_BIN_PATH 已设 → 追加灰字提示行"
+t_it "herdr 成功返回空列表（刚装好、还没加机器）→ 引导去 machine add，而不是报「可能失败」"
 stage
 HF_FAKE_MACHINES="[]"
 _pl_run /dev/null "panel_render"
 t_exit_ok 0 "${rc}" "exit 0（提示不得让面板失败）"
-hint_line="$(_line_of "${out}" "未列出 saved machines")"
-t_contains "未列出 saved machines" "${out}" "提示行出现"
-_assert_absent "MACHINES (" "${out}" "仍不渲染 machines 段（省略不变）"
-t_contains "${DIM}" "${hint_line}" "提示行置灰"
-t_contains "machine list --json" "${hint_line}" "提示给出可复制跳命令"
-t_contains "${FAKE_BIN}/herdr" "${hint_line}" "提示里代入真实 HERDR_BIN_PATH"
+t_contains "MACHINES (0)  还没有 saved machine" "${out}" "明说一台都没有"
+t_contains "herdr machine add <ssh 目标> --label <名字>" "${out}" "给出下一步的命令"
+_assert_absent "未列出 saved machines" "${out}" "不再误报「machine list 可能失败」"
 unset HF_FAKE_MACHINES
 
 t_it "HERDR_BIN_PATH 缺失 → 纯省略，不加提示（未在插件运行时里）"
@@ -369,6 +366,10 @@ chmod +x "${FAKE_BIN}/herdr"
 _pl_run /dev/null "panel_render"
 t_exit_ok 0 "${rc}" "herdr 挂掉也不拖趴面板"
 t_contains "未列出 saved machines" "${out}" "失败时也给提示（用户可见）"
+hint_line="$(_line_of "${out}" "未列出 saved machines")"
+t_contains "${DIM}" "${hint_line}" "提示行置灰"
+t_contains "rc=7" "${hint_line}" "提示带上 herdr 的退出码"
+t_contains "${FAKE_BIN}/herdr machine list --json" "${hint_line}" "提示给出可复制的排障命令（代入真实 HERDR_BIN_PATH）"
 t_contains "FORWARDS" "${out}" "forwards 段仍正常（面板可用优先）"
 
 t_it "local（同机短路激活）行：也是 [✓] + 不置灰 + 本机说明"
@@ -574,6 +575,17 @@ if [[ "${renders}" -ge 2 ]]; then
   t_pass "r 触发重绘（渲染 ${renders} 次）"
 else
   t_fail_note "r 未触发重绘（渲染 ${renders} 次）"
+fi
+
+t_it "Enter 不关面板（刚打开就按回车是常见反射）：继续重绘，按 x 才退出"
+printf '\nx' >"${WORK}/in-enter-x"
+_pl_run "${WORK}/in-enter-x" "${SNIP_MAIN_NO_PROBE}"
+t_exit_ok 0 "${rc}" "exit 0"
+renders="$(_count 'RENDER' "${out}")"
+if [[ "${renders}" -ge 2 ]]; then
+  t_pass "Enter 后面板仍在（渲染 ${renders} 次）"
+else
+  t_fail_note "Enter 把面板关了（只渲染 ${renders} 次）"
 fi
 
 t_it "x 退出：panel_main 立即返回 0"

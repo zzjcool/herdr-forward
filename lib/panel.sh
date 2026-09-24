@@ -464,7 +464,31 @@ _panel_machines_omitted_hint() {
   [[ -n "${HERDR_BIN_PATH:-}" ]] || return 0
   # 有 client 经桥接 attach 时本机是被远程开发的那台：没有自己的 saved machines 是常态
   [[ "${PANEL_CLIENT_LIVE}" != "yes" ]] || return 0
-  _panel_fnote "${PANEL_DIM}  未列出 saved machines（可能 herdr machine list 失败，详见日志或手动运行 ${HERDR_BIN_PATH} machine list --json）${PANEL_RESET}"
+  # 「herdr 说一台都没有」与「machine list 失败」要分开：刚装好插件的用户属于前者，
+  # 给他排障提示只会让他以为坏了，他需要的是下一步怎么加机器。
+  local raw="" rc=0
+  set +o errexit
+  if command -v timeout >/dev/null 2>&1; then
+    raw="$(timeout 3 "${HERDR_BIN_PATH}" machine list --json 2>/dev/null)"
+  else
+    raw="$("${HERDR_BIN_PATH}" machine list --json 2>/dev/null)"
+  fi
+  rc=$?
+  set -o errexit
+  local empty=""
+  if [[ "${rc}" -eq 0 ]]; then
+    empty="$(printf '%s' "${raw}" | jq -r '
+      (if type == "array" then . elif (.machines | type) == "array" then .machines
+       elif (.result.machines | type) == "array" then .result.machines else null end)
+      | if type == "array" and length == 0 then "yes" else "" end' 2>/dev/null || true)"
+  fi
+  if [[ "${empty}" == "yes" ]]; then
+    _panel_fnote "──────────────────────────────────────────────────────────────"
+    _panel_fnote "MACHINES (0)  还没有 saved machine"
+    _panel_fnote "  远程开发：先在终端运行 herdr machine add <ssh 目标> --label <名字>，回到这里按序号激活。"
+    return 0
+  fi
+  _panel_fnote "${PANEL_DIM}  未列出 saved machines（herdr machine list 失败或输出无法解析，rc=${rc}；详见日志或手动运行 ${HERDR_BIN_PATH} machine list --json）${PANEL_RESET}"
   return 0
 }
 
@@ -829,8 +853,11 @@ panel_main() {
     if [[ "${rrc}" -gt 128 ]]; then
       continue # 超时 = 自动刷新（forward 状态可能是别的 pane 改的）
     fi
-    if [[ "${rrc}" -ne 0 || -z "${key}" ]]; then
+    if [[ "${rrc}" -ne 0 ]]; then
       return 0 # EOF（终端消失 / 输入被关闭）：干净退出，trap EXIT 会恢复终端
+    fi
+    if [[ -z "${key}" ]]; then
+      continue # Enter（read 的定界符）读出来是空串：刚打开面板就按回车不能把它关掉
     fi
 
     action="$(panel_handle_key "${key}")"
