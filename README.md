@@ -14,6 +14,9 @@ local port  ⇄  remote machine (ssh -L)        ⇅ 3000  ⇅ 5173   ← tab bar
 local port  →  public URL (Cloudflare)        🌐 https://x.trycloudflare.com
 ```
 
+- **Remote development**: working on a saved machine B from your laptop A? Map
+  B's dev-server ports to A's `localhost` from B's own Port Forward panel — see
+  [Remote development](#remote-development-bs-ports-on-as-localhost)
 - **Explicit mappings** on saved machines (0.9+), not auto-forward-everything
 - **Three-layer UI**: tab bar status entry, a Port Forward pane, notifications
 - **Saved machines in the panel**: activate a machine and the tab bar follows it
@@ -76,9 +79,11 @@ both UI pieces:
 
 Both are idempotent (a marker comment identifies our entries, so subsequent
 starts change nothing) and the hook **tells you what it did**: it prints the
-three keys it installed, how to pick different ones, and a reload reminder.
-Because the hook writes files but cannot itself reload, press `prefix+q` (or run
-`herdr server reload-config`) to apply it. A hook failure never stops the server.
+three keys it installed and how to pick different ones. The server has already
+read its config by the time the hook runs, so after writing anything the hook
+runs `herdr server reload-config` itself — that makes the new keys work in open
+clients and pushes the tab bar to them, so `prefix+f` works right away without
+a manual reload. A hook failure never stops the server.
 
 **Conflict etiquette:** if one of the default keys is already bound to something
 else, the hook does **not** overwrite your binding. It skips the automatic
@@ -90,9 +95,11 @@ a different key:
   --add-key prefix+<your key>          # --list-key / --doctor-key work the same
 ```
 
-(Keys live in the **client** config: a `[[keys.command]]` binding dispatches a
-`plugin_action` to whichever server you are currently attached to, so the same
-binding works for local and remote sessions alike.)
+(Keys live in the config of the machine whose panes you are viewing: herdr does
+not send a client's custom-command keybindings to a remote server, so while you
+view a saved machine B, `prefix+f` is resolved from **B's** config. Activating B
+from the panel sets up B's keys for you — see
+[Remote development](#remote-development-bs-ports-on-as-localhost).)
 
 **B. What still takes one step (cross-machine).** `tab_bar_right` is
 *presentation* config owned by the client, even though the `command` inside it
@@ -405,6 +412,80 @@ the startup path: it must be instant, so it trusts what activation recorded).
 Anything unexpected — no active machine, an active one that is this host,
 a truncated record, a corrupt JSON file, a missing `lib/machines.sh` — degrades
 to the plain local behaviour, and the hook always exits 0.
+
+## Remote development: B's ports on A's localhost
+
+The VS Code Remote workflow: herdr runs on your laptop **A**, you have saved a
+machine **B** (`herdr machine add`) and do your work in B's workspaces. A dev
+server started on B (`npm run dev` → `:5173`) should open in **A's** browser at
+`http://localhost:5173`.
+
+1. **Install the plugin on A** (`herdr plugin install zzjcool/herdr-forward`).
+2. **Activate B** from A's Port Forward panel (`prefix+f` while viewing Local,
+   press B's number) or with `forward machines activate <B>`. The plugin probes B
+   over SSH (read-only, `BatchMode`):
+   - B has no plugin → it **asks** `现在在 B 上安装吗？[y/N]` and, on `y`, runs
+     `herdr plugin install zzjcool/herdr-forward --yes` on B for you
+     (`--install` answers yes non-interactively; without consent it only prints
+     the command).
+   - It then sets up **B's** keybindings and reloads B's server — herdr resolves
+     `prefix+f` from the config of the machine you are viewing, not from A's.
+   - Finally it starts the **bridge**: one SSH session from A to B, supervised in
+     the background (reconnects with backoff, restarted by A's startup hook).
+3. **Map ports while viewing B.** `prefix+f` on B opens B's panel. It shows
+   `CLIENT  <A> 已连接` and a `LISTENING` list of B's open ports; press `f` then
+   the port's number and A starts listening on `localhost:<port>`, forwarding to
+   B's `localhost:<port>`. The mapping appears in B's tab bar (`⇅5173`) once A
+   reports it up. From a B shell, the same is `forward add 5173` (or
+   `forward add 15173:5173` for a different local port on A).
+4. **Ctrl+click** `http://localhost:5173` in a B pane: the port is mapped if it
+   wasn't already, and the URL opens in **A's** browser.
+
+```text
+A (laptop)                                   B (saved machine)
+ herdr client ── herdr's own SSH ─────────▶  herdr server, your panes
+ forward bridge run ── SSH session ───────▶  forward bridge serve
+   listens 127.0.0.1:5173 / [::1]:5173  ◀──  forwards.json: f-5173 mode=client
+   (ssh -O forward on that session)          dev server on localhost:5173
+```
+
+Mappings are declared on B and survive disconnects: when A goes away they show
+`waiting`, and they come back by themselves when the bridge reconnects. A busy
+port on A is reported as `down` with the reason and retried every few seconds.
+
+```sh
+# on B
+forward add 5173                # map B:5173 → A's localhost:5173
+forward list                    # MACHINE column: client:<A>, live status
+forward ports                   # B's listening ports, and which are mapped
+forward remove f-5173
+forward bridge status           # which clients are attached right now
+
+# on A
+forward bridge status           # bridges to your machines and their mappings
+forward machines doctor         # re-probe the active machine, restart its bridge
+forward machines deactivate <B> # stops the bridge; A's listeners go away with it
+```
+
+`scripts/e2e/run-two-machines.sh` walks through all of this the way a person
+would, with nobody at the keyboard: two containers on a private network, A and
+B each running a real herdr and sshd (different users and plugin paths), and
+A's **real herdr TUI** running inside tmux, which types the keys and reads the
+screen back. It runs `herdr machine add`, opens herdr, presses `prefix+f` / `1` /
+`y` to activate B, switches to B with `prefix+w`, presses `prefix+f` / `f` / `1`
+in B's panel, reads `⇅5173` off the tab bar, Ctrl+clicks a URL in B's pane, drops
+A's network, restarts A's herdr server, and deactivates B from the panel —
+checking the screen and, independently, what A's `localhost` actually serves.
+`scripts/ci.sh` runs it after the docker E2E when the host's herdr can run inside
+the container.
+
+**Trust boundary.** A enforces what B may ask for: A-side ports ≥ 1024, bound to
+A's loopback only, targets fixed to B's `localhost`, at most 32 mappings, and
+Ctrl+click opens only `http(s)://localhost` URLs of ports the bridge has mapped.
+The bridge session runs with your `~/.ssh/config` (aliases, `ProxyJump`, keys)
+but forces `ForwardAgent=no`, `ForwardX11=no` and `ClearAllForwardings=yes`.
+What B *can* do is listen on a free loopback port of A — the same trust you give
+VS Code Remote's port forwarding; do not activate machines you do not trust.
 
 ## Related work
 

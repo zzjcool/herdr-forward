@@ -203,6 +203,82 @@ notify_toast <title> <body>                    # herdr socket API / notification
   selected}]`；saved machine 的 target 不支持端口后缀（herdr 自身限制），端口场景用
   `forward add --ssh-target` 直连语义
 
+### A.3.3 远程开发：B 的端口映射到 A 的 localhost（client 映射 + 桥接）
+
+**用户流程**：A 上 herdr 配了 saved machine B 并在 B 的 workspace 里开发 → A 装插件 →
+面板/CLI 激活 B（探测；B 未装则**经同意**代装）→ 在 B 的面板里选监听端口 → 端口出现在
+A 的 `localhost`。
+
+**为什么需要桥接（herdr 执行模型，官方文档实证）**：
+- 查看 B 时，插件 action / pane / tab bar command 都在 **B** 上执行（「Custom commands
+  and plugins advertised by the selected server still run there」），B 碰不到 A 的端口；
+- client 的 `[[keys.command]]` **不会**带到远端（「Local custom command keybindings are
+  not sent」），查看 B 时 `prefix+f` 取自 **B 自己的 config** —— 故激活时要在 B 上代跑
+  startup hook 装键位并 `herdr server reload-config`；
+- 运行中的 herdr server 会立即看到新装的插件（隔离 HOME 实测），无需重启 B。
+
+**数据面**：A 侧 supervisor（`forward bridge run <id>`，由 `bridge up` 以 setsid 放后台）维持
+一条 `ssh -T -o ControlMaster=yes -o ControlPersist=no … <B> 'env HERDR_PLUGIN_STATE_DIR=<B state>
+<B root>/bin/forward bridge serve'`。会话 stdio 是行协议；A 在**同一 master** 上
+`ssh -O forward|cancel -L localhost:<lp>:localhost:<rp>` 增删映射。会话结束 = master 退出 =
+映射全部释放（无孤儿隧道）。断线指数退避重连（2s→60s，稳定 60s 后复位），重连后按 B 的
+期望集合自动恢复；本机 herdr socket 消失时 supervisor 退出，A 的 startup hook 会在 server
+启动时对 active 的远端机器重新 `bridge up`。
+
+**行协议（HF1，一行一条，空格分隔）**：
+- B → A：`HF1 HELLO <host>`；`HF1 SYNC <id:lp:rp,...|->`（期望集合全量，启动 + 每次变化）；
+  `HF1 OPEN <url>`（仅当端口已出现在已发出的 SYNC 里才发，30s 过期）
+- A → B：`HF1 HELLO <host> <label...>`；`HF1 STATUS <id> up|down [reason...]`；`HF1 PING`（心跳）
+
+**A 侧强制的安全边界**：id 必须 `f-<lp>`；lp ∈ [1024, 65535]、rp ∈ [1, 65535]，无前导零；
+至多 32 条；绑定恒为 A 的 loopback（`localhost` → 127.0.0.1 + ::1），目标恒为 B 的
+`localhost`；OPEN 只接受已生效映射端口的 `http(s)://localhost|127.0.0.1` URL。桥接 ssh 沿用
+用户 `~/.ssh/config`（别名/ProxyJump/IdentityFile），但钉死 `BatchMode=yes ForwardAgent=no
+ForwardX11=no ClearAllForwardings=yes PermitLocalCommand=no` 与独立 ControlPath。
+`HERDR_FORWARD_SSH_CONFIG` 可指定 `-F`（测试 / 自定义部署）。
+
+**状态（单 writer）**：
+- B：`forwards.json` 里 `mode:"client"` 的记录 = 期望集合（CLI/面板写）；
+  `bridge/session-<serve pid>.json` = 该 client 的回报与心跳（serve 写）。在线 = serve 进程活着
+  且心跳 ≤ 20s；死 serve 的文件读时清理。展示状态：`up|down`（client 回报）/ `pending`（在线
+  未回报）/ `waiting`（无 client）。tunnel 的 doctor/prune **跳过** client 记录。
+- A：`bridge/client-<id>.json`（supervisor 写：state connecting|connected|retrying|stopped、
+  reason、各映射 spec/state/reason）+ `client-<id>.lock/pid`（mkdir 原子单实例锁）。
+  `forward list` 在 A 上把 connected 的映射以 `mode:"bridge"` 合并展示（tab bar 同源）。
+
+**CLI 契约追加**：`forward add <port>|<lp>:<rp> [--client]`（无目标且有在线 client 时默认
+client 映射；否则维持 die 4）/ `forward bridge up|down|status|serve|run` / `forward ports
+[--json]` / `forward open-url [URL]`（manifest 的 open-url action 改指向它）/
+`forward machines activate <id> [--install|--no-install]`（absent 时交互询问或 `--install`
+代装；present 后远端装键位 + reload + 启动桥接，并停掉指向其它机器的桥接 —— 与单 active
+语义一致）/ `deactivate` 停桥接 / `machines doctor` 报告并拉起桥接。
+
+**测试**：`tests/unit/test_bridge.sh`（协议/校验/serve 循环经管道驱动）、
+`test_client_forwards.sh`、`test_ports.sh`、`test_machines_bridge.sh`、`test_panel_bridge.sh`、
+`test_startup_bridge.sh`；`tests/integration/test_bridge_roundtrip.sh` 用真 sshd 证明
+A 的 localhost 收到 B 服务的回包、仅 loopback 监听、端口被占如实报告并自愈、杀掉 ssh 后同一
+supervisor 重连恢复、OPEN 在 A 上打开、bridge down 无残留。
+`scripts/e2e/run-two-machines.sh`（ci.sh 第 5 段 docker 路径之后运行，前置条件不满足时以 127
+显式跳过）用两个容器 + `--internal` 网络把 A/B 放进两个网络栈、两个用户，并把 A 的**真 herdr
+TUI client** 放进 tmux（tmux = 虚拟终端：send-keys 按键、capture-pane 读屏），全程按用户的
+操作走：`machine add` → 打开 herdr → prefix+f / 1 / y 激活（B 在 server 运行中装插件，键位由
+A 代装并 reload）→ prefix+w 切到 devbox → prefix+f 打开的是 **B** 的面板（B 的插件日志为证）→
+f / 1 → A 的 localhost 取到 B 只绑 127.0.0.1 的服务、tab bar 读出 ⇅5173 → 在 B 的 pane 里
+Ctrl+click（SGR 1006 鼠标序列）在 A 上打开 → 断网重连 → A 的 herdr server 重启后 startup hook
+拉回桥接 → 回到 Local 用面板停用，无残留进程。实现细节：herdr 的 prefix 要以原始字节 0x02
+送入（tmux 的 `C-b` 键名送不到）；A 的测试配置关掉 onboarding 与联网检查。
+
+**真 TUI 测出并已修正的产品问题**：
+- 自定义命令键位由 server 广播，而 startup hook 在 server 读完 config 之后才写入 → 装完插件
+  prefix+f 无效，直到手动 reload。实测 **server 侧** `herdr server reload-config` 即可让已开的
+  client 立刻拿到新键位与新 tab bar → startup hook（写过 config 时）与面板里的激活/停用都自动
+  reload；只在以 herdr 插件身份运行（有 `HERDR_PLUGIN_ID`）时做，手敲命令与测试不碰真实 server。
+- 默认半屏 popup 把面板行折断 → manifest 的 `[[panes]]` 声明 `placement = "popup"`、80%×80%。
+- 被远程开发的 B 通常没有自己的 saved machines，面板却提示「machine list 可能失败」→ 有 client
+  在线时不再提示。
+- LISTENING 曾列出绑在 127.0.0.11（容器 DNS）等非 127.0.0.1 地址上的端口，经 localhost 连不到
+  → 只列 127.0.0.1 / ::1 / 通配地址。
+
 ### A.4 herdr-plugin.toml 冻结声明（开工时填入）
 
 ```toml

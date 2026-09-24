@@ -101,6 +101,24 @@ Legend：`[x]` 可自动验证且已绿 ／ `[~]` 部分验证（沙箱内绿，
 - publish/unpublish 往返干净，URL 实时显示在 pane
 - quick tunnel 进程退出（超时/网络）后面板正确显示 down
 
+## 远程开发：saved machine 的端口映射到 client 的 localhost（ARCHITECTURE §A.3.3）
+
+场景：A 上 herdr 连着 saved machine B，在 B 上开发；B 的 dev server 要在 A 的浏览器里打开。
+
+- [x] 激活 B：只读探测 → 未装插件时经同意代装（交互 y/N 或 `--install`）→ 远端装键位并
+  reload（herdr 不把 client 的自定义命令键位带到远端）→ 启动桥接
+- [x] 桥接：A 维持一条到 B 的 SSH 会话（stdio 行协议 + 同一 master 上 `-O forward/cancel`），
+  断线退避重连、映射自动恢复；A 的 startup hook 对 active 的远端机器重新拉起
+- [x] B 侧：`forward add <port>`（有 client 在线时默认 client 映射）、面板 CLIENT 行 +
+  LISTENING 段（f+序号 一键映射、d+序号 删除）、tab bar 显示已生效映射
+- [x] Ctrl+click B 上的 localhost 链接 → 自动映射并在 A 的浏览器打开
+- [x] 真 sshd 集成测试（`tests/integration/test_bridge_roundtrip.sh`，含 `%3A` state 目录形态）
+- [x] 两机真实场景 E2E（`scripts/e2e/run-two-machines.sh`）：两个容器各跑真 herdr + 真 sshd、
+  不同用户与插件路径；A 的真 herdr TUI 跑在 tmux 里，全程按键操作：prefix+f 激活 → prefix+w 切到
+  devbox → prefix+f 打开 B 的面板映射端口 → tab bar ⇅5173 → Ctrl+click 在 A 上打开 → 断网重连 →
+  A 的 server 重启 → 面板里停用。无需人工。
+- [ ] 自动映射（检测到新监听端口即映射，VS Code 默认行为）—— 候选，默认仍保持显式
+
 ## 三期（候选，不承诺）
 - `ssh -R` 反向（本地→远程机器方向）
 - SOCKS `-D`
