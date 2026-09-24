@@ -191,6 +191,53 @@ t_eq "[]" "${o}" "空列表"
 t_eq "0" "${r}" "不 die"
 t_contains "失败" "${e}" "warn 提到失败"
 
+# Bug 2：原本 herdr 的 stderr 被 2>/dev/null 丢弃，日志里只剩 rc，用户排障时无从下手。
+# 现在至少要有 rc + stderr 摘要（截断）落进 forward.log，供用户打开日志定位。
+t_it "list 失败：日志里带 rc + herdr stderr 摘要（Bug 2 诊断加固）"
+_reset_state
+cat >"${TMP}/herdr" <<'EOF'
+#!/usr/bin/env bash
+printf 'herdr: cannot connect to server at /run/user/1000/herdr.sock\n' >&2
+exit 7
+EOF
+chmod +x "${TMP}/herdr"
+export HERDR_BIN_PATH="${TMP}/herdr"
+_capok machines_herdr_list_json
+t_eq "[]" "${o}" "空列表"
+LOGFILE="${HERDR_PLUGIN_STATE_DIR}/logs/forward.log"
+t_file_exists "${LOGFILE}" "warn 已落日志文件"
+logtail="$(cat "${LOGFILE}" 2>/dev/null || true)"
+t_contains "rc=7" "${logtail}" "日志含退出码 rc=7"
+t_contains "cannot connect to server" "${logtail}" "日志含 herdr stderr 摘要（不再被 2>/dev/null 吞掉）"
+
+# timeout 杀掉（rc=124）也属于「herdr 挂了」：stderr 可能为空，但 rc 必须在日志里。
+t_it "list 超时/被杀：日志里带 rc 且不崩（诊断信息不丢）"
+_reset_state
+cat >"${TMP}/herdr" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "${TMP}/herdr"
+export HERDR_BIN_PATH="${TMP}/herdr"
+# MACHINES_HERDR_TIMEOUT 是 readonly（模块内定义），无法重设；用 timeout shim 让
+# 外层 timeout 立即失败，模拟「herdr 卡住被杀」而不真等 5 秒。
+mkdir -p "${TMP}/fast-timeout"
+cat >"${TMP}/fast-timeout/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift || true
+exit 124
+EOF
+chmod +x "${TMP}/fast-timeout/timeout"
+_cap env PATH="${TMP}/fast-timeout:${PATH}" bash -c "source '${MACHINES_LIB}'; machines_herdr_list_json"
+t_eq "[]" "${o}" "超时 -> 空列表"
+t_eq "0" "${r}" "不 die"
+_tf="${TMP}/fast-timeout/my-state"
+set +o errexit
+out="$(env PATH="${TMP}/fast-timeout:${PATH}" HERDR_PLUGIN_STATE_DIR="${_tf}" HERDR_BIN_PATH="${TMP}/herdr" \
+  bash -c "source '${MACHINES_LIB}'; machines_herdr_list_json" 2>&1)"
+set -o errexit
+t_contains "124" "${out}" "rc=124 可见（用户知道是超时不是空配置）"
+
 t_it "输出不是 JSON -> [] + warn（不 die）"
 _fake_herdr 'not json at all'
 _capok machines_herdr_list_json
@@ -395,6 +442,25 @@ done
 if [[ -n "${HOST_FULL}" ]]; then
   _capok machines_is_local_target "${HOST_FULL}.example.com"
   t_eq "no" "${o}" "remote: ${HOST_FULL}.example.com（FQDN 后缀，不是本机精确名）"
+fi
+
+# Bug 3：herdr machine add 接受 ssh:// URI 形态；is_local 必须先剥 scheme 再比，
+# 否则 'ssh://localhost:22' 会被当作远程机（多跑一次必败的探测）。
+t_it "ssh:// URI 形态：剥 scheme 后再判同机（Bug 3）"
+for _t in "ssh://localhost" "ssh://localhost:22" "ssh://user@localhost:22" "SSH://127.0.0.1" "ssh://user@127.0.0.1:2222"; do
+  _capok machines_is_local_target "${_t}"
+  t_eq "yes" "${o}" "local(ssh://): ${_t}"
+done
+
+# 用户 A 机的真实形态：ssh://zheng@nj.rssyes.com:31415 必须判 not local（不得把 scheme 当主机名）。
+t_it "A 机真实形态 ssh://zheng@nj.rssyes.com:31415 -> no（Bug 3 回归锁）"
+_capok machines_is_local_target "ssh://zheng@nj.rssyes.com:31415"
+t_eq "no" "${o}" "nj-mac 形态 -> no"
+_capok machines_is_local_target "ssh://nj.rssyes.com"
+t_eq "no" "${o}" "无 user/port 的 ssh:// 也 no"
+if [[ -n "${HOST_FULL}" ]]; then
+  _capok machines_is_local_target "ssh://${HOST_FULL}:2222"
+  t_eq "yes" "${o}" "本机名的 ssh:// 形态 -> yes"
 fi
 
 t_it "恒 return 0（可安全用于条件判断）"
