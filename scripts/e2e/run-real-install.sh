@@ -42,7 +42,6 @@ done
 
 # shellcheck source=/dev/null
 source "${PROJ}/tests/lib/assertions.sh"
-out=""
 rc=0
 WAITED_RC=1
 
@@ -123,8 +122,14 @@ panel_still_open() {
   sleep 1.5
   ui_shows 'herdr-forward · Port Forward'
 }
+# installed_sha -> stdout: registry 里记录的 resolved_commit（按分支安装时 plugin list 只显示分支名）
 installed_sha() {
-  hh plugin list 2>/dev/null | sed -n 's/.*github:[^@]*@\([0-9a-f]*\)\].*/\1/p' | head -1
+  jq -r '.[] | select(.plugin_id == "zzjcool:forward") | .source.resolved_commit // empty' \
+    "${ROOT}/home/.config/herdr/plugins.json" 2>/dev/null || true
+}
+# postinstall_log -> stdout: build 步骤自己的日志（herdr 成功时不回显 build 的输出）
+postinstall_log() {
+  cat "${ROOT}/home/.local/state/herdr/plugins/zzjcool%3Aforward/logs/postinstall.log" 2>/dev/null || true
 }
 startup_hook_done() {
   local logs="" n=""
@@ -197,7 +202,10 @@ wait_for 5 ui_hides 'Port Forward'
 install_new
 t_exit_ok 0 "${rc}" "herdr plugin install 升级（server 保持运行）"
 sha="$(installed_sha)"
-t_isnt "${OLD_SHA:0:40}" "${sha}" "已不是旧版（现在 @${sha:0:7}）"
+t_match '^[0-9a-f]{40}$' "${sha}" "registry 记录了新的 resolved_commit"
+t_isnt "${OLD_SHA}" "${sha}" "已不是旧版（现在 @${sha:0:7}）"
+log_text="$(postinstall_log)"
+t_contains "keys already installed" "${log_text}" "升级时 build 步骤发现键位已在，不重复写"
 check_new_panel
 
 # --- 场景 2：全新用户 -------------------------------------------------------------
@@ -211,7 +219,9 @@ ui_prefix q
 sleep 1
 install_new
 t_exit_ok 0 "${rc}" "herdr plugin install 退出 0"
-t_contains "现在就可以按 prefix+f" "${out}${err:-}" "安装的 build 步骤装好键位并重载了 herdr"
+log_text="$(postinstall_log)"
+t_contains "keys installed" "${log_text}" "安装的 build 步骤写入了键位"
+t_contains "reloaded" "${log_text}" "并重载了正在运行的 herdr"
 check_new_panel
 
 t_done
