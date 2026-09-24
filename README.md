@@ -53,38 +53,59 @@ to remove the link.
 
 Plugin v1 manifests cannot declare keybindings or tab-bar entries — those live in
 herdr's own `config.toml`, and no plugin API can register them at install time.
-So the plugin ships two idempotent installers plus one one-shot command that runs
-both:
+The plugin's `[[startup]]` hook installs both automatically on first start, so
+for the common case there is nothing to run. `bootstrap.sh` is the manual
+installer, kept for re-installing, choosing different keys, and cross-machine
+setups:
 
 ```sh
-# after linking/installing the plugin — run from the plugin checkout,
-# or from anywhere via the `forward` CLI (`bin/forward bootstrap`)
+# optional — the startup hook already does this on first start
 ./scripts/bootstrap.sh          # tab bar status entry + 3 keybindings
 ./scripts/bootstrap.sh --dry-run  # preview first, writes nothing
 ```
 
-Afterwards press `prefix+q` (or run `herdr server reload-config`) to apply it.
+**A. `herdr plugin install` → reload → done (the common case).** Plugin install
+is the only install step. If your herdr server and your herdr client run on the
+same machine (the common local case), the plugin's `[[startup]]` hook runs
+`scripts/startup-hook.sh` once the server is up and **automatically** installs
+both UI pieces:
 
-**What happens automatically (same machine):** if your herdr server and your
-herdr client run on the same machine (the common local case), the plugin's
-`[[startup]]` hook runs `scripts/startup-hook.sh` once the server is up. It
-detects the missing tab-bar entry and installs it for you — no manual step, and
-idempotent so it does nothing on subsequent starts. The hook writes the config
-file; the running server picks it up on the next `reload-config` (the hook itself
-cannot reload, and a hook failure never stops the server). The tab bar entry is
-the automatic part; the optional keybindings are not installed by the hook —
-run `bootstrap.sh` once if you want them.
+- the **tab bar status entry**, and
+- the **three keybindings** — `prefix+f` (Port Forward panel), `prefix+shift+f`
+  (list forwards), `prefix+alt+f` (doctor).
 
-**What still takes one step (cross-machine):** `tab_bar_right` is *presentation*
-config owned by the client, even though the `command` inside it runs on the
-*server*. When you attach from machine A to a server on machine B, the plugin
-process on B cannot reach A's filesystem — a physical boundary, not an
-oversight. In that case:
+Both are idempotent (a marker comment identifies our entries, so subsequent
+starts change nothing) and the hook **tells you what it did**: it prints the
+three keys it installed, how to pick different ones, and a reload reminder.
+Because the hook writes files but cannot itself reload, press `prefix+q` (or run
+`herdr server reload-config`) to apply it. A hook failure never stops the server.
 
-- On B (the server), the startup hook only logs a hint; nothing is written to A.
-- On **A**, run the one-shot client setup. A attaches to B *over SSH*, so the
-  installer can use that same channel to probe B for real — you do not even need
-  to look up B's paths:
+**Conflict etiquette:** if one of the default keys is already bound to something
+else, the hook does **not** overwrite your binding. It skips the automatic
+install and prints exactly which key was occupied plus the command to install on
+a different key:
+
+```sh
+<plugin-root>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
+  --add-key prefix+<your key>          # --list-key / --doctor-key work the same
+```
+
+(Keys live in the **client** config: a `[[keys.command]]` binding dispatches a
+`plugin_action` to whichever server you are currently attached to, so the same
+binding works for local and remote sessions alike.)
+
+**B. What still takes one step (cross-machine).** `tab_bar_right` is
+*presentation* config owned by the client, even though the `command` inside it
+runs on the *server*. When you attach from machine A to a server on machine B,
+the plugin process on B cannot reach A's filesystem — a physical boundary, not
+an oversight. In that case:
+
+- On B (the server), the startup hook writes **B's own** config only; nothing is
+  written to A. Since keybindings are client config too, A does not inherit B's
+  either — A needs its own copy of both.
+- On **A**, run the client setup — the remote-session / special-case fallback. A
+  attaches to B *over SSH*, so the installer can use that same channel to probe
+  B for real — you do not even need to look up B's paths:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/zzjcool/herdr-forward/main/scripts/setup-client.sh \
@@ -235,8 +256,8 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 | `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--command CMD`, `--dry-run` |
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
 | `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
-| `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A | `--config PATH`, `--server-host TARGET` (SSH probe of B: auto-derives B's root/state dir), `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
-| `scripts/startup-hook.sh` | nothing directly — the `[[startup]]` hook that calls `install-tabbar.sh` | never fails the server; degrades to a log line cross-machine; points the tab bar at the **active machine** when one is activated (see below) |
+| `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A. The remote-session / special-case fallback (the same-machine startup hook covers the common case) | `--config PATH`, `--server-host TARGET` (SSH probe of B: auto-derives B's root/state dir), `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
+| `scripts/startup-hook.sh` | the `[[startup]]` hook: calls `install-tabbar.sh` **and** `install-keys.sh` (the automatic tab bar + keybindings; notifies what it installed, skips on key conflict) | never fails the server; degrades to a log line cross-machine; points the tab bar at the **active machine** when one is activated (see below) |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
 the original to `config.toml.bak.<epoch>` before any real change. Re-running
@@ -255,9 +276,12 @@ When installed from GitHub, use the copy inside the managed checkout:
 | `prefix+shift+f` | list current forwards |
 | `prefix+alt+f` | doctor — probe tunnels |
 
-Override them with `--add-key/--list-key/--doctor-key`. If a key is already
-bound to something else the installer warns and still installs (so a collision is
-visible rather than silent), so pass a different key if the warning fires.
+Override them with `--add-key/--list-key/--doctor-key`. The startup hook installs
+these three automatically on first start; if one is already bound to something
+else it skips the automatic install and tells you which key collided (so a
+collision is visible rather than silent, and your existing binding is never
+overwritten). Run `bootstrap.sh --add-key <key>` to install on a different key,
+or let `install-keys.sh` warn-and-install anyway if you are fine with the overlap.
 
 ### D. Ctrl+click links
 
