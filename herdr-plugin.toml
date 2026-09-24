@@ -14,6 +14,15 @@ description = "Forward a saved SSH machine's TCP port to localhost, and optional
 platforms = ["linux", "macos"]
 
 # ---------------------------------------------------------------------------
+# build —— `herdr plugin install` 时运行（安装预览里可见）：装好键位并重载正在运行的
+# herdr，装完即可按 prefix+f。startup hook 只在 server 启动时跑，往正在运行的 herdr 里
+# 安装时不会触发；`herdr plugin link` 不跑 build（本地开发由下次启动的 startup hook 补）。
+# ---------------------------------------------------------------------------
+
+[[build]]
+command = ["bash", "scripts/postinstall.sh"]
+
+# ---------------------------------------------------------------------------
 # startup hook —— OOTB：装好插件后自动补上 tab bar 状态条
 #
 # 职责（任务 §3）：herdr 在恢复会话、API socket ready 后跑一次（handoff 再跑）。

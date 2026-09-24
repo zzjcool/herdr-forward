@@ -746,7 +746,17 @@ cmd_bootstrap() {
   if [[ ! -f "${script}" ]]; then
     die 127 "缺少 ${script}（OOTB 安装脚本）。本机手动安装：bash scripts/install-tabbar.sh && bash scripts/install-keys.sh。请确认插件检出完整后重试。"
   fi
-  exec bash "${script}" "$@"
+  local rc=0
+  bash "${script}" "$@" || rc=$?
+  # 作为「Port Forward: Setup UI」action 运行时顺手重载，新装的键位与 tab bar 立即可用
+  if ((rc == 0)) && declare -F _bridge_bounded >/dev/null; then
+    local reloaded=""
+    reloaded="$(_hf_reload_herdr)"
+    if [[ ${reloaded} == "yes" ]]; then
+      printf '已自动重载 herdr 配置：键位与 tab bar 已生效。\n'
+    fi
+  fi
+  return "${rc}"
 }
 
 # --- bridge（A.3.3：client ↔ server 桥接） ---
