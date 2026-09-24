@@ -166,6 +166,44 @@ probe 'ssh_probe_parse_target "db.internal"'
 t_exit_ok 0 "${rc}" "退出 0"
 t_eq "db.internal 22" "${out}" "默认端口 22"
 
+# --- Bug 3（用户实测）：“herdr machine add 接受 ssh:// URI 形态” ---
+# 真实数据：{"target": "ssh://zheng@nj.rssyes.com:31415"}。
+# 修复前 *:* 分支把 host 整串当主机（host="ssh://zheng@nj.rssyes.com"），
+# ssh 收到带 scheme 的主机名 → Could not resolve。
+t_it "ssh://user@host:port（A 机真实形态）-> 剥 scheme 后正确切分"
+probe 'ssh_probe_parse_target "ssh://zheng@nj.rssyes.com:31415"'
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "zheng@nj.rssyes.com 31415" "${out}" "host 剥 ssh://，端口 31415"
+
+t_it "ssh://host（无 user/port）-> host + 默认 22"
+probe 'ssh_probe_parse_target "ssh://nj.rssyes.com"'
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "nj.rssyes.com 22" "${out}" "无 user 无端口"
+
+t_it "ssh://user@host（无端口）-> user@host + 22"
+probe 'ssh_probe_parse_target "ssh://zheng@nj.rssyes.com"'
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "zheng@nj.rssyes.com 22" "${out}" "保留 user，默认端口"
+
+t_it "SSH://（大写 scheme）也识别（大小写不敏感）"
+probe 'ssh_probe_parse_target "SSH://USER@HOST:22"'
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "USER@HOST 22" "${out}" "大写 scheme 同样剥除"
+
+# 回归锁：带 scheme 的实时主机一定不能把 scheme 交给 ssh。
+t_it "ssh_probe_run 不把 scheme 当主机名传给 ssh（Bug 3 回归锁）"
+: >"${SHIM_LOG}"
+probe 'ssh_probe_run "ssh://zheng@nj.rssyes.com:31415" "remote-cmd"'
+t_exit_ok 0 "${rc}" "退出 0"
+scheme_log="$(shim_log)"
+t_contains "<-p> <31415>" "${scheme_log}" "端口由 -p 传递"
+t_contains "<zheng@nj.rssyes.com>" "${scheme_log}" "主机已剥 scheme"
+if [[ "${scheme_log}" == *"ssh://"* ]]; then
+  t_fail_note "传给 ssh 的 argv 里仍有 ssh:// 前缀（ssh 会 Could not resolve）"
+else
+  t_pass "argv 里无 ssh:// 残留"
+fi
+
 t_it "[v6]:22 -> 去掉方括号 + 端口"
 probe 'ssh_probe_parse_target "[2001:db8::1]:2222"'
 t_exit_ok 0 "${rc}" "退出 0"
@@ -180,6 +218,13 @@ t_it "无方括号的裸 IPv6 -> 整体当主机（无法从中切端口）"
 probe 'ssh_probe_parse_target "::1"'
 t_exit_ok 0 "${rc}" "退出 0"
 t_eq "::1 22" "${out}" "裸 IPv6 当主机 + 默认端口"
+
+t_it "ssh:// + IPv6 方括号：scheme 剥除后方括号分支照常工作"
+# 注：带 user@ 的方括号形态（user@[v6]:port）在现有三分支里本就不支持，
+# 本次只加 scheme 剥除，不扩大解析语义（保持“剥完再走现有三分支”）。
+probe 'ssh_probe_parse_target "ssh://[2001:db8::1]:2222"'
+t_exit_ok 0 "${rc}" "退出 0"
+t_eq "2001:db8::1 2222" "${out}" "剥 scheme 后再走方括号分支"
 
 t_it "为空 -> die 64（用法错）"
 probe 'ssh_probe_parse_target ""'

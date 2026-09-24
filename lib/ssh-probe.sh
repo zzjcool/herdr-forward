@@ -51,6 +51,8 @@ kv_get() {
 }
 # --- ssh_probe_parse_target <target> -> stdout "<host> <port>"（非法 die 64） ---
 # 支持形态（README / --help 承诺的 user@host[:port] 是主路径；方括号仅用于 IPv6）：
+#   ssh://user@host:2222          -> 先剥 scheme，再按下面各条处理（herdr machine add
+#                                    接受 ssh:// URI 形态，见下）
 #   host | user@host               -> host 原样 + 默认端口 22
 #   user@host:2222                 -> user@host 2222（用整串展开，故 user@ 不会丢）
 #   [v6]:22 / [::1]                -> 去掉方括号 + 22（IPv6 字面量端口无法用 ':' 切分，故需括号）
@@ -61,9 +63,28 @@ _SSH_PROBE_HOST=""
 _SSH_PROBE_PORT=""
 _SSH_PROBE_HAS_PORT=0
 
+# _ssh_probe_strip_scheme <target> -> stdout 剥掉 ssh:// 前缀的 target（无则原样）
+#   为什么需要（真实 bug）：herdr machine add 接受 `ssh://user@host:31415` 形态并原样
+#   存进 saved machines 的 target 字段。若把 scheme 一起当主机名，ssh 收到
+#   `ssh://user@host` 会 Could not resolve，而 *:* 分支又会把 `ssh://user@host`(含 scheme)
+#   当主机 —— 两处都错。故在解析最前面剥一次，后续三分支逻辑不动。
+#   大小写不敏感（SSH:// 也认）；只剥前缀（不动 user/port/IPv6）。
+_ssh_probe_strip_scheme() {
+  local target="${1-}"
+  # ${target,,} 取小写副本判断前缀，命中后用 ${#target} 与固定长度切片剥原始串
+  # （不用 sed/awk：本库在 curl|bash 形态下要尽量少依赖，且参数展开零 fork）。
+  if [[ "${target,,}" == ssh://* ]]; then
+    printf '%s\n' "${target:6}"
+    return 0
+  fi
+  printf '%s\n' "${target}"
+}
+
 # _ssh_probe_split_target <target>：只解析不输出（失败即 die 64），副作用是上面 3 个内部变量。
 _ssh_probe_split_target() {
-  local target="${1:-}"
+  local raw="${1:-}"
+  local target=""
+  target="$(_ssh_probe_strip_scheme "${raw}")"
   _SSH_PROBE_HOST=""
   _SSH_PROBE_PORT=""
   _SSH_PROBE_HAS_PORT=0

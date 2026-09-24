@@ -75,20 +75,46 @@ machines_herdr_list_json() {
 
   local raw=""
   local rc=0
+  # Bug 2 诊断：herdr 的 stderr 以前被 2>/dev/null 丢掉，日志里只剩 rc，用户无从排障。
+  # 现在把它收进临时文件，失败时把摘要写进 warn。
+  # 刻意不用 mktemp：本函数在面板 3s 刷新路径上被反复调用，每次 mktemp = 多一个 fork
+  # （与 Bug 1 的「去 fork」目标相悔）。$$ + $RANDOM 已足够唯一（单线程 bash + 单进程）。
+  local errfile="${TMPDIR:-/tmp}/hf-herdr-err.$$.${RANDOM}"
+  : >"${errfile}" 2>/dev/null || errfile=""
   set +o errexit
   if command -v timeout >/dev/null 2>&1; then
-    raw="$(timeout "${MACHINES_HERDR_TIMEOUT}" "${bin}" machine list --json 2>/dev/null)"
+    if [[ -n ${errfile} ]]; then
+      raw="$(timeout "${MACHINES_HERDR_TIMEOUT}" "${bin}" machine list --json 2>"${errfile}")"
+    else
+      raw="$(timeout "${MACHINES_HERDR_TIMEOUT}" "${bin}" machine list --json 2>/dev/null)"
+    fi
     rc=$?
   else
-    raw="$("${bin}" machine list --json 2>/dev/null)"
+    if [[ -n ${errfile} ]]; then
+      raw="$("${bin}" machine list --json 2>"${errfile}")"
+    else
+      raw="$("${bin}" machine list --json 2>/dev/null)"
+    fi
     rc=$?
   fi
   set -o errexit
 
   if [[ ${rc} -ne 0 || -z ${raw} ]]; then
-    log warn "获取 saved machines 失败（${bin} machine list --json，rc=${rc}），按空列表继续。可手动执行该命令排查（herdr 未启动 / 未登录时也会如此）。"
+    local errsum=""
+    if [[ -n ${errfile} && -s ${errfile} ]]; then
+      errsum="$(<"${errfile}")"
+      errsum="${errsum//$'\n'/ }" # 压平换行，日志一条一行
+      errsum="${errsum:0:300}"    # 截断：不把长堆栈塞进日志
+    fi
+    log warn "获取 saved machines 失败（${bin} machine list --json，rc=${rc}），按空列表继续。可手动执行该命令排查（herdr 未启动 / 未登录时也会如此）。${errsum:+herdr stderr: ${errsum}}"
+    if [[ -n ${errfile} ]]; then
+      rm -f "${errfile}" 2>/dev/null || true
+    fi
     printf '[]\n'
     return 0
+  fi
+  if [[ -n ${errfile} ]]; then
+    rm -f "${errfile}" 2>/dev/null || true
   fi
 
   local arr=""
@@ -391,6 +417,8 @@ machines_activation_active() {
 # machines_is_local_target <ssh_target> -> stdout: yes|no
 #   强信号：localhost / 127.0.0.1 / ::1（含 user@ 前缀与 :port）与
 #   `hostname` / `hostname -s` / `hostname -f` 精确等值（大小写不敏感）。
+#   先剥 `ssh://` scheme（herdr machine add 接受该形态）：否则 `ssh://localhost`
+#   会被当成主机名 "ssh://localhost" 而误判为远程，多跑一次必败的 SSH 探测。
 #   不做 DNS 解析、不读 /etc/hosts —— 误判为远程只是多跑一次 ssh 探测，误判为本机才会写错路径。
 machines_is_local_target() {
   local raw="${1-}"
@@ -400,6 +428,10 @@ machines_is_local_target() {
   fi
 
   local host="${raw}"
+  # ssh:// scheme（大小写不敏感，与 _ssh_probe_strip_scheme 同源语义）
+  if [[ ${host,,} == ssh://* ]]; then
+    host="${host:6}"
+  fi
   # user@ 前缀（ssh_target 形如 user@host[:port]）
   if [[ ${host} == *@* ]]; then
     host="${host##*@}"
