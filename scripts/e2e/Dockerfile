@@ -17,12 +17,14 @@ FROM docker.io/library/archlinux:latest
 # coreutils/util-linux  timeout/pgrep/ss 等测试原语
 # tmux         run-two-machines.sh 的 UI 阶段：给真 herdr TUI client 当虚拟终端
 #              （send-keys 按键、capture-pane 读屏）
+# go           Go 二进制脚手架阶段的容器内构建（PLAN-GO-MIGRATION §7）；
+#              配合仓库内提交的 go/vendor/ 实现无网络（离线）构建
 # shellcheck/shfmt 不用 pacman 版：下方用二进制固定版本覆盖（见注释）
 RUN pacman -Sy --noconfirm \
   openssh jq python openbsd-netcat socat bash coreutils util-linux \
-  iproute2 tmux \
+  iproute2 tmux go \
   && pacman -Scc --noconfirm \
-  && command -v jq nc socat sshd ssh-keygen bash python3 tmux
+  && command -v jq nc socat sshd ssh-keygen bash python3 tmux go
 
 # shellcheck 与 shfmt 用二进制固定版本覆盖 pacman 版：
 # pacman 的 shfmt 是滚动更新（实测 3.14.x），与宿主/开发者常用 3.10 对同一构造

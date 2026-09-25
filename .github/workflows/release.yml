@@ -1,0 +1,45 @@
+# .github/workflows/release.yml — 打 tag v* 时用 GoReleaser 发布 4 平台产物（PLAN §7）
+#
+# 产物：herdr-forward_{version}_{os}_{arch}.tar.gz × 4（linux/darwin × amd64/arm64）
+#  + checksums.txt（postinstall 下载校验用，scripts/postinstall.sh 读 latest/download）。
+# goreleaser 版本固定，避免滚动更新导致同一 tag 重跑结果漂移。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # goreleaser 需要完整历史计算 changelog/版本
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache-dependency-path: go/go.sum
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload checksums.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
