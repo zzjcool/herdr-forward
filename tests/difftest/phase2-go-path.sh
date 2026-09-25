@@ -389,18 +389,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9) 仍未迁移的子命令零变化：bootstrap 仍由 bash 处理
+# 9) Phase 4 dispatch：watch/bootstrap 也切 Go；help 仍由 bin/forward 自身处理
 #
-# `watch` 故意不做样本：非 TTY 下它 exec `watch -n 3 forward list`，嵌套的 list 本来就
-# 应该走 Go（list 是已迁移的），marker 出现 GO 行是正确行为而不是回归。
+# watch 的非 TTY 退化会再调用 list，因此记录里可能有 watch 与 list 两条；
+# bootstrap 直接留下 bootstrap marker。help 不在 dispatch 白名单，marker 不变。
 # ---------------------------------------------------------------------------
-for unmigrated in "bootstrap" "help"; do
-  read -r -a unmigrated_argv <<<"${unmigrated}"
+mkdir -p "${SANDBOX}/shim-bin"
+cat >"${SANDBOX}/shim-bin/watch" <<'WATCH'
+#!/bin/sh
+printf 'phase4-watch %s\n' "$*"
+WATCH
+chmod +x "${SANDBOX}/shim-bin/watch"
+for migrated in "bootstrap" "watch"; do
+  read -r -a migrated_argv <<<"${migrated}"
   before="$(wc -l <"${MARKER}")"
-  run timeout 20 "${FW}" "${unmigrated_argv[@]}"
+  if [[ "${migrated}" == "watch" ]]; then
+    run env PATH="${SANDBOX}/shim-bin:${PATH}" timeout 20 "${FW}" "${migrated_argv[@]}" </dev/null
+  else
+    run timeout 20 "${FW}" "${migrated_argv[@]}"
+  fi
   after="$(wc -l <"${MARKER}")"
-  eq "${before}" "${after}" "未迁移子命令留 bash：${unmigrated}（rc=${rc}，marker 无新增）"
+  if [[ "${after}" -gt "${before}" ]]; then
+    ok "Phase 4 子命令走 Go：${migrated}（rc=${rc}）"
+  else
+    no "Phase 4 子命令未走 Go：${migrated}（rc=${rc}）"
+  fi
 done
+before="$(wc -l <"${MARKER}")"
+run timeout 20 "${FW}" help
+after="$(wc -l <"${MARKER}")"
+eq "${before}" "${after}" "help 仍留在 bin/forward（marker 无新增）"
 
 # ---------------------------------------------------------------------------
 # 汇总

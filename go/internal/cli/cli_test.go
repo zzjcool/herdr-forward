@@ -138,7 +138,8 @@ func TestDispatchExitCodes(t *testing.T) {
 		}
 	}
 
-	// 未迁移子命令：一律哨兵 9（绝不静默成功、也不误报用法错误）
+	// Phase 4 owns watch/bootstrap.  Keep this loop for any future command that
+	// is deliberately left behind during a partial migration.
 	for sub := range unmigrated {
 		rc, out, errOut := runCLI(t, sub)
 		if rc != exitNotImplemented {
@@ -154,9 +155,7 @@ func TestDispatchExitCodes(t *testing.T) {
 }
 
 func TestUnmigratedCoverage(t *testing.T) {
-	// 契约 C1 的 15 个子命令：Phase 3 之后 13 个已迁移/内建（add/list/remove/doctor/
-	// publish/unpublish/machines/bridge/ports/open-url/help/version + internal 探针），
-	// 仅 2 个未迁移（watch/bootstrap 属 Phase 4）。
+	// 契约 C1 的子命令：Phase 4 后 watch/bootstrap 也已迁移到 Go。
 	// 这条断言防「漏登记」导致某子命令静默落到 default 分支。
 	want := map[string]bool{
 		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
@@ -165,8 +164,8 @@ func TestUnmigratedCoverage(t *testing.T) {
 	}
 	migrated := map[string]bool{
 		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
-		"unpublish": true, "ports": true, "help": true, "version": true,
-		"machines": true, "bridge": true, "open-url": true,
+		"unpublish": true, "watch": true, "bootstrap": true, "ports": true,
+		"help": true, "version": true, "machines": true, "bridge": true, "open-url": true,
 	}
 	for sub := range want {
 		if unmigrated[sub] {
@@ -179,8 +178,8 @@ func TestUnmigratedCoverage(t *testing.T) {
 	if got := len(want); got != 14 {
 		t.Fatalf("契约清单长度 = %d, want 14（+internal 探针 = 15）", got)
 	}
-	if got := len(unmigrated); got != 2 {
-		t.Fatalf("未迁移子命令数 = %d, want 2（Phase 4 前仅 watch/bootstrap）", got)
+	if got := len(unmigrated); got != 0 {
+		t.Fatalf("未迁移子命令数 = %d, want 0（Phase 4 已接线 watch/bootstrap）", got)
 	}
 }
 

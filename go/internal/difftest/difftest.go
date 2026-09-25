@@ -102,6 +102,8 @@ func Main(args []string) int {
 		return cmdRemoteCmd(args[1:])
 	case "bridge-ssh-args":
 		return cmdBridgeSSHArgs(args[1:])
+	case "phase4":
+		return cmdPhase4(args[1:])
 	case "bridge-active":
 		return cmdBridgeActive(args[1:])
 	case "probe-kv":

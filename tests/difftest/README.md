@@ -50,7 +50,7 @@ bash tests/difftest/run.sh
 > W4 接线后只需在 `cli.Main` 加一行 `case "internal": return difftest.Main(args)`
 > （本包已自带 `internal` / `difftest` 前缀跳过，无需改本包）。
 
-## 覆盖的用例（426 条）
+## 覆盖的用例（438 条）
 
 | 组 | 用例 | 比对方式 |
 |---|---|---|
@@ -67,6 +67,7 @@ bash tests/difftest/run.sh
 | 11 | **HF1 行协议**（Phase 3）：`hf-fmt` 编码（HELLO/SYNC 空与多条/含非法条目/OPEN/STATUS 无·带 reason/PING）× `hf-parse` 解析（合法矩阵 + 非 HF1 前缀/未知动作/空行/仅前缀/STATUS 缺字段/注入尝试）× `hf-valid` C6 边界（合法/端口下限/前导零/id 不一致/越界/非数字/路径穿越）× `ssh-dest`（别名/`user@host`/`host:port`→URI/`ssh://`/`[v6]:port`/裸 IPv6）× `remote-cmd`（含空格与单引号）× `bridge-ssh-args`（信任边界 argv） | **逐字节** stdout + 退出码 |
 | 12 | **machines 合并视图 + 激活 schema**（Phase 3）：`view-json`（active/activated/local/inactive + orphan）× `active` / `has`（命中·未命中·orphan）/ `resolve`（id·label·大小写不敏感·orphan label·不存在）× **空状态**（无 activated-machines.json） | **逐字节** stdout + 退出码 |
 | 13 | **端口字面量边界矩阵**（Phase 3）：lp ∈ {1024,1025,9999,10000,65535,99999,0,80,102,1023}、rp ∈ {1,22,80,1024,65535,65536}、前导零 {01024,05173,010234}、六位端口 | **逐字节** stdout + 退出码 |
+| 14 | **Phase 4 panel / watch / installer**：panel 帧 golden、非 TTY `watch -n 3 forward list` 退化、tab bar Go installer 写入口径与幂等、startup-hook binary 缺失/存在两态 | 帧/输出逐字节 + rc + 配置断言 |
 
 组 3 的 probe 用例用的是 Go 侧 `serve reply|silent|close` 起的**真实**监听 socket
 （`net.Listen("tcp","127.0.0.1:0")`，端口由内核分配后打印，无竞态），bash 与 Go
@@ -99,7 +100,7 @@ bash tests/difftest/run.sh
 是**可复现的证据脚本**：它在隔离 HOME 里起真 sshd + echo 服务，用「记录型 shim」替换
 `bin/forward-go`（记录一行后 exec 真二进制），因此能同时断言「dispatch 到了 Go」与
 「Go 实现的行为」。Phase 3 起它同时钉住 dispatch 边界的翻转：`add --client` 与
-`machines`/`bridge`/`open-url` **必须**被路由到 Go，而 `bootstrap`/`help` 仍留 bash。
+`machines`/`bridge`/`open-url`/`watch`/`bootstrap` **必须**被路由到 Go，而 `help` 仍由 `bin/forward` 的 Bash dispatch 处理。
 
 ### 组 11/12 的两侧接线（Phase 3）
 

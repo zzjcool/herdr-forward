@@ -1112,6 +1112,94 @@ hf_pair "hf-valid 前导零 rp 拒绝" hf-valid f-5173 5173 05173
 hf_pair "hf-valid 六位端口拒绝" hf-valid f-100000 100000 100000
 
 # ===========================================================================
+# 组 14：Phase 4 面板/退化/安装器（Go-only pure boundary probes）
+#
+# panel-frame is intentionally a pure function probe: it never opens a TTY and
+# compares the complete frame byte-for-byte with its committed golden.  The
+# watch probe forces stdin=/dev/null and intercepts watch(1), while the
+# installer probe uses the real POSIX wrapper with the Go binary explicitly
+# selected (so a parked checkout artifact cannot make this test bash-only).
+# ===========================================================================
+printf '=== 组 14：Phase 4 panel / watch / installer ===\n'
+PANEL_STATE="${TMP}/phase4-panel-state"
+mkdir -p "${PANEL_STATE}"
+cp "${OWN_FIXTURES}/full.two.json" "${PANEL_STATE}/forwards.json"
+capture go_side "${PANEL_STATE}" phase4 panel-frame 3
+_readfile "${OWN_FIXTURES}/panel.frame.two.golden"
+phase4_golden="${get}"
+_eq "panel frame golden 逐字节" "${phase4_golden}" "${OUT}"
+_eq "panel frame rc" "0" "${RC}"
+
+WATCH_BIN="${TMP}/phase4-watch-bin"
+mkdir -p "${WATCH_BIN}"
+cat >"${WATCH_BIN}/watch" <<'WATCH'
+#!/bin/sh
+printf 'FAKE-WATCH %s\n' "$*"
+WATCH
+chmod +x "${WATCH_BIN}/watch"
+GO_CLI_FOR_TEST="${CLI_GO}"
+capture env PATH="${WATCH_BIN}:${PATH}" HERDR_PLUGIN_STATE_DIR="${TMP}/phase4-watch-state" \
+  bash -c "exec \"\$1\" watch </dev/null" _ "${GO_CLI_FOR_TEST}"
+_eq "watch non-TTY rc" "0" "${RC}"
+if [[ "${OUT}" == *"FAKE-WATCH -n 3"* && "${OUT}" == *" list"* ]]; then
+  ok "watch non-TTY 退化为 watch -n 3 forward list"
+else
+  bad "watch non-TTY 退化为 watch -n 3 forward list"
+  printf '#   got: %s\n' "${OUT}" >&2
+fi
+
+PHASE4_CONFIG="${TMP}/phase4-installer.toml"
+printf 'theme = "dark"\n' >"${PHASE4_CONFIG}"
+PHASE4_STATE="${TMP}/phase4-plugin-state"
+capture env HERDR_FORWARD_BIN="${GO_CLI_FOR_TEST}" HERDR_PLUGIN_ROOT="${ROOT}" \
+  HERDR_PLUGIN_STATE_DIR="${PHASE4_STATE}" bash "${ROOT}/scripts/install-tabbar.sh" \
+  --config "${PHASE4_CONFIG}"
+_eq "installer tabbar wrapper rc" "0" "${RC}"
+if grep -F "HERDR_PLUGIN_STATE_DIR='${PHASE4_STATE}'" "${PHASE4_CONFIG}" >/dev/null &&
+  grep -F "${ROOT}/bin/forward" "${PHASE4_CONFIG}" >/dev/null &&
+  grep -F 'list --oneline' "${PHASE4_CONFIG}" >/dev/null; then
+  ok "installer tab bar 写入口径（Go path + state env）"
+else
+  bad "installer tab bar 写入口径（Go path + state env）"
+fi
+capture env HERDR_FORWARD_BIN="${GO_CLI_FOR_TEST}" HERDR_PLUGIN_ROOT="${ROOT}" \
+  HERDR_PLUGIN_STATE_DIR="${PHASE4_STATE}" bash "${ROOT}/scripts/install-tabbar.sh" \
+  --config "${PHASE4_CONFIG}"
+_eq "installer tabbar 幂等 rc" "0" "${RC}"
+if [[ "${OUT}" == *"already installed"* ]]; then
+  ok "installer tab bar 幂等"
+else
+  bad "installer tab bar 幂等"
+fi
+
+# startup-hook wrapper contract: missing binary is a one-line, non-blocking
+# warning (rc=0); present binary executes the Go CLI and writes the config.
+STARTUP_MISSING="${TMP}/startup-missing"
+mkdir -p "${STARTUP_MISSING}"
+cp "${ROOT}/scripts/startup-hook.sh" "${STARTUP_MISSING}/startup-hook.sh"
+chmod +x "${STARTUP_MISSING}/startup-hook.sh"
+capture env HERDR_FORWARD_BIN="${STARTUP_MISSING}/no-forward-go" HERDR_FORWARD_SOURCE_ROOT="${STARTUP_MISSING}/no-source" \
+  HERDR_PLUGIN_ROOT="${STARTUP_MISSING}" HOME="${STARTUP_MISSING}/home" \
+  sh -c "cd \"\$1\" && exec \"\$1/startup-hook.sh\"" _ "${STARTUP_MISSING}"
+_eq "startup-hook binary 缺失 rc" "0" "${RC}"
+if [[ "${ERR}" == *"forward-go 缺失"* && "${OUT}" == "" ]]; then
+  ok "startup-hook binary 缺失仅一行提示且不阻塞"
+else
+  bad "startup-hook binary 缺失仅一行提示且不阻塞"
+fi
+STARTUP_PRESENT_CONFIG="${TMP}/startup-present.toml"
+printf 'theme = "dark"\n' >"${STARTUP_PRESENT_CONFIG}"
+capture env HERDR_FORWARD_BIN="${GO_CLI_FOR_TEST}" HERDR_PLUGIN_ROOT="${ROOT}" \
+  HERDR_PLUGIN_STATE_DIR="${TMP}/startup-present-state" \
+  bash "${ROOT}/scripts/startup-hook.sh" --config "${STARTUP_PRESENT_CONFIG}"
+_eq "startup-hook binary 存在 rc" "0" "${RC}"
+if grep -F 'herdr-forward: tab bar status entry' "${STARTUP_PRESENT_CONFIG}" >/dev/null; then
+  ok "startup-hook binary 存在执行 Go installer"
+else
+  bad "startup-hook binary 存在执行 Go installer"
+fi
+
+# ===========================================================================
 # 汇总
 # ===========================================================================
 printf '1..%d\n' "$((PASS + FAIL))"

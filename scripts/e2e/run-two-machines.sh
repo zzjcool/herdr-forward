@@ -26,6 +26,8 @@ PROJ="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${HERDR_FORWARD_E2E_IMAGE:-herdr-forward-e2e:local}"
 HERDR_HOST_BIN="${HERDR_FORWARD_E2E_HERDR:-/usr/bin/herdr}"
 SUFFIX="$$-${RANDOM}"
+INJECT_DIR="${TMPDIR:-/tmp}/hf-two-machines-${SUFFIX}"
+PLUGIN_TAR="${INJECT_DIR}/plugin.tar"
 NET="hf2m-${SUFFIX}"
 A="hf2m-a-${SUFFIX}"
 B="hf2m-b-${SUFFIX}"
@@ -61,6 +63,19 @@ if [[ ! -x ${HERDR_HOST_BIN} ]]; then
 fi
 log "构建/复用镜像 ${IMAGE}"
 timeout 900 docker build -q -f "${PROJ}/scripts/e2e/Dockerfile" -t "${IMAGE}" "${PROJ}" >/dev/null
+log "构建一次 Go CLI，并注入两机 tar（Phase 4 §16.4）"
+mkdir -p "${INJECT_DIR}"
+if ! (cd "${PROJ}/go" && GOFLAGS=-mod=vendor go build -o "${INJECT_DIR}/forward-go" ./cmd/forward) >"${INJECT_DIR}/go-build.log" 2>&1; then
+  echo "two-machines: Go CLI 构建失败（${INJECT_DIR}/go-build.log）" >&2
+  cat "${INJECT_DIR}/go-build.log" >&2
+  exit 1
+fi
+# Build a single source tar for both containers.  The binary is appended under
+# bin/forward-go so the two-machine assertions exercise the same Go dispatch,
+# independent of ci.sh's migration adapter parking the checkout artifact.
+tar --exclude=.git --exclude=.pi-subagents --exclude=test-results --exclude=node_modules \
+  -cf "${PLUGIN_TAR}" -C "${PROJ}" .
+tar --transform='s,^forward-go$,bin/forward-go,' -rf "${PLUGIN_TAR}" -C "${INJECT_DIR}" forward-go
 if ! timeout 60 docker run --rm -v "${HERDR_HOST_BIN}:/usr/local/bin/herdr:ro" \
   --entrypoint /usr/local/bin/herdr "${IMAGE}" --version >/dev/null 2>&1; then
   echo "two-machines: 宿主 herdr 在容器内跑不起来（模式 B）；本验证需要真 herdr" >&2
@@ -79,6 +94,7 @@ cleanup() {
   fi
   docker rm -f "${A}" "${B}" >/dev/null 2>&1
   docker network rm "${NET}" >/dev/null 2>&1
+  rm -rf "${INJECT_DIR}"
   return "${code}"
 }
 trap cleanup EXIT
@@ -237,13 +253,16 @@ docker network create --internal "${NET}" >/dev/null
 MOUNTS=(
   -v "${HERDR_HOST_BIN}:/usr/local/bin/herdr:ro"
   -v "${PROJ}:/plugin-src:ro"
+  -v "${PLUGIN_TAR}:/plugin-go.tar:ro"
 )
 docker run -d --init --name "${B}" --hostname devbox --network "${NET}" --network-alias devbox \
   --user root "${MOUNTS[@]}" --entrypoint sleep "${IMAGE}" infinity >/dev/null
 docker run -d --init --name "${A}" --hostname laptop --network "${NET}" --network-alias laptop \
   "${MOUNTS[@]}" --entrypoint sleep "${IMAGE}" infinity >/dev/null
 
-COPY_PLUGIN='mkdir -p ~/plugin && cd /plugin-src && tar --exclude=.git --exclude=.pi-subagents --exclude=test-results --exclude=node_modules -cf - . | tar -C ~/plugin -xf -'
+# The tar already contains the full checkout plus bin/forward-go; no second
+# source copy is allowed to accidentally drop the injected Go artifact.
+COPY_PLUGIN='mkdir -p ~/plugin && tar -C ~/plugin -xf /plugin-go.tar && chmod 0755 ~/plugin/bin/forward-go'
 
 # --- 2. B：用户 bob、sshd、两个只绑 loopback 的 dev server、herdr server ---------
 log "B：用户 bob + sshd + dev server + herdr server"
