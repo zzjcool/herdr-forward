@@ -8,7 +8,7 @@ package hfcommon
 type Health int
 
 const (
-	HealthUp        Health = iota // 本地可连且远端有回包
+	HealthUp       Health = iota // 本地可连且远端有回包
 	HealthDegraded               // 本地可连但无回包（隧道半开）
 	HealthDown                   // 连接被拒/超时
 )
