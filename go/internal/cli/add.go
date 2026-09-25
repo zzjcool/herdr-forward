@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/machine"
 	"github.com/zzjcool/herdr-forward/internal/state"
 	"github.com/zzjcool/herdr-forward/internal/tunnel"
@@ -185,8 +186,8 @@ func addClient(localPort, remotePort int) int {
 func anyClientLive() bool {
 	sessions := bridgeSessions()
 	for _, s := range sessions {
-		if doc, ok := s.(*jobj); ok {
-			if v, _ := doc.get("live"); jqTruthy(v) {
+		if doc, ok := s.(*jqjson.Object); ok {
+			if v, _ := doc.Get("live"); jqjson.Truthy(v) {
 				return true
 			}
 		}

@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/ports"
 )
 
@@ -41,7 +42,7 @@ func cmdPorts(args []string) int {
 	}
 
 	if len(args) > 0 && args[0] == "--json" {
-		fmt.Println(encodeJV(portsJSONModel(listeners), false))
+		fmt.Println(jqjson.Encode(portsJSONModel(listeners), false))
 		return exitOK
 	}
 	if len(args) > 0 {
@@ -70,10 +71,10 @@ func cmdPorts(args []string) int {
 func portsJSONModel(listeners []ports.Listener) any {
 	arr := make([]any, 0, len(listeners))
 	for _, l := range listeners {
-		row := newJObj()
-		row.set("port", jsonNumberLiteral(strconv.Itoa(l.Port)))
-		row.set("addr", l.Addr)
-		row.set("process", l.Process)
+		row := jqjson.NewObject()
+		row.Set("port", jqjson.NumberLiteral(strconv.Itoa(l.Port)))
+		row.Set("addr", l.Addr)
+		row.Set("process", l.Process)
 		arr = append(arr, row)
 	}
 	return arr
@@ -87,15 +88,15 @@ func portsJSONModel(listeners []ports.Listener) any {
 func forwardedMap() map[string]string {
 	out := map[string]string{}
 	for _, e := range readRawForwards() {
-		o, ok := e.(*jobj)
+		o, ok := e.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		if jqStr(mustGet(o, "mode")) != "client" {
+		if jqjson.Str(jqGet(o, "mode")) != "client" {
 			continue
 		}
-		key := jqToString(mustGet(o, "remote_port"))
-		out[key] = jqToString(mustGet(o, "local_port"))
+		key := jqjson.ToString(jqGet(o, "remote_port"))
+		out[key] = jqjson.ToString(jqGet(o, "local_port"))
 	}
 	return out
 }

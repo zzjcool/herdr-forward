@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/render"
 	"github.com/zzjcool/herdr-forward/internal/state"
 )
@@ -85,10 +86,10 @@ func listJSON(v view) int {
 		hfcommon.Logf("error", "FORWARD_STATE_VERSION 不是合法 JSON：%q（jq --argjson 兼容模式仅接受单个 JSON 值）。", os.Getenv("FORWARD_STATE_VERSION"))
 		return exitStateVersionInvalid
 	}
-	doc := newJObj()
-	doc.set("version", version)
-	doc.set("forwards", v.rows)
-	fmt.Println(encodeJV(doc, true))
+	doc := jqjson.NewObject()
+	doc.Set("version", version)
+	doc.Set("forwards", v.rows)
+	fmt.Println(jqjson.Encode(doc, true))
 	return exitOK
 }
 
@@ -107,11 +108,11 @@ func stateVersionValue() (any, bool) {
 	if raw == "" {
 		raw = "1"
 	}
-	if v, err := parseJV([]byte(raw)); err == nil {
+	if v, err := jqjson.Parse([]byte(raw)); err == nil {
 		return v, true
 	}
 	if lit, ok := lenientNumberLiteral(raw); ok {
-		return jsonNumberLiteral(lit), true
+		return jqjson.NumberLiteral(lit), true
 	}
 	return nil, false
 }
@@ -163,7 +164,7 @@ func lenientNumberLiteral(raw string) (string, bool) {
 		return "", false
 	}
 	lit := s[:intStart] + orZero(intPart) + "." + fracPart + expPart
-	return formatJQNumber(lit), true
+	return jqjson.FormatNumber(lit), true
 }
 
 func orZero(s string) string {
@@ -205,35 +206,35 @@ func typedRows(rows []any) []state.Forward {
 // 夹具规避）：字段缺失/null 与显式空串/0 在 Go 侧不可区分（远端主机、remote_port、
 // status、pid 非数字等）。
 func rowToForward(e any) state.Forward {
-	o, ok := e.(*jobj)
+	o, ok := e.(*jqjson.Object)
 	if !ok {
 		return state.Forward{}
 	}
-	mode := jqStr(mustGet(o, "mode"))
+	mode := jqjson.Str(jqGet(o, "mode"))
 	f := state.Forward{
-		LocalPort:  intOrZero(mustGet(o, "local_port")),
-		RemoteHost: tsvEscape(strOrEmpty(mustGet(o, "remote_host"), "127.0.0.1")),
-		RemotePort: intOrZero(mustGet(o, "remote_port")),
-		Status:     tsvEscape(jqToString(mustGet(o, "status"))),
-		Pid:        intPtrOrNil(mustGet(o, "pid")),
+		LocalPort:  intOrZero(jqGet(o, "local_port")),
+		RemoteHost: tsvEscape(strOrEmpty(jqGet(o, "remote_host"), "127.0.0.1")),
+		RemotePort: intOrZero(jqGet(o, "remote_port")),
+		Status:     tsvEscape(jqjson.ToString(jqGet(o, "status"))),
+		Pid:        intPtrOrNil(jqGet(o, "pid")),
 	}
-	if p, ok := o.get("pid"); !ok || p == nil {
+	if p, ok := o.Get("pid"); !ok || p == nil {
 		// bash: `if .pid == null then "-"`；保持 nil（render.tablePID 输出 "-"）
 		f.Pid = nil
 	}
-	if s, ok := o.get("status"); !ok || s == nil {
+	if s, ok := o.Get("status"); !ok || s == nil {
 		f.Status = "" // render.tableStatus 会渲染成 "-"
 	}
 
 	switch mode {
 	case "client":
-		client := jqToString(mustGet(o, "client"))
+		client := jqjson.ToString(jqGet(o, "client"))
 		if client == "" {
 			f.Machine = "client"
 		} else {
 			f.Machine = tsvEscape("client:" + client)
 		}
-		reason := jqToString(mustGet(o, "status_reason"))
+		reason := jqjson.ToString(jqGet(o, "status_reason"))
 		if reason == "" {
 			f.SshTarget = "-"
 		} else {
@@ -241,20 +242,20 @@ func rowToForward(e any) state.Forward {
 		}
 	case "bridge":
 		f.Mode = state.Mode("bridge")
-		machine := jqToString(mustGet(o, "machine"))
+		machine := jqjson.ToString(jqGet(o, "machine"))
 		if machine == "" {
 			machine = "-"
 		}
 		f.Machine = tsvEscape(machine)
-		f.SshTarget = tsvOrDash(jqToString(mustGet(o, "ssh_target")))
+		f.SshTarget = tsvOrDash(jqjson.ToString(jqGet(o, "ssh_target")))
 	default:
 		f.Mode = state.ModeTunnel
-		machine := jqToString(mustGet(o, "machine"))
+		machine := jqjson.ToString(jqGet(o, "machine"))
 		if machine == "" {
 			machine = "-"
 		}
 		f.Machine = tsvEscape(machine)
-		f.SshTarget = tsvOrDash(jqToString(mustGet(o, "ssh_target")))
+		f.SshTarget = tsvOrDash(jqjson.ToString(jqGet(o, "ssh_target")))
 	}
 	return f
 }
@@ -296,18 +297,18 @@ func strOrEmpty(v any, def string) string {
 	if v == nil {
 		return def
 	}
-	return jqToString(v)
+	return jqjson.ToString(v)
 }
 
 // intOrZero 取整数（非数字/缺失 -> 0；与 state.Forward 的零值语义一致）。
 func intOrZero(v any) int {
-	n, ok := v.(jsonNumberType)
+	n, ok := v.(jqjson.Number)
 	if !ok {
 		return 0
 	}
-	i, err := strconv.Atoi(formatJQNumber(string(n)))
+	i, err := strconv.Atoi(jqjson.FormatNumber(string(n)))
 	if err != nil {
-		f, err := strconv.ParseFloat(formatJQNumber(string(n)), 64)
+		f, err := strconv.ParseFloat(jqjson.FormatNumber(string(n)), 64)
 		if err != nil {
 			return 0
 		}
@@ -318,11 +319,11 @@ func intOrZero(v any) int {
 
 // intPtrOrNil 取可空整数（非整数 -> nil，render.tablePID 输出 "-"）。
 func intPtrOrNil(v any) *int {
-	n, ok := v.(jsonNumberType)
+	n, ok := v.(jqjson.Number)
 	if !ok {
 		return nil
 	}
-	lit := formatJQNumber(string(n))
+	lit := jqjson.FormatNumber(string(n))
 	if strings.ContainsAny(lit, ".Ee") {
 		return nil
 	}
@@ -337,7 +338,7 @@ func intPtrOrNil(v any) *int {
 // 保留给内部断言与排序自测使用）。
 func sortRowsByLocalPort(rows []any) {
 	sort.SliceStable(rows, func(i, j int) bool {
-		return intOrZero(mustGet(asObj(rows[i]), "local_port")) <
-			intOrZero(mustGet(asObj(rows[j]), "local_port"))
+		return intOrZero(jqGet(asObj(rows[i]), "local_port")) <
+			intOrZero(jqGet(asObj(rows[j]), "local_port"))
 	})
 }

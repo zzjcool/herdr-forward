@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"io"
 	"os"
 	"os/exec"
@@ -690,8 +691,8 @@ func TestFormatJQNumber(t *testing.T) {
 		"1000000e-13": "1.000000E-7", "-1.50": "-1.50", "1234567890123456789012345678901234567890e-40": "0.1234567890123456789012345678901234567890",
 	}
 	for in, want := range cases {
-		if got := formatJQNumber(in); got != want {
-			t.Errorf("formatJQNumber(%q) = %q, want %q", in, got, want)
+		if got := jqjson.FormatNumber(in); got != want {
+			t.Errorf("jqjson.FormatNumber(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -716,30 +717,30 @@ func TestEncodeJQString(t *testing.T) {
 		"é":        `"é"`,
 	}
 	for in, want := range cases {
-		if got := encodeJQString(in); got != want {
-			t.Errorf("encodeJQString(%q) = %q, want %q", in, got, want)
+		if got := jqjson.EncodeString(in); got != want {
+			t.Errorf("jqjson.EncodeString(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
 func TestEncodeJVOrderAndSorting(t *testing.T) {
-	v, err := parseJV([]byte(`{"b":1,"a":{"d":1,"c":2},"n":1e3,"s":"x"}`))
+	v, err := jqjson.Parse([]byte(`{"b":1,"a":{"d":1,"c":2},"n":1e3,"s":"x"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := encodeJV(v, false), `{"b":1,"a":{"d":1,"c":2},"n":1E+3,"s":"x"}`; got != want {
+	if got, want := jqjson.Encode(v, false), `{"b":1,"a":{"d":1,"c":2},"n":1E+3,"s":"x"}`; got != want {
 		t.Errorf("插入顺序编码 = %q, want %q", got, want)
 	}
-	if got, want := encodeJV(v, true), `{"a":{"c":2,"d":1},"b":1,"n":1E+3,"s":"x"}`; got != want {
+	if got, want := jqjson.Encode(v, true), `{"a":{"c":2,"d":1},"b":1,"n":1E+3,"s":"x"}`; got != want {
 		t.Errorf("字母序编码 = %q, want %q", got, want)
 	}
 }
 
 func TestParseJVRejectsTrailingContent(t *testing.T) {
-	if _, err := parseJV([]byte(`{} {}`)); err == nil {
+	if _, err := jqjson.Parse([]byte(`{} {}`)); err == nil {
 		t.Error("尾随内容应报错")
 	}
-	if _, err := parseJV([]byte(`{`)); err == nil {
+	if _, err := jqjson.Parse([]byte(`{`)); err == nil {
 		t.Error("截断的 JSON 应报错")
 	}
 }
@@ -749,12 +750,12 @@ func TestJQTruthy(t *testing.T) {
 		in   any
 		want bool
 	}{
-		{nil, false}, {false, false}, {true, true}, {jsonNumberLiteral("0"), true},
+		{nil, false}, {false, false}, {true, true}, {jqjson.NumberLiteral("0"), true},
 		{"", true}, {[]any{}, true},
 	}
 	for _, tc := range cases {
-		if got := jqTruthy(tc.in); got != tc.want {
-			t.Errorf("jqTruthy(%v) = %v, want %v", tc.in, got, tc.want)
+		if got := jqjson.Truthy(tc.in); got != tc.want {
+			t.Errorf("jqjson.Truthy(%v) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }

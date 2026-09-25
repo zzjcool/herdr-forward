@@ -14,7 +14,7 @@
 // 因此这里自带一个「顺序保留对象 + 保留数字字面量」的模型：用 json.Decoder 的
 // Token() 流式解析（UseNumber 保留字面量），用下面的编码器按 jq 的规则输出。
 // golden 全部来自本机 jq 1.8.2 的实测输出（见 cli_test.go 的表驱动用例）。
-package cli
+package jqjson
 
 import (
 	"bytes"
@@ -26,45 +26,65 @@ import (
 	"strings"
 )
 
-// jsonNumberType 是保留字面量的数字类型别名（json.Decoder.UseNumber 产出 json.Number）。
+// Number 是保留字面量的数字类型别名（json.Decoder.UseNumber 产出 json.Number）。
 // 用别名而非新类型，避免在解析结果里混入需要转换的类型。
-type jsonNumberType = json.Number
+type Number = json.Number
 
-// jsonNumberLiteral 把十进制字面量包成 json.Number（只在构造视图行时用）。
-func jsonNumberLiteral(lit string) json.Number { return json.Number(lit) }
+// NumberLiteral 把十进制字面量包成 json.Number（只在构造视图行时用）。
+func NumberLiteral(lit string) json.Number { return json.Number(lit) }
 
-// jobj 是「保留键插入顺序」的 JSON 对象。
+// Object 是「保留键插入顺序」的 JSON 对象。
 //
 // 必要性：jq 的 `to_entries` / 对象迭代都按插入顺序（`-S` 只在**输出时**按键排序），
 // 而 `status` 对象的 to_entries 顺序决定 `bridge_live_status_json` 里
 // 「同 id 多条报告」的 tie-break 结果。Go 的 map 无法提供这一保证。
-type jobj struct {
+type Object struct {
 	keys []string
 	vals map[string]any
 }
 
-func newJObj() *jobj { return &jobj{vals: map[string]any{}} }
+func NewObject() *Object { return &Object{vals: map[string]any{}} }
 
 // set 写入键值；已存在的键保持原位置（jq 的对象更新语义：就地改值，不挪位置）。
-func (o *jobj) set(key string, val any) {
+// Set 写入键值；已存在的键保持原位置（jq 的对象更新语义：就地改值，不挪位置）。
+func (o *Object) Set(key string, val any) { o.set(key, val) }
+
+func (o *Object) set(key string, val any) {
 	if _, ok := o.vals[key]; !ok {
 		o.keys = append(o.keys, key)
 	}
 	o.vals[key] = val
 }
 
+// Get 取值；缺失键返回 (nil, false)。
+func (o *Object) Get(key string) (any, bool) { return o.get(key) }
+
+// Keys 返回键的插入顺序（复刻 jq 的对象迭代序）。
+func (o *Object) Keys() []string { return o.keys }
+
+// Val 取键值（缺失返回 nil）。
+func (o *Object) Val(key string) any {
+	v, _ := o.vals[key]
+	return v
+}
+
 // get 取值；缺失键返回 (nil, false)。
-func (o *jobj) get(key string) (any, bool) {
+func (o *Object) get(key string) (any, bool) {
 	v, ok := o.vals[key]
 	return v, ok
 }
 
-// parseJV 解析**一个**完整 JSON 值（允许首尾空白，不允许多余内容）。
+// MarshalJSON 让 Object 也能直接喂给 encoding/json（键按插入序，不排序）。
+func (o *Object) MarshalJSON() ([]byte, error) {
+	return []byte(Encode(o, false)), nil
+}
+
+// Parse 解析**一个**完整 JSON 值（允许首尾空白，不允许多余内容）。
 // 与 jq 对齐：任何语法错误都返回 error（调用方据此走 warn 降级路径）。
-func parseJV(data []byte) (any, error) {
+func Parse(data []byte) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	v, err := decodeJVValue(dec)
+	v, err := decodeValue(dec)
 	if err != nil {
 		return nil, err
 	}
@@ -74,15 +94,15 @@ func parseJV(data []byte) (any, error) {
 	return v, nil
 }
 
-func decodeJVValue(dec *json.Decoder) (any, error) {
+func decodeValue(dec *json.Decoder) (any, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, err
 	}
-	return decodeJVFromToken(dec, tok)
+	return decodeFromToken(dec, tok)
 }
 
-func decodeJVFromToken(dec *json.Decoder, tok json.Token) (any, error) {
+func decodeFromToken(dec *json.Decoder, tok json.Token) (any, error) {
 	delim, isDelim := tok.(json.Delim)
 	if !isDelim {
 		// string / json.Number / bool / nil 都是可直接使用的叶子值
@@ -90,7 +110,7 @@ func decodeJVFromToken(dec *json.Decoder, tok json.Token) (any, error) {
 	}
 	switch delim {
 	case '{':
-		obj := newJObj()
+		obj := NewObject()
 		for dec.More() {
 			kt, err := dec.Token()
 			if err != nil {
@@ -100,7 +120,7 @@ func decodeJVFromToken(dec *json.Decoder, tok json.Token) (any, error) {
 			if !ok {
 				return nil, fmt.Errorf("json: 对象键不是字符串")
 			}
-			val, err := decodeJVValue(dec)
+			val, err := decodeValue(dec)
 			if err != nil {
 				return nil, err
 			}
@@ -113,7 +133,7 @@ func decodeJVFromToken(dec *json.Decoder, tok json.Token) (any, error) {
 	case '[':
 		arr := []any{}
 		for dec.More() {
-			val, err := decodeJVValue(dec)
+			val, err := decodeValue(dec)
 			if err != nil {
 				return nil, err
 			}
@@ -128,17 +148,17 @@ func decodeJVFromToken(dec *json.Decoder, tok json.Token) (any, error) {
 	}
 }
 
-// encodeJV 按 jq 的规则把值模型编码成紧凑 JSON。
+// Encode 按 jq 的规则把值模型编码成紧凑 JSON。
 //
 //	sorted=false —— 保留对象键插入顺序（对位 `jq -c`，如 `ports --json`）
 //	sorted=true  —— 对象键递归按字母序排列（对位 `jq -S -c`，如 `list --json`）
-func encodeJV(v any, sorted bool) string {
+func Encode(v any, sorted bool) string {
 	var b strings.Builder
-	writeJV(&b, v, sorted)
+	writeValue(&b, v, sorted)
 	return b.String()
 }
 
-func writeJV(b *strings.Builder, v any, sorted bool) {
+func writeValue(b *strings.Builder, v any, sorted bool) {
 	switch t := v.(type) {
 	case nil:
 		b.WriteString("null")
@@ -149,10 +169,10 @@ func writeJV(b *strings.Builder, v any, sorted bool) {
 			b.WriteString("false")
 		}
 	case string:
-		b.WriteString(encodeJQString(t))
+		b.WriteString(EncodeString(t))
 	case json.Number:
-		b.WriteString(formatJQNumber(t.String()))
-	case *jobj:
+		b.WriteString(FormatNumber(t.String()))
+	case *Object:
 		keys := t.keys
 		if sorted {
 			keys = append([]string(nil), t.keys...)
@@ -163,9 +183,9 @@ func writeJV(b *strings.Builder, v any, sorted bool) {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			b.WriteString(encodeJQString(k))
+			b.WriteString(EncodeString(k))
 			b.WriteByte(':')
-			writeJV(b, t.vals[k], sorted)
+			writeValue(b, t.vals[k], sorted)
 		}
 		b.WriteByte('}')
 	case []any:
@@ -174,7 +194,7 @@ func writeJV(b *strings.Builder, v any, sorted bool) {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			writeJV(b, e, sorted)
+			writeValue(b, e, sorted)
 		}
 		b.WriteByte(']')
 	default:
@@ -183,13 +203,13 @@ func writeJV(b *strings.Builder, v any, sorted bool) {
 	}
 }
 
-// encodeJQString 复刻 jq 的字符串转义（od 逐字节实测）：
+// EncodeString 复刻 jq 的字符串转义（od 逐字节实测）：
 //
 //	"  -> \"     \  -> \\     \b -> \b     \t -> \t
 //	\n -> \n     \f -> \f     \r -> \r
 //	其余 < 0x20 与 0x7f -> \u00xx（小写十六进制）
 //	别的字节原样输出（UTF-8 原样；U+2028/U+2029 不转义，`<` `>` `&` 不转义）
-func encodeJQString(s string) string {
+func EncodeString(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 2)
 	b.WriteByte('"')
@@ -222,7 +242,7 @@ func encodeJQString(s string) string {
 	return b.String()
 }
 
-// formatJQNumber 把 JSON 数字字面量重排成 jq（decNumber）的输出形态。
+// FormatNumber 把 JSON 数字字面量重排成 jq（decNumber）的输出形态。
 //
 // 算法即 decNumber 的 decNumberToString（用实测的 ~60 个字面量反推并验证）：
 //
@@ -234,7 +254,7 @@ func encodeJQString(s string) string {
 //
 // 例：1e3->1E+3，1.5e3->1.5E+3，1e-6->0.000001，1e-7->1E-7，0.0000000->0E-7，
 // 2.50->2.50，-0->-0，0e5->0E+5，1000000e-6->1.000000，1.000000e-7->1.000000E-7。
-func formatJQNumber(lit string) string {
+func FormatNumber(lit string) string {
 	s := lit
 	sign := ""
 	if strings.HasPrefix(s, "-") {
@@ -293,8 +313,8 @@ func formatJQNumber(lit string) string {
 	return sign + out
 }
 
-// jqTruthy 复刻 jq 的真值判定：只有 null 与 false 是「假」，其余（含 0、""）为真。
-func jqTruthy(v any) bool {
+// Truthy 复刻 jq 的真值判定：只有 null 与 false 是「假」，其余（含 0、""）为真。
+func Truthy(v any) bool {
 	switch t := v.(type) {
 	case nil:
 		return false
@@ -305,8 +325,8 @@ func jqTruthy(v any) bool {
 	}
 }
 
-// jqTypeName 复刻 jq 的 `type` 输出（object/array/string/number/boolean/null）。
-func jqTypeName(v any) string {
+// TypeName 复刻 jq 的 `type` 输出（object/array/string/number/boolean/null）。
+func TypeName(v any) string {
 	switch v.(type) {
 	case nil:
 		return "null"
@@ -318,16 +338,16 @@ func jqTypeName(v any) string {
 		return "number"
 	case []any:
 		return "array"
-	case *jobj:
+	case *Object:
 		return "object"
 	default:
 		return "unknown"
 	}
 }
 
-// jqToString 复刻 jq 的 `tostring`：数字保留字面量形态、字符串原样、
+// ToString 复刻 jq 的 `tostring`：数字保留字面量形态、字符串原样、
 // 对象/数组用紧凑（键序保留）形态、null -> "null"。
-func jqToString(v any) string {
+func ToString(v any) string {
 	switch t := v.(type) {
 	case nil:
 		return "null"
@@ -339,14 +359,14 @@ func jqToString(v any) string {
 		}
 		return "false"
 	case json.Number:
-		return formatJQNumber(t.String())
+		return FormatNumber(t.String())
 	default:
-		return encodeJV(v, false)
+		return Encode(v, false)
 	}
 }
 
-// jqStr 取字符串（jq 里 `(.x // "")` 的 Go 化）：非字符串一律当空串。
-func jqStr(v any) string {
+// Str 取字符串（jq 里 `(.x // "")` 的 Go 化）：非字符串一律当空串。
+func Str(v any) string {
 	s, _ := v.(string)
 	return s
 }

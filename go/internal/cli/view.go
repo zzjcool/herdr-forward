@@ -35,6 +35,7 @@ import (
 	"syscall"
 
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 )
 
 // lib/state.sh 的三条 warn 文案（逐字复刻；`log warn` 会同时镜像到 stderr）。
@@ -86,7 +87,7 @@ func loadView() view {
 // allObjects 报告数组里是否每个元素都是 JSON 对象（空数组为真）。
 func allObjects(arr []any) bool {
 	for _, e := range arr {
-		if _, ok := e.(*jobj); !ok {
+		if _, ok := e.(*jqjson.Object); !ok {
 			return false
 		}
 	}
@@ -109,17 +110,17 @@ func readRawForwards() []any {
 		hfcommon.Logf("warn", stateWarnUnparsable, path)
 		return []any{}
 	}
-	parsed, err := parseJV(data)
+	parsed, err := jqjson.Parse(data)
 	if err != nil {
 		hfcommon.Logf("warn", stateWarnUnparsable, path)
 		return []any{}
 	}
-	obj, ok := parsed.(*jobj)
+	obj, ok := parsed.(*jqjson.Object)
 	if !ok {
 		hfcommon.Logf("warn", stateWarnUnparsable, path)
 		return []any{}
 	}
-	fv, ok := obj.get("forwards")
+	fv, ok := obj.Get("forwards")
 	if !ok {
 		hfcommon.Logf("warn", stateWarnNoForwards, path)
 		return []any{}
@@ -226,22 +227,22 @@ func bridgeSessions() []any {
 		if err != nil {
 			continue
 		}
-		parsed, err := parseJV(data)
+		parsed, err := jqjson.Parse(data)
 		if err != nil {
 			continue
 		}
-		doc, ok := parsed.(*jobj)
+		doc, ok := parsed.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		seen, _ := doc.get("last_seen_unix")
+		seen, _ := doc.Get("last_seen_unix")
 		seenDigits := floorDigits(seen)
 		live := false
 		if n, err := strconv.ParseInt(seenDigits, 10, 64); err == nil {
 			live = now-n <= window
 		}
-		doc.set("pid", jsonNumber(pidText))
-		doc.set("live", live)
+		doc.Set("pid", jsonNumber(pidText))
+		doc.Set("live", live)
 		docs = append(docs, doc)
 	}
 	if len(docs) == 0 {
@@ -266,31 +267,31 @@ func bridgeLiveStatus(sessions []any) []liveStatus {
 	}
 	entries := []entry{}
 	for _, s := range sessions {
-		doc, ok := s.(*jobj)
+		doc, ok := s.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		if v, _ := doc.get("live"); !jqTruthy(v) {
+		if v, _ := doc.Get("live"); !jqjson.Truthy(v) {
 			continue
 		}
-		client := jqStr(mustGet(doc, "client_host"))
-		statusVal, _ := doc.get("status")
-		statusObj, ok := statusVal.(*jobj)
+		client := jqjson.Str(jqGet(doc, "client_host"))
+		statusVal, _ := doc.Get("status")
+		statusObj, ok := statusVal.(*jqjson.Object)
 		if !ok {
 			// jq 在此处对非对象 .status 会报错（现实中不会出现）；Go 退化为「无汇报」。
 			continue
 		}
-		for _, k := range statusObj.keys {
-			val, _ := statusObj.get(k)
-			vo, _ := val.(*jobj)
+		for _, k := range statusObj.Keys() {
+			val, _ := statusObj.Get(k)
+			vo, _ := val.(*jqjson.Object)
 			state := "down"
 			reason := ""
 			if vo != nil {
-				if v, ok := vo.get("state"); ok && v != nil {
-					state = jqToString(v)
+				if v, ok := vo.Get("state"); ok && v != nil {
+					state = jqjson.ToString(v)
 				}
-				if v, ok := vo.get("reason"); ok && v != nil {
-					reason = jqToString(v)
+				if v, ok := vo.Get("reason"); ok && v != nil {
+					reason = jqjson.ToString(v)
 				}
 			}
 			entries = append(entries, entry{id: k, state: state, reason: reason, client: client})
@@ -338,8 +339,8 @@ func mergeLive(raw []any, sessions []any) []any {
 	}
 	anyLive := false
 	for _, s := range sessions {
-		if doc, ok := s.(*jobj); ok {
-			if v, _ := doc.get("live"); jqTruthy(v) {
+		if doc, ok := s.(*jqjson.Object); ok {
+			if v, _ := doc.Get("live"); jqjson.Truthy(v) {
 				anyLive = true
 				break
 			}
@@ -347,31 +348,31 @@ func mergeLive(raw []any, sessions []any) []any {
 	}
 	out := make([]any, 0, len(raw))
 	for _, e := range raw {
-		doc, ok := e.(*jobj)
+		doc, ok := e.(*jqjson.Object)
 		if !ok {
 			// 调用方已用 allObjects 拦掉；保底不变形。
 			out = append(out, e)
 			continue
 		}
-		mode := jqStr(mustGet(doc, "mode"))
+		mode := jqjson.Str(jqGet(doc, "mode"))
 		if mode != "client" {
 			out = append(out, doc)
 			continue
 		}
-		l, has := byID[jqToString(mustGet(doc, "id"))]
+		l, has := byID[jqjson.ToString(jqGet(doc, "id"))]
 		switch {
 		case has:
-			doc.set("status", l.State)
-			doc.set("status_reason", l.Reason)
-			doc.set("client", l.Client)
+			doc.Set("status", l.State)
+			doc.Set("status_reason", l.Reason)
+			doc.Set("client", l.Client)
 		case anyLive:
-			doc.set("status", "pending")
-			doc.set("status_reason", "")
-			doc.set("client", "")
+			doc.Set("status", "pending")
+			doc.Set("status_reason", "")
+			doc.Set("client", "")
 		default:
-			doc.set("status", "waiting")
-			doc.set("status_reason", "")
-			doc.set("client", "")
+			doc.Set("status", "waiting")
+			doc.Set("status_reason", "")
+			doc.Set("client", "")
 		}
 		out = append(out, doc)
 	}
@@ -387,28 +388,28 @@ func bridgeClientForwards() []any {
 	clients := bridgeClients()
 	rows := []any{}
 	for _, c := range clients {
-		doc, ok := c.(*jobj)
+		doc, ok := c.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		if v, _ := doc.get("running"); !jqTruthy(v) {
+		if v, _ := doc.Get("running"); !jqjson.Truthy(v) {
 			continue
 		}
-		if jqStr(mustGet(doc, "state")) != "connected" {
+		if jqjson.Str(jqGet(doc, "state")) != "connected" {
 			continue
 		}
-		fwVal, _ := doc.get("forwards")
-		fwObj, ok := fwVal.(*jobj)
+		fwVal, _ := doc.Get("forwards")
+		fwObj, ok := fwVal.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		for _, id := range fwObj.keys {
-			val, _ := fwObj.get(id)
-			vo, _ := val.(*jobj)
+		for _, id := range fwObj.Keys() {
+			val, _ := fwObj.Get(id)
+			vo, _ := val.(*jqjson.Object)
 			if vo == nil {
 				continue
 			}
-			spec := jqStr(mustGet(vo, "spec"))
+			spec := jqjson.Str(jqGet(vo, "spec"))
 			parts := strings.Split(spec, " ")
 			if len(parts) < 2 {
 				continue // `split(" ")` 后取 $p[1] 会得到 null，tonumber 报错（bash 整体失败）
@@ -418,27 +419,27 @@ func bridgeClientForwards() []any {
 			if !ok1 || !ok2 {
 				continue
 			}
-			row := newJObj()
-			row.set("id", id)
-			row.set("local_port", jsonNumber(strconv.Itoa(lp)))
-			row.set("remote_host", "localhost")
-			row.set("remote_port", jsonNumber(strconv.Itoa(rp)))
-			label, hasLabel := doc.get("label")
+			row := jqjson.NewObject()
+			row.Set("id", id)
+			row.Set("local_port", jsonNumber(strconv.Itoa(lp)))
+			row.Set("remote_host", "localhost")
+			row.Set("remote_port", jsonNumber(strconv.Itoa(rp)))
+			label, hasLabel := doc.Get("label")
 			if !hasLabel || label == nil {
-				row.set("machine", mustGet(doc, "machine"))
+				row.Set("machine", jqGet(doc, "machine"))
 			} else {
-				row.set("machine", label)
+				row.Set("machine", label)
 			}
-			target, hasTarget := doc.get("target")
+			target, hasTarget := doc.Get("target")
 			if !hasTarget || target == nil {
-				row.set("ssh_target", "")
+				row.Set("ssh_target", "")
 			} else {
-				row.set("ssh_target", target)
+				row.Set("ssh_target", target)
 			}
-			row.set("pid", mustGet(doc, "pid"))
-			row.set("status", mustGet(vo, "state"))
-			row.set("status_reason", mustGet(vo, "reason"))
-			row.set("mode", "bridge")
+			row.Set("pid", jqGet(doc, "pid"))
+			row.Set("status", jqGet(vo, "state"))
+			row.Set("status_reason", jqGet(vo, "reason"))
+			row.Set("mode", "bridge")
 			rows = append(rows, row)
 		}
 	}
@@ -460,16 +461,16 @@ func bridgeClients() []any {
 		if err != nil {
 			continue
 		}
-		parsed, err := parseJV(data)
+		parsed, err := jqjson.Parse(data)
 		if err != nil {
 			continue
 		}
-		doc, ok := parsed.(*jobj)
+		doc, ok := parsed.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		mid := jqStr(mustGet(doc, "machine"))
-		doc.set("running", bridgeLockHolder(mid) != "")
+		mid := jqjson.Str(jqGet(doc, "machine"))
+		doc.Set("running", bridgeLockHolder(mid) != "")
 		docs = append(docs, doc)
 	}
 	return docs
@@ -495,15 +496,15 @@ func bridgeLockHolder(machine string) string {
 
 // --- 小工具 ---------------------------------------------------------------
 
-func mustGet(o *jobj, key string) any {
+func jqGet(o *jqjson.Object, key string) any {
 	if o == nil {
 		return nil
 	}
-	v, _ := o.get(key)
+	v, _ := o.Get(key)
 	return v
 }
 
-func jsonNumber(lit string) any { return jsonNumberLiteral(lit) }
+func jsonNumber(lit string) any { return jqjson.NumberLiteral(lit) }
 
 // isDigits 判定纯 ASCII 数字串（复刻 bash `[[ ${x} =~ ^[0-9]+$ ]]`）。
 func isDigits(s string) bool {
@@ -533,7 +534,7 @@ func atoiOK(s string) (int, bool) {
 //   - 无指数的小数 -> 向下取整（jq floor）；负数 -> 负号使正则不匹配 -> "0"；
 //   - 带指数/超大值 -> jq 打印成科学计数/E 记法 -> 正则不匹配 -> "0"。
 func floorDigits(v any) string {
-	n, ok := v.(jsonNumberType)
+	n, ok := v.(jqjson.Number)
 	if !ok {
 		return "0"
 	}
@@ -559,12 +560,12 @@ func floorDigits(v any) string {
 // （jq 的类型序：null < false < true < number < string < array < object）。
 func sortByKeyStable(rows []any, key string) {
 	sort.SliceStable(rows, func(i, j int) bool {
-		return jvCompare(mustGet(asObj(rows[i]), key), mustGet(asObj(rows[j]), key)) < 0
+		return jvCompare(jqGet(asObj(rows[i]), key), jqGet(asObj(rows[j]), key)) < 0
 	})
 }
 
-func asObj(v any) *jobj {
-	o, _ := v.(*jobj)
+func asObj(v any) *jqjson.Object {
+	o, _ := v.(*jqjson.Object)
 	return o
 }
 
@@ -584,13 +585,13 @@ func jvTypeRank(v any) int {
 			return 2
 		}
 		return 1
-	case jsonNumberType:
+	case jqjson.Number:
 		return 3
 	case string:
 		return 4
 	case []any:
 		return 5
-	case *jobj:
+	case *jqjson.Object:
 		return 6
 	default:
 		return 7
@@ -607,8 +608,8 @@ func jvCompare(a, b any) int {
 	case 0, 1, 2:
 		return 0
 	case 3:
-		af, _ := strconv.ParseFloat(formatJQNumber(string(a.(jsonNumberType))), 64)
-		bf, _ := strconv.ParseFloat(formatJQNumber(string(b.(jsonNumberType))), 64)
+		af, _ := strconv.ParseFloat(jqjson.FormatNumber(string(a.(jqjson.Number))), 64)
+		bf, _ := strconv.ParseFloat(jqjson.FormatNumber(string(b.(jqjson.Number))), 64)
 		switch {
 		case af < bf:
 			return -1
@@ -620,7 +621,7 @@ func jvCompare(a, b any) int {
 	case 4:
 		return strings.Compare(a.(string), b.(string))
 	default:
-		return strings.Compare(encodeJV(a, false), encodeJV(b, false))
+		return strings.Compare(jqjson.Encode(a, false), jqjson.Encode(b, false))
 	}
 }
 

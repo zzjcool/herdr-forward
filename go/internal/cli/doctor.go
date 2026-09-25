@@ -17,6 +17,7 @@ package cli
 import (
 	"fmt"
 
+	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/state"
 	"github.com/zzjcool/herdr-forward/internal/tunnel"
 )
@@ -67,18 +68,18 @@ func printClientDoctorRows() {
 		return
 	}
 	for _, row := range v.rows {
-		doc, ok := row.(*jobj)
+		doc, ok := row.(*jqjson.Object)
 		if !ok {
 			continue
 		}
-		if jqStr(mustGet(doc, "mode")) != string(state.ModeClient) {
+		if jqjson.Str(jqGet(doc, "mode")) != string(state.ModeClient) {
 			continue
 		}
-		id := jqToString(mustGet(doc, "id"))
-		localPort := intOrZero(mustGet(doc, "local_port"))
-		status := jqToString(mustGet(doc, "status"))
-		reason := jqToString(mustGet(doc, "status_reason"))
-		client := jqToString(mustGet(doc, "client"))
+		id := jqjson.ToString(jqGet(doc, "id"))
+		localPort := intOrZero(jqGet(doc, "local_port"))
+		status := jqjson.ToString(jqGet(doc, "status"))
+		reason := jqjson.ToString(jqGet(doc, "status_reason"))
+		client := jqjson.ToString(jqGet(doc, "client"))
 
 		var label string
 		switch {

@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zzjcool/herdr-forward/internal/hfcommon"
 )
 
 // HerdrTimeout 是 `machine list --json` 的探测超时（秒），对照 lib/machines.sh 的
@@ -166,23 +167,11 @@ func stderrSummary(s string) string {
 	return "herdr stderr: " + s
 }
 
-// warn 输出一条 warn 级日志：恒镜像 stderr，并在 HERDR_PLUGIN_STATE_DIR 存在时追加进
-// logs/forward.log（格式对齐 lib/common.sh 的 `[<UTC ISO8601>] warn: <msg>`）。
+// warn 输出一条 warn 级日志（恒镜像 stderr，并写 state/logs/forward.log）。
 //
-// 备注：唯一的 log 实现属于 internal/hfcommon（PLAN §5 的 Log，W1 拥有，本 phase 尚未落地）；
-// 为避免与未落地的符号耦合，这里就地实现「warn 必达用户」这一被 §1 降级契约要求的最小行为。
-// Phase 2 起可改为 hfcommon.Log("warn", ...)（轮转逻辑同时收口，本函数不实现轮转）。
+// 收口说明（Phase 3）：本函数原为「就地实现的最小 warn」（Phase 1 时 hfcommon.Log
+// 尚未落地，见 git 历史）。现在委托给 hfcommon.Logf —— 与 lib/common.sh 的 `log warn`
+// 逐字段一致（时间戳格式、轮转 1MB/512KB、warn/error 双重镜像），不再有第二份实现。
 func warn(msg string) {
-	line := fmt.Sprintf("[%s] warn: %s", time.Now().UTC().Format("2006-01-02T15:04:05Z"), msg)
-	if dir := os.Getenv("HERDR_PLUGIN_STATE_DIR"); dir != "" {
-		logDir := filepath.Join(dir, "logs")
-		if err := os.MkdirAll(logDir, 0o755); err == nil {
-			f, err := os.OpenFile(filepath.Join(logDir, "forward.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-			if err == nil {
-				_, _ = f.WriteString(line + "\n")
-				_ = f.Close()
-			}
-		}
-	}
-	fmt.Fprintln(os.Stderr, line)
+	hfcommon.Logf("warn", "%s", msg)
 }
