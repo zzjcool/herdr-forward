@@ -46,6 +46,8 @@ LAX="${HERDR_FORWARD_CI_LAX:-0}"
 # E2E 的源码拷贝与两机 tar 带进去，放外面就完全隔离了。
 # ---------------------------------------------------------------------------
 FORWARD_GO_PARKED=""
+FORWARD_GO_ENV_WAS_SET=0
+FORWARD_GO_ENV_OLD=""
 _bin_forward_go_park() {
   if [[ -f bin/forward-go && ! -L bin/forward-go ]]; then
     local parkdir=""
@@ -58,6 +60,14 @@ _bin_forward_go_park() {
       fi
     fi
     if [[ -n "${FORWARD_GO_PARKED}" ]]; then
+      if [[ -n "${HERDR_FORWARD_BIN+x}" ]]; then
+        FORWARD_GO_ENV_WAS_SET=1
+        FORWARD_GO_ENV_OLD="${HERDR_FORWARD_BIN}"
+      fi
+      # Compatibility wrappers (postinstall/startup/installers) still need a
+      # Go implementation while bin/forward itself is deliberately parked so
+      # legacy unit tests exercise the Bash fallback.
+      export HERDR_FORWARD_BIN="${FORWARD_GO_PARKED}"
       echo "   [迁移期适配器] 暂存本地构建的 bin/forward-go（本轮基线按纯 bash 判据跑；结束还原）"
     fi
   fi
@@ -67,6 +77,11 @@ _bin_forward_go_unpark() {
   if [[ -n "${FORWARD_GO_PARKED}" && -f "${FORWARD_GO_PARKED}" ]]; then
     mv -f "${FORWARD_GO_PARKED}" bin/forward-go 2>/dev/null || true
     rmdir "$(dirname "${FORWARD_GO_PARKED}")" 2>/dev/null || true
+  fi
+  if [[ "${FORWARD_GO_ENV_WAS_SET}" -eq 1 ]]; then
+    export HERDR_FORWARD_BIN="${FORWARD_GO_ENV_OLD}"
+  else
+    unset HERDR_FORWARD_BIN
   fi
   return 0
 }

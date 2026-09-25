@@ -326,10 +326,10 @@ func remoteInstall(target string) int {
 
 // remoteSetupUI 复刻 _hf_remote_setup_ui：让远端的键位立即可用（代跑 startup hook + reload）。
 func remoteSetupUI(target, root, stateDir string) {
-	qRoot := "HERDR_PLUGIN_ROOT=" + shellQuoteValue(root)
-	qState := "HERDR_PLUGIN_STATE_DIR=" + shellQuoteValue(stateDir)
+	qRoot := shellQuote("HERDR_PLUGIN_ROOT=" + root)
+	qState := shellQuote("HERDR_PLUGIN_STATE_DIR=" + stateDir)
 	qHook := shellQuote(root + "/scripts/startup-hook.sh")
-	remote := fmt.Sprintf("env %s %s bash %s", shellQuote(qRoot), shellQuote(qState), qHook)
+	remote := fmt.Sprintf("env %s %s bash %s", qRoot, qState, qHook)
 	out, ok := runBoundedArgvOut(60, []string{"ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", bridgeSSHDestination(target), remote})
 	if !ok {
 		fmt.Printf("  ⚠ 远端键位配置未完成；可在 %s 上手动运行 %s/scripts/bootstrap.sh。\n", target, root)

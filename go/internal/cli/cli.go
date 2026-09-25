@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zzjcool/herdr-forward/internal/difftest"
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
 )
 
@@ -38,15 +37,10 @@ const (
 	exitMissingDep     = 127
 )
 
-// unmigrated 是「在 Bash 侧实现、Go 侧尚未迁移」的子命令集合（C1 的 15 项之一部分）。
-//
-// Phase 3 之后只剩 2 个：watch / bootstrap（Phase 4 的交互面板 + 安装器）。
-// 它们出现在 dispatch 表里只为了让契约清单完整、并让哨兵行为可测：生产路径由
-// bin/forward 的白名单保证不会走到这里。
-var unmigrated = map[string]bool{
-	"watch":     true,
-	"bootstrap": true,
-}
+// unmigrated is kept as a compatibility assertion for callers that inspect the
+// dispatch table.  Phase 4 owns both watch and bootstrap, so the production
+// table is intentionally empty.
+var unmigrated = map[string]bool{}
 
 // Main 是 CLI 入口，返回值即进程退出码。
 func Main(args []string) int {
@@ -61,7 +55,7 @@ func Main(args []string) int {
 
 	if unmigrated[sub] {
 		return die(exitNotImplemented, fmt.Sprintf(
-			"子命令 %s 尚未迁移到 Go（应由 bin/forward 的 bash 实现处理）；这条哨兵不该被用户看到，请报告。", sub))
+			"子命令 %s 尚未迁移到 Go；这条哨兵不该被用户看到，请报告。", sub))
 	}
 
 	switch sub {
@@ -85,6 +79,10 @@ func Main(args []string) int {
 		return cmdBridge(rest)
 	case "open-url":
 		return cmdOpenURL(rest)
+	case "watch":
+		return cmdWatch(rest)
+	case "bootstrap":
+		return internalBootstrap(rest)
 	case "help", "--help", "-h":
 		// bash: usage 到 stdout，return 0
 		fmt.Print(usageText)
@@ -95,8 +93,7 @@ func Main(args []string) int {
 		fmt.Printf("forward %s\n", Version)
 		return exitOK
 	case "internal":
-		// 差分测试探针入口（tests/difftest/run.sh 优先用 `bin/forward-go internal difftest …`）
-		return difftest.Main(args)
+		return cmdInternal(rest)
 	default:
 		fmt.Fprint(os.Stderr, usageText)
 		return die(exitUsage, fmt.Sprintf("未知子命令：%s。请运行 'forward --help' 查看可用子命令。", sub))

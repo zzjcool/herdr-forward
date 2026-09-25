@@ -210,7 +210,8 @@ func (s *Supervisor) connectOnce(ctx context.Context, rec activationRecord, herd
 	s.lock.Unlock()
 	s.write("connecting", "")
 
-	full := append(append([]string{}, argv...), dest, remote)
+	full := append([]string{"ssh"}, argv...)
+	full = append(full, dest, remote)
 	cmd := exec.Command(full[0], full[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
