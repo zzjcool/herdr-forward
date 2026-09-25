@@ -22,7 +22,7 @@
 | C1 | CLI argv | 15 个子命令及全部 flag（见 bin/forward usage，1737-1748 行 dispatch） |
 | C2 | 退出码 | `0 ok / 2 端口重复 / 3 记录不存在 / 4 machine 解析失败 / 5 隧道失败 / 9 未实现 / 64 用法 / 127 依赖缺失 / 1 激活半成品` |
 | C3 | tab bar oneline | `⇅3000⇅5173`，仅 up、升序、>6 条截断 `+N`、纯文本无 ANSI、坏输入 → 空串恒 exit 0 |
-| C4 | forwards.json | A.2 schema（version:1 + mode/publish 扩展），损坏 → 空数组 + warn；原子写；**jq 排序格式**（键名字母序、2 空格缩进）——Go 结构体字段序按字母序声明以复刻 |
+| C4 | forwards.json | A.2 schema（version:1 + mode/publish 扩展），损坏 → 空数组 + warn；原子写；**jq 排序格式**（键名字母序；W1 实测修正：bash `state_save` 用 `jq -S -c`，磁盘上是**紧凑单行**而非缩进多行——Go 以 bash 字节为准）——Go 结构体字段序按字母序声明以复刻 |
 | C5 | `list --json` / `machines list --json|--short` / `bridge status --json` | 输出形状逐字段不变 |
 | C6 | HF1 行协议 | `HELLO/SYNC/OPEN/STATUS/PING` 一行一条，A 侧安全边界（id=f-<lp>、lp∈[1024,65535]、≤32 条、恒 loopback） |
 | C7 | 探活三级 | `up/degraded/down`（A.3.1：本地可连≠远端可达，payload marker `herdr-forward-probe`） |
@@ -231,7 +231,7 @@ sha256 校验：sha256sum（Linux）/ shasum -a 256（macOS）
 ## 8. 必须写 Go 单测的关键纯函数
 
 - **render.Oneline**：空/单/多/>6 截断 `+N`/全 down/坏 JSON → 空串；⇅ 多字节字符；exit 0 恒定。
-- **state.Load/Save**：4 个现有 fixture 逐一复用；round-trip 后**逐字节**等于 jq 输出（键序/缩进/`publish` null 形态）；旧记录缺 `mode` → 默认 tunnel；损坏 → 空+warn。
+- **state.Load/Save**：4 个现有 fixture 逐一复用；round-trip 后**逐字节**等于 jq 输出（键序/紧凑单行格式/`publish` null 形态）；旧记录缺 `mode` → 默认 tunnel；损坏 → 空+warn。
 - **ports.List**：`/proc/net/tcp{,6}` hex 解析（LISTEN=0A、`0100007F`→127.0.0.1、IPv6 展开剥 zone）；过滤矩阵——127.0.0.11（容器 DNS）、127.0.0.53、0.0.0.0/::/::1/`::ffff:127.0.0.1` 通、端口 <1024/前导零/越界不通。
 - **machine.NormalizeSshTarget**：`user@host`→`:22`、`user@host:2222`、`user@[::1]:22`、裸 `[::1]`、非法 → 64。
 - **bridge.ParseLine + ValidateForward + String()**：C6 全边界（id 形态、端口区间、≤32、OPEN 只接受已 SYNC 端口的 localhost URL）——与 bash 实现做差分。
