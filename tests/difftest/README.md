@@ -16,8 +16,8 @@ bash tests/difftest/run.sh
 - 输出为 TAP 风格，与 `tests/run.sh` 的断言风格一致（`ok N - ...` / `# PASS/FAIL`）。
 
 > 注意：本 harness 与 `tests/run.sh` 的 `unit|integration|e2e` 层**不是**同一入口。
-> `tests/difftest/` 是 Phase 1 新增的独立层，由 W4 决定是否挂进 `scripts/ci.sh`
-> （PLAN §6 Phase 1 验收里 difftest 是独立门；`scripts/ci.sh` 归 W4/主 agent）。
+> `tests/difftest/` 是 Phase 1 新增的独立层，已由 W4 挂进 `scripts/ci.sh` 的
+> `0b/6 difftest` 段（作为独立门，同时也是 E2E 容器内的一段：`run-inside.sh` B2）。
 
 ## 结构
 
@@ -25,7 +25,9 @@ bash tests/difftest/run.sh
 |---|---|
 | `run.sh` | 驱动器：装夹具、分别跑两侧、逐字节比对、汇总 TAP |
 | `bashside.sh` | bash 侧对位入口：`source lib/common.sh lib/state.sh`，转调真实生产函数 |
-| `fixtures/full.two.json` | schema 完整（含 `mode`）的两条记录语料；供需要「bash 自产形态」的用例 |
+| `fixtures/full.two.json` | schema 完整（含 `mode`）的两条 tunnel 记录语料 |
+| `fixtures/mix.client.tunnel.json` | 一条 tunnel + 一条 client（含 `status:starting`） |
+| `fixtures/many.up.json` | 8 条 `up` tunnel 记录（验 `--oneline` 的 `+N` 截断） |
 | `../fixtures/forwards.*.json` | 仓库既有 4 个夹具（只读复用，PLAN §8 要求） |
 
 `bashside.sh` 刻意**不复制**任何逻辑 —— 它就是生产 bash 的函数调用，否则差分测试
@@ -48,7 +50,7 @@ bash tests/difftest/run.sh
 > W4 接线后只需在 `cli.Main` 加一行 `case "internal": return difftest.Main(args)`
 > （本包已自带 `internal` / `difftest` 前缀跳过，无需改本包）。
 
-## 覆盖的用例（38 条）
+## 覆盖的用例（123 条）
 
 | 组 | 用例 | 比对方式 |
 |---|---|---|
@@ -57,10 +59,24 @@ bash tests/difftest/run.sh
 | 3 | `probe_payload` 三态（up/degraded/down）+ 拒连 | 同一真实监听 socket 上跑两侧，stdout 逐字符 |
 | 4 | `add` / `add` 重复端口 / `remove` / `remove` 不存在 / `set-status` / `set-status` 非法值 | 落盘**逐字节** + 退出码（0/2/3/1） |
 | 5 | legacy 无 `mode` 记录的既定偏差 | 显式钉住形态 + 归一化后语义一致 |
+| 6 | **CLI `list`**（W4）：table/`--json`/`--oneline` × 双 tunnel / 空状态 / 文件不存在 / client 离线；client 在线（up·down·未上报）；本机 bridge 行；`>6` 截断；`FORWARD_STATE_VERSION=2`；损坏记录；参数错误（rc + 去时间戳 stderr） | **逐字节** stdout + 退出码 |
+| 7 | **CLI `ports`**（W4）：table/`--json`/`--json extra`/多余参数，两侧都屏蔽 `ss`/`lsof` 同读 `/proc` | **逐字节** stdout + 退出码 |
+| 8 | **CLI `help` / 未知子命令 / 缺子命令**（W4） | **逐字节** stdout（usage 文本冻结）+ 退出码 |
 
-probe 用例用的是 Go 侧 `serve reply|silent|close` 起的**真实**监听 socket
+组 3 的 probe 用例用的是 Go 侧 `serve reply|silent|close` 起的**真实**监听 socket
 （`net.Listen("tcp","127.0.0.1:0")`，端口由内核分配后打印，无竞态），bash 与 Go
 两侧探测的是**同一个**服务 —— 这才是真差分。
+
+### 组 6/7/8 的两侧接线（为什么这么搭）
+
+* **Go 侧**：现场 `go build ./cmd/forward` 到 `${TMP}/forward-go`（仓库的 `bin/` 绝不落产物）。
+  比的是**用户可见 CLI** 的字节，而不是 internal 层的函数输出。
+* **bash 侧**：把 `bin/forward` 拷成 staged root（`lib/` 用符号链接），**不带** `forward-go`，
+  于是同一份脚本走纯 bash 路径（`bin/forward` 只对 `list|ports` 做条件 exec）。
+* **`ss` 屏蔽（组 7）**：bash 的 `ports_listening_json` 优先用 `ss`（能拿到进程名），而 Go 侧读
+  `/proc` 拿不到 —— 这是已知偏离（W4 报告与 PLAN 的偏离记录均登记）。组 7 给 bash 侧一个
+  只含 symlink 的 PATH 农场（白名单里没有 `ss`/`lsof`），两侧因此同源（都读 `/proc`），
+  比的是「同一数据源下的输出」。监听集合会随环境变化，故组 7 有「不一致则重试一次」的抖动防护。
 
 ## 已知偏差（有意保留，已在组 5 断言）
 

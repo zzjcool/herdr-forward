@@ -474,6 +474,283 @@ _eq "legacy：除 mode 外其余字段逐键一致" "${bash_nomode}" "${go_nomod
 unset DIFFTEST_NOW_UNIX
 
 # ===========================================================================
+# 组 6/7/8：CLI 层差分（W4：list / ports / help）
+#
+# 与前 5 组的区别：前面比的是 internal 层函数（state/render/probe 的纯函数形态），
+# 这里比的是**用户可见的 CLI 输出**（`bin/forward` vs Go 实现）。
+#
+# 两侧接线：
+#   * Go 侧 = 编译真实 CLI（go/cmd/forward -> ${TMP}/forward-go），不是探针；
+#   * bash 侧 = 把 bin/forward + lib/ 拷/链成「staged root」，**不带** forward-go，
+#     于是同一份脚本走纯 bash 路径（`bin/forward` 只对 list|ports 做条件 exec）。
+# 两者共享同一份状态目录内容（各自一份拷贝，避免相互写坏）。
+# ===========================================================================
+printf '=== 组 6/7/8：CLI 差分（list / ports / help） ===\n'
+
+# --- Go CLI 构建（一次性） ---
+CLI_GO="${TMP}/forward-go"
+if ! (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${CLI_GO}" ./cmd/forward >"${TMP}/cli-build.log" 2>&1); then
+  echo "RED: 无法编译 Go CLI（go/cmd/forward）。构建输出：" >&2
+  cat "${TMP}/cli-build.log" >&2
+  exit 1
+fi
+note "CLI 差分：Go 侧 = ${CLI_GO}（真实 go/cmd/forward）"
+
+# --- bash 侧 staged root（只有 bash，绝不带 forward-go） ---
+BASH_ROOT="${TMP}/bashroot"
+mkdir -p "${BASH_ROOT}/bin"
+cp "${ROOT}/bin/forward" "${BASH_ROOT}/bin/forward"
+chmod +x "${BASH_ROOT}/bin/forward"
+ln -sfn "${ROOT}/lib" "${BASH_ROOT}/lib"
+if [[ -x "${BASH_ROOT}/bin/forward-go" ]]; then
+  bad "staged bash root 里不应存在 bin/forward-go"
+fi
+note "CLI 差分：bash 侧 = ${BASH_ROOT}/bin/forward（staged，无 forward-go → 纯 bash）"
+
+# ss/lsof 屏蔽农场：让 bash 的 ports_listening_json 与 Go 一样走 /proc（同源），
+# 否则 bash 会用 ss 拿到进程名而 Go 拿不到（已知偏离，见 README）。
+NO_SS_FARM="${TMP}/farm-noss"
+mkdir -p "${NO_SS_FARM}"
+for tool in bash sh jq awk mkdir rm mv mktemp dirname cat date tr sed grep head tail wc ls uname stat readlink chmod printf env sort sleep kill; do
+  tool_path="$(command -v "${tool}" 2>/dev/null || true)"
+  [[ -z "${tool_path}" ]] && continue
+  ln -sf "${tool_path}" "${NO_SS_FARM}/${tool}"
+done
+
+# cli_go <state_dir> <args...>：跑 Go CLI
+cli_go() {
+  local st="$1"
+  shift
+  HERDR_PLUGIN_STATE_DIR="${st}" "${CLI_GO}" "$@"
+}
+
+# cli_bash <state_dir> <args...>：跑 staged bash CLI（PATH 里没有 ss/lsof → 走 /proc）
+cli_bash() {
+  local st="$1"
+  shift
+  HERDR_PLUGIN_STATE_DIR="${st}" env PATH="${NO_SS_FARM}" \
+    bash "${BASH_ROOT}/bin/forward" "$@"
+}
+
+# strip_ts：把 log 行首的时间戳拿掉，便于比较 warn/error 文案（时间不可比）
+strip_ts() { sed -E 's/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z\] //'; }
+
+# cli_pair <name> <fixture|-> <setup_fn|-> <args...>
+#   在各自的临时状态目录里铺同一份夹具，跑两侧，比 stdout + rc（+可选 stderr）。
+#   参数里的 "-" 表示不铺状态文件（文件不存在）。
+CLI_PAIR_STRICT_STDERR=0
+cli_pair_stdout() {
+  local name="$1" fixture="$2" setup="$3"
+  shift 3
+  local bst="${TMP}/cli-bash-state" gst="${TMP}/cli-go-state"
+  rm -rf "${bst}" "${gst}"
+  mkdir -p "${bst}/bridge" "${gst}/bridge"
+  if [[ "${fixture}" != "-" ]]; then
+    cp "${fixture}" "${bst}/forwards.json"
+    cp "${fixture}" "${gst}/forwards.json"
+  fi
+  if [[ "${setup}" != "-" ]]; then
+    "${setup}" "${bst}"
+    "${setup}" "${gst}"
+  fi
+  capture cli_bash "${bst}" "$@"
+  local b_out="${OUT}" b_err="${ERR}" b_rc="${RC}"
+  capture cli_go "${gst}" "$@"
+  local g_out="${OUT}" g_err="${ERR}" g_rc="${RC}"
+  _eq "${name} 退出码（bash=${b_rc} go=${g_rc}）" "${b_rc}" "${g_rc}"
+  _eq "${name} stdout 逐字节" "${b_out}" "${g_out}"
+  if [[ "${CLI_PAIR_STRICT_STDERR}" -eq 1 ]]; then
+    local b_err_clean="" g_err_clean=""
+    b_err_clean="$(printf '%s' "${b_err}" | strip_ts)"
+    g_err_clean="$(printf '%s' "${g_err}" | strip_ts)"
+    _eq "${name} stderr（去时间戳）" "${b_err_clean}" "${g_err_clean}"
+  fi
+}
+
+# --- 会话夹具 builders（在各自状态目录里造 session / client 文件） ---
+#   ⚠ 会话存活判定用当前 shell 的 $$（staged bash 与 Go 都会 kill -0 它）。
+#   BRIDGE_LIVE_WINDOW_S 放大到 3600，避免夹具铺设与执行之间跨过 20s 窗口。
+export BRIDGE_LIVE_WINDOW_S=3600
+
+setup_session_up() {
+  local now=""
+  now="$(date +%s)"
+  printf '{"client_host":"laptop","client_label":"b-box","last_seen_unix":%s,"status":{"f-5173":{"state":"up","reason":""}}}\n' "${now}" >"$1/bridge/session-$$.json"
+}
+setup_session_down() {
+  local now=""
+  now="$(date +%s)"
+  printf '{"client_host":"laptop","last_seen_unix":%s,"status":{"f-5173":{"state":"down","reason":"client 端口 5173 已被占用（laptop）"}}}\n' "${now}" >"$1/bridge/session-$$.json"
+}
+setup_session_nostatus() {
+  local now=""
+  now="$(date +%s)"
+  printf '{"client_host":"laptop","last_seen_unix":%s}\n' "${now}" >"$1/bridge/session-$$.json"
+}
+setup_client_self() {
+  printf '{"pid":%s,"machine":"web-box","label":"web-box-label","target":"u@web:22","state":"connected","forwards":{"f-8080":{"spec":"8080 80","state":"up","reason":""},"f-9090":{"spec":"9090 90","state":"down","reason":"remote busy"}}}\n' "$$" >"$1/bridge/client-web-box.json"
+  mkdir -p "$1/bridge/client-web-box.lock"
+  printf '%s\n' "$$" >"$1/bridge/client-web-box.lock/pid"
+}
+
+CLI_TWO="${OWN_FIXTURES}/full.two.json"
+CLI_MIX="${OWN_FIXTURES}/mix.client.tunnel.json"
+CLI_MANY="${OWN_FIXTURES}/many.up.json"
+CLI_EMPTY="${FIXTURES}/forwards.empty.json"
+
+# 组 6：list —— table / --json / --oneline × 多夹具（≥ 3×3）
+for form in "" "--json" "--oneline"; do
+  form_name="table"
+  list_args=(list)
+  if [[ "${form}" == "--json" ]]; then
+    form_name="json"
+    list_args=(list --json)
+  fi
+  if [[ "${form}" == "--oneline" ]]; then
+    form_name="oneline"
+    list_args=(list --oneline)
+  fi
+  cli_pair_stdout "list ${form_name} 双 tunnel" "${CLI_TWO}" - "${list_args[@]}"
+  cli_pair_stdout "list ${form_name} 空状态" "${CLI_EMPTY}" - "${list_args[@]}"
+  cli_pair_stdout "list ${form_name} 状态文件不存在" - - "${list_args[@]}"
+  cli_pair_stdout "list ${form_name} client 离线(waiting)" "${CLI_MIX}" - "${list_args[@]}"
+done
+
+# client 在线（up / down / 未上报）与自机 bridge 行
+cli_pair_stdout "list json client 在线 up" "${CLI_MIX}" setup_session_up list --json
+cli_pair_stdout "list table client 在线 up" "${CLI_MIX}" setup_session_up list
+cli_pair_stdout "list oneline client 在线 up" "${CLI_MIX}" setup_session_up list --oneline
+cli_pair_stdout "list json client 在线 down" "${CLI_MIX}" setup_session_down list --json
+cli_pair_stdout "list table client 在线 down" "${CLI_MIX}" setup_session_down list
+cli_pair_stdout "list json client 在线未上报(pending)" "${CLI_MIX}" setup_session_nostatus list --json
+cli_pair_stdout "list table 本机 bridge 行" "${CLI_MIX}" setup_client_self list
+cli_pair_stdout "list json 本机 bridge 行" "${CLI_MIX}" setup_client_self list --json
+cli_pair_stdout "list oneline 本机 bridge 行" "${CLI_MIX}" setup_client_self list --oneline
+
+# >6 条 up -> oneline 截断 +N
+cli_pair_stdout "list oneline >6 截断" "${CLI_MANY}" - list --oneline
+cli_pair_stdout "list table 8 条" "${CLI_MANY}" - list
+
+# FORWARD_STATE_VERSION=2：--json 的 version 字段
+_cli_version_bash="${TMP}/cli-bash-state"
+_cli_version_go="${TMP}/cli-go-state"
+rm -rf "${_cli_version_bash}" "${_cli_version_go}"
+mkdir -p "${_cli_version_bash}" "${_cli_version_go}"
+cp "${CLI_TWO}" "${_cli_version_bash}/forwards.json"
+cp "${CLI_TWO}" "${_cli_version_go}/forwards.json"
+export FORWARD_STATE_VERSION=2
+capture cli_bash "${_cli_version_bash}" list --json
+b_v="${OUT}"
+capture cli_go "${_cli_version_go}" list --json
+_eq "list --json FORWARD_STATE_VERSION=2 逐字节" "${b_v}" "${OUT}"
+unset FORWARD_STATE_VERSION
+
+# 损坏状态（forwards 里有非对象元素）：bash 的 jq 报错 -> stdout 空/仅表头、rc 0
+CORRUPT_FORWARDS="${TMP}/corrupt-forwards.json"
+printf '{"version":1,"forwards":[5]}\n' >"${CORRUPT_FORWARDS}"
+cli_pair_stdout "list json 损坏记录(stdout+rc)" "${CORRUPT_FORWARDS}" - list --json
+cli_pair_stdout "list table 损坏记录(stdout+rc)" "${CORRUPT_FORWARDS}" - list
+cli_pair_stdout "list oneline 损坏记录(stdout+rc)" "${CORRUPT_FORWARDS}" - list --oneline
+
+# 参数错误：比 rc + 去时间戳的 stderr（warn/error 文案是用户可见契约）
+CLI_PAIR_STRICT_STDERR=1
+cli_pair_stdout "list --oneline --json 互斥" "${CLI_TWO}" - list --oneline --json
+cli_pair_stdout "list --json --oneline 互斥" "${CLI_TWO}" - list --json --oneline
+cli_pair_stdout "list 未知参数" "${CLI_TWO}" - list --wat
+cli_pair_stdout "list 位置参数" "${CLI_TWO}" - list foo
+cli_pair_stdout "ports 多余参数" "${CLI_TWO}" - ports extra
+CLI_PAIR_STRICT_STDERR=0
+
+# 组 7：ports —— table / --json（两侧都读 /proc；进程名可能随实际负载变动，失败重试一次）
+#
+# cli_pair_retry <name> <fixture> <with_client_map:0|1> <args...>
+#   同 cli_pair_stdout，但在两侧不一致时**重试一次**（环境里监听端口集可能在两次
+#   调用之间变化 —— 例如别的进程刚好关了一个监听）。
+cli_pair_retry() {
+  local name="$1" fixture="$2" with_client_map="$3"
+  shift 3
+  local attempt=1
+  local b_out="" g_out="" b_rc="" g_rc=""
+  while [[ "${attempt}" -le 2 ]]; do
+    local bst="${TMP}/cli-bash-state" gst="${TMP}/cli-go-state"
+    rm -rf "${bst}" "${gst}"
+    mkdir -p "${bst}" "${gst}"
+    if [[ "${fixture}" != "-" ]]; then
+      cp "${fixture}" "${bst}/forwards.json"
+      cp "${fixture}" "${gst}/forwards.json"
+    fi
+    if [[ "${with_client_map}" == "1" ]]; then
+      setup_ports_state "${bst}" "${gst}"
+    fi
+    capture cli_bash "${bst}" "$@"
+    b_out="${OUT}"
+    b_rc="${RC}"
+    capture cli_go "${gst}" "$@"
+    g_out="${OUT}"
+    g_rc="${RC}"
+    if [[ "${b_out}" == "${g_out}" && "${b_rc}" == "${g_rc}" ]]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+  done
+  _eq "${name} 退出码（bash=${b_rc} go=${g_rc}）" "${b_rc}" "${g_rc}"
+  _eq "${name} stdout 逐字节" "${b_out}" "${g_out}"
+}
+
+# setup_ports_state <bash_state_dir> <go_state_dir>：两侧各造一条 client 映射
+#   （remote_port = 5173，本机常有一个监听；是否命中取决于环境，但两侧同源，仍等价）。
+setup_ports_state() {
+  local doc='{"version":1,"forwards":[{"control_socket":"","created_unix":1,"id":"f-5173","local_port":5173,"machine":"","mode":"client","pid":null,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"localhost","remote_port":5173,"ssh_target":"","status":"up"}]}'
+  printf '%s\n' "${doc}" >"$1/forwards.json"
+  printf '%s\n' "${doc}" >"$2/forwards.json"
+}
+
+cli_pair_retry "ports table（ss 屏蔽，同读 /proc）" "${CLI_TWO}" 0 ports
+cli_pair_retry "ports --json（ss 屏蔽，同读 /proc）" "${CLI_TWO}" 0 ports --json
+cli_pair_retry "ports table（带 client 映射）" "${CLI_TWO}" 1 ports
+cli_pair_retry "ports --json（带 client 映射）" "${CLI_TWO}" 1 ports --json
+cli_pair_retry "ports --json extra 参数（rc 0）" "${CLI_TWO}" 0 ports --json extra
+
+# 组 8：help —— 用户可见契约，逐字节
+capture bash "${BASH_ROOT}/bin/forward" help
+b_help="${OUT}"
+capture "${CLI_GO}" help
+g_help="${OUT}"
+_eq "help stdout 逐字节（usage 文本冻结）" "${b_help}" "${g_help}"
+
+# 未知子命令：bash 打印 usage + die 64；Go 侧同一个 dispatch 表应同形（stdout+rc）
+_cli_unk_bash="${TMP}/cli-bash-state"
+_cli_unk_go="${TMP}/cli-go-state"
+rm -rf "${_cli_unk_bash}" "${_cli_unk_go}"
+mkdir -p "${_cli_unk_bash}" "${_cli_unk_go}"
+capture bash "${BASH_ROOT}/bin/forward" no-such-subcommand
+b_unk_out="${OUT}"
+b_unk_rc="${RC}"
+b_unk_err="$(printf '%s' "${ERR}" | strip_ts)"
+capture "${CLI_GO}" no-such-subcommand
+g_unk_out="${OUT}"
+g_unk_rc="${RC}"
+g_unk_err="$(printf '%s' "${ERR}" | strip_ts)"
+_eq "未知子命令 rc" "${b_unk_rc}" "${g_unk_rc}"
+_eq "未知子命令 stdout（usage）逐字节" "${b_unk_out}" "${g_unk_out}"
+_eq "未知子命令 stderr（去时间戳）" "${b_unk_err}" "${g_unk_err}"
+
+# 缺子命令：bash 打 usage 到 stderr + die 64
+capture bash "${BASH_ROOT}/bin/forward"
+b_no_out="${OUT}"
+b_no_rc="${RC}"
+b_no_err="$(printf '%s' "${ERR}" | strip_ts)"
+capture "${CLI_GO}"
+g_no_out="${OUT}"
+g_no_rc="${RC}"
+g_no_err="$(printf '%s' "${ERR}" | strip_ts)"
+_eq "缺子命令 rc" "${b_no_rc}" "${g_no_rc}"
+_eq "缺子命令 stdout" "${b_no_out}" "${g_no_out}"
+_eq "缺子命令 stderr（去时间戳）" "${b_no_err}" "${g_no_err}"
+
+unset BRIDGE_LIVE_WINDOW_S
+
+# ===========================================================================
 # 汇总
 # ===========================================================================
 printf '1..%d\n' "$((PASS + FAIL))"

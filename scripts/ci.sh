@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # scripts/ci.sh — 基线拦截（T0 交付物 3；契约见 ARCHITECTURE.md §B.4）
 #
-# 6 段：1) shellcheck 严格  2) shfmt  3) unit  4) integration
-#       5) e2e（docker 优先，不可用降级 bwrap）  6) e2e 完整性哨兵 + 红线 grep
-# 另加 0 段：go（Go 二进制脚手架 vet + build + test，Phase 0 新增，见 PLAN-GO-MIGRATION §6）
+# 7 段：0) go  0b) difftest（bash↔Go 逐字节差分）  1) shellcheck 严格  2) shfmt
+#       3) unit  4) integration  5) e2e（docker 优先，不可用降级 bwrap）
+#       6) e2e 完整性哨兵 + 红线 grep
+#（Phase 1 之前是 6 段：0/1/2/3/4/5/6 里没有 0b；新增段见下方说明）
 #
 # 工具缺失策略（B.4 + SCOUT-FACTS §1.4：本机无 shellcheck/shfmt/nc）：
 #   * shellcheck/shfmt/jq 任一缺失 → CI FAIL 并打印安装提示（绝不静默绿）
@@ -15,6 +16,16 @@
 #   * 测试层缺失由 tests/run.sh 自行打印 SKIP（见该脚本行为契约），ci 不重复判断
 #   * E2E 绝不静默跳过：两脚本缺失，或 docker/bwrap 都不可用 → CI FAIL（红线 §C.2.7）
 #
+# 迁移期适配器（Phase 1 W4）：
+#   * 若仓库根存在 `bin/forward-go`（`make build` 的产物，.gitignore 排除），本脚本
+#     在**整轮开始前**把它挪到一边（EXIT 陷阱还原），让基线始终跑「纯 bash 版」。
+#     为什么：unit/integration 里有一批用 staged root 或真实 root 调 bin/forward 的
+#     用例，它们的历史 golden 是 bash 输出；本地恰好 build 过二进制会让这些用例
+#     在「本机绿、CI 红」之间抖动（也与 two-machines E2E 的 tar 确定性有关）。
+#     迁移完成后（Phase 3）删掉这段适配器即可。
+#   * 新增 0b/6 difftest 段：直接跑 tests/difftest/run.sh（bash↔Go 逐字节比对）。
+#     缺 go/go.mod 或该脚本时显式 SKIP（使假仓库用例不受影响）。
+#
 # 红线检查（ARCHITECTURE §C.2）：对 scripts/e2e/run-docker.sh、run-bwrap.sh、
 # run-inside.sh、Dockerfile 做 grep 静态扫描，命中即 CI FAIL（RE LINE 标记）。
 set -Eeuo pipefail
@@ -22,6 +33,41 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 LAX="${HERDR_FORWARD_CI_LAX:-0}"
+
+# ---------------------------------------------------------------------------
+# 迁移期适配器：把本地已构建的 bin/forward-go 挪出视野（整轮有效），EXIT 时还原。
+# 这样 `bash scripts/ci.sh` 的判据与「干净 checkout + CI」一致，不依赖本地 make build。
+# 暂存位置放到 $TMPDIR（而不是仓库内加个后缀）——仓库内的任何残留文件都会被
+# E2E 的源码拷贝与两机 tar 带进去，放外面就完全隔离了。
+# ---------------------------------------------------------------------------
+FORWARD_GO_PARKED=""
+_bin_forward_go_park() {
+  if [[ -f bin/forward-go && ! -L bin/forward-go ]]; then
+    local parkdir=""
+    parkdir="$(mktemp -d "${TMPDIR:-/tmp}/hf-ci-park.XXXXXX" 2>/dev/null || true)"
+    if [[ -n "${parkdir}" ]]; then
+      FORWARD_GO_PARKED="${parkdir}/forward-go"
+      if ! mv bin/forward-go "${FORWARD_GO_PARKED}" 2>/dev/null; then
+        FORWARD_GO_PARKED=""
+        rmdir "${parkdir}" 2>/dev/null || true
+      fi
+    fi
+    if [[ -n "${FORWARD_GO_PARKED}" ]]; then
+      echo "   [迁移期适配器] 暂存本地构建的 bin/forward-go（本轮基线按纯 bash 判据跑；结束还原）"
+    fi
+  fi
+  return 0
+}
+_bin_forward_go_unpark() {
+  if [[ -n "${FORWARD_GO_PARKED}" && -f "${FORWARD_GO_PARKED}" ]]; then
+    mv -f "${FORWARD_GO_PARKED}" bin/forward-go 2>/dev/null || true
+    rmdir "$(dirname "${FORWARD_GO_PARKED}")" 2>/dev/null || true
+  fi
+  return 0
+}
+trap '_bin_forward_go_unpark' EXIT
+_bin_forward_go_park
+
 TOOL_HINT="安装提示：Arch 用 'pacman -S --noconfirm shellcheck shfmt jq'，
 Debian/Ubuntu 用 'apt-get install -y shellcheck jq' + shfmt（https://github.com/mvdan/sh/releases）"
 
@@ -104,6 +150,31 @@ if [[ "${HAS_GO}" -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 0b/6 difftest（Phase 1 新增，PLAN-GO-MIGRATION §6）
+#
+# 真差分：同一输入上把生产 bash（lib/*.sh）与 Go 实现（internal/*）的输出逐字节比对。
+# 它是「迁移期零行为变化」的唯一实测门（C4/R1 风险）。
+#
+# 缺失策略：go/go.mod 或 tests/difftest/run.sh 不存在 -> SKIP（与 0 段同策略，
+# 使 tests/unit/test_ci_script.sh 里的假仓库用例不受影响）；go 缺失时 LAX 降级
+# 为 WARN、非 LAX 为 FAIL（与 0 段一致：difftest 需要 go 工具链）。
+# ⚠ 绝不在这两条 SKIP/WARN 分支打印 "CI FAIL"：test_ci_script.sh 断言 LAX 下
+#   输出里不得出现该字串。
+# ---------------------------------------------------------------------------
+echo "== 0b/6 difftest（bash ↔ Go 逐字节差分） =="
+if [[ ! -f go/go.mod || ! -f tests/difftest/run.sh ]]; then
+  echo "SKIP 0b/6 difftest（go/go.mod 或 tests/difftest/run.sh 尚未交付）"
+elif [[ "${HAS_GO}" -eq 0 ]]; then
+  if [[ "${LAX}" == "1" ]]; then
+    warn "缺少 go —— HERDR_FORWARD_CI_LAX=1 显式降级，跳过 difftest 段"
+  else
+    fail "difftest 需要 go 工具链（go/go.mod 已存在）。安装见 0/6 段提示，或设 HERDR_FORWARD_CI_LAX=1 显式降级"
+  fi
+else
+  bash tests/difftest/run.sh || fail "difftest（bash 与 go 输出不一致）"
+fi
+
+# ---------------------------------------------------------------------------
 # 1/6 shellcheck（严格：-S style -o all）
 # ---------------------------------------------------------------------------
 echo "== 1/6 shellcheck（严格） =="
@@ -124,7 +195,7 @@ else
   else
     echo "SKIP shellcheck 目标 lib/*.sh（尚未交付）"
   fi
-  for f in tests/lib/*.sh tests/run.sh scripts/*.sh tests/**/*.sh; do
+  for f in tests/lib/*.sh tests/run.sh scripts/*.sh tests/**/*.sh tests/difftest/*.sh; do
     [[ -f "${f}" ]] && shellcheck_targets+=("${f}")
   done
   if compgen -G 'scripts/e2e/*.sh' >/dev/null 2>&1; then
@@ -149,7 +220,7 @@ if [[ "${HAS_SHFMT}" -eq 0 ]]; then
   echo "SKIP 2/6 shfmt（工具缺失，已在预检 WARN）"
 else
   shfmt_targets=()
-  for f in bin/forward tests/run.sh tests/lib/*.sh scripts/*.sh; do
+  for f in bin/forward tests/run.sh tests/lib/*.sh scripts/*.sh tests/difftest/*.sh; do
     [[ -f "${f}" ]] && shfmt_targets+=("${f}")
   done
   if compgen -G 'lib/*.sh' >/dev/null 2>&1; then

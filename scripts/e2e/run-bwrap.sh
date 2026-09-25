@@ -71,6 +71,34 @@ for entry in "${PROJ}"/*; do
   cp -a "${entry}" "${SANDBOX}/src/"
 done
 shopt -u dotglob nullglob
+
+# ---------------------------------------------------------------------------
+# Go CLI 预构建（PLAN-GO-MIGRATION §6 Phase 1 W4）
+#
+# bwrap 沙箱**没有 go 工具链**（只 ro-bind 宿主 /usr，不暴露 mise/nix 安装），所以
+# `bin/forward` 的 `list|ports` 条件 exec 必须在宿主预先构建好再拷进沙箱。
+# 产物落到 ${SANDBOX}/src/bin/forward-go（沙箱内 /plugin-src/bin/forward-go）。
+# 没有 go 且宿主也没预置时：显式告知（run-inside.sh 会把切换探针记 SKIP，不静默变绿）。
+# ---------------------------------------------------------------------------
+GO_CLI_SRC="${PROJ}/bin/forward-go"
+GO_CLI_DST="${SANDBOX}/src/bin/forward-go"
+if command -v go >/dev/null 2>&1; then
+  log "宿主预构建 Go CLI（go build -mod=vendor ./cmd/forward）"
+  mkdir -p "${SANDBOX}/src/bin"
+  if (cd "${PROJ}/go" && GOFLAGS=-mod=vendor go build -o "${GO_CLI_DST}" ./cmd/forward) >>"${RESULTS_DIR}/bwrap-go-cli-build.log" 2>&1; then
+    chmod +x "${GO_CLI_DST}" 2>/dev/null || true
+    log "Go CLI 已预置进沙箱：${GO_CLI_DST}"
+  else
+    log "警告：宿主预构建 Go CLI 失败（日志 ${RESULTS_DIR}/bwrap-go-cli-build.log）；沙箱内 list/ports 切换探针将 SKIP"
+    rm -f "${GO_CLI_DST}"
+  fi
+elif [[ -x "${GO_CLI_SRC}" ]]; then
+  mkdir -p "${SANDBOX}/src/bin"
+  cp "${GO_CLI_SRC}" "${GO_CLI_DST}"
+  log "宿主无 go，但已有预构建的 ${GO_CLI_SRC} -> 拷入沙箱"
+else
+  log "警告：宿主无 go 且无预构建 bin/forward-go，沙箱内 list/ports 将跑纯 bash（切换探针 SKIP）"
+fi
 # /work/test-results 用 bind mount 指向宿主结果目录（结果出口），不预建同名空目录。
 # 宿主额外工具（shellcheck/shfmt 可能装在 ~/.local/bin，宿主 /usr 下没有；宿主也可能没有 nc）。
 # 两种注入方式并用：

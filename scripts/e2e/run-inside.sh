@@ -69,16 +69,80 @@ fi
 # shellcheck source=tests/lib/assertions.sh
 source "${WORK_DIR}/tests/lib/assertions.sh"
 
+# ---------------------------------------------------------------------------
+# Go CLI（bin/forward-go）的容器内准备（PLAN-GO-MIGRATION §6 Phase 1 W4）
+#
+# bin/forward 对 `list|ports` 做条件 exec（存在 bin/forward-go 才切 Go），所以 E2E 必须在
+# 容器内把这个二进制准备好，否则 A/A2/B2 跑的仍是纯 bash —— 那就没有「切换后 E2E 仍绿」
+# 的证据。容器镜像里有 go 工具链（PLAN §9 R4：E2E 容器要能离线构建）。
+#
+# 构建位置：${WORK_DIR}/bin/forward-go（工作区，不是只读的 /plugin-src）。
+#   优先用预先构建好的（run-bwrap.sh 在宿主预构建后随源码拷进来）；
+#   否则容器内 `go build -mod=vendor`（离线、vendor 已提交）；
+#   两者都不具备时显式失败并给指引（不静默退化，否则就变成“假绿”）。
+# ---------------------------------------------------------------------------
+GO_BIN="${WORK_DIR}/bin/forward-go"
+GO_CLI_READY=0
+go_cli_prepare() {
+  mkdir -p "${WORK_DIR}/bin"
+  if [[ -x "${GO_BIN}" ]] && "${GO_BIN}" help >/dev/null 2>&1; then
+    GO_CLI_READY=1
+    log "Go CLI 就绪（沿用容器内已有产物）：${GO_BIN}"
+    return 0
+  fi
+  if command -v go >/dev/null 2>&1; then
+    log "容器内构建 Go CLI（go build -mod=vendor ./cmd/forward）"
+    if (cd "${WORK_DIR}/go" && GOFLAGS=-mod=vendor go build -o "${GO_BIN}" ./cmd/forward) \
+      >>"${RESULTS_DIR}/go-cli-build.log" 2>&1; then
+      chmod +x "${GO_BIN}" 2>/dev/null || true
+      GO_CLI_READY=1
+      log "Go CLI 构建成功：${GO_BIN}"
+      return 0
+    fi
+    log "WARN：容器内 go build 失败（日志 ${RESULTS_DIR}/go-cli-build.log）"
+    return 0
+  fi
+  log "WARN：容器内无 go 工具链，且未预置 ${GO_BIN}"
+  return 0
+}
+go_cli_prepare
+
+# 整壳开关：B 段要跑「纯 bash 基线」（若干 integration 用例的历史 golden 是 bash 端口探测），
+# 故把 Go CLI 挪出视野；B2 段再恢复。GO_CLI_PARKED 记录被挪走的位置。
+GO_CLI_PARKED=""
+go_cli_park() {
+  if [[ -n "${GO_CLI_PARKED}" ]]; then
+    return 0
+  fi
+  if [[ -f "${GO_BIN}" ]]; then
+    GO_CLI_PARKED="${GO_BIN}.e2e-parked"
+    mv -f "${GO_BIN}" "${GO_CLI_PARKED}" 2>/dev/null || GO_CLI_PARKED=""
+    if [[ -n "${GO_CLI_PARKED}" ]]; then
+      log "暂停 Go CLI（B 段按纯 bash 基线跑）：${GO_BIN} -> ${GO_CLI_PARKED}"
+    fi
+  fi
+  return 0
+}
+go_cli_unpark() {
+  if [[ -n "${GO_CLI_PARKED}" && -f "${GO_CLI_PARKED}" ]]; then
+    mv -f "${GO_CLI_PARKED}" "${GO_BIN}" 2>/dev/null || true
+    GO_CLI_PARKED=""
+    log "恢复 Go CLI：${GO_BIN}"
+  fi
+  return 0
+}
+
 # lint_targets：stdout 每行一个 shell 目标（供 shellcheck/shfmt 用）。
 # 覆盖真实代码而不只是测试：bin/forward、lib/*.sh、tests/lib、tests/unit、
-# tests/integration、scripts（含 e2e）。只输出存在的文件（T0 早期阶段可能缺）。
+# tests/integration/tests/difftest、scripts（含 e2e）。只输出存在的文件。
 lint_targets() {
   local f=""
   [[ -f "bin/forward" ]] && printf '%s\n' "bin/forward"
   for f in lib/*.sh; do
     [[ -f "${f}" ]] && printf '%s\n' "${f}"
   done
-  for f in tests/lib/*.sh tests/unit/*.sh tests/integration/*.sh tests/run.sh scripts/*.sh scripts/e2e/*.sh; do
+  for f in tests/lib/*.sh tests/unit/*.sh tests/integration/*.sh tests/difftest/*.sh \
+    tests/run.sh scripts/*.sh scripts/e2e/*.sh; do
     [[ -f "${f}" ]] && printf '%s\n' "${f}"
   done
   return 0
@@ -365,6 +429,32 @@ t_it "list --oneline 反映活跃映射（tab bar 契约）"
 run "${WORK_DIR}/bin/forward" list --oneline
 t_exit_ok 0 "${rc}" "list --oneline 退出 0"
 t_contains "⇅${CLI_PORT}" "${out}" "oneline 含 ⇅${CLI_PORT}"
+
+# W4 切换验证：这一条必须走 Go 实现（bin/forward 对 list|ports 做条件 exec）
+# 证明方式：把 bin/forward-go 换成打印标记的 shim，同一命令应输出标记（而不是 oneline）。
+t_it "W4：bin/forward list 已切到 Go 实现（staged shim 探针）"
+if [[ "${GO_CLI_READY}" -ne 1 ]]; then
+  t_skip "容器内未就绪 Go CLI（无预置二进制且无 go 工具链），跳过切换探针"
+else
+  W4_STAGE="${HOME}/w4-dispatch"
+  rm -rf "${W4_STAGE}"
+  mkdir -p "${W4_STAGE}/bin"
+  cp "${WORK_DIR}/bin/forward" "${W4_STAGE}/bin/forward"
+  chmod +x "${W4_STAGE}/bin/forward"
+  ln -sfn "${WORK_DIR}/lib" "${W4_STAGE}/lib"
+  cp "${WORK_DIR}/bin/forward-go" "${W4_STAGE}/bin/forward-go"
+  chmod +x "${W4_STAGE}/bin/forward-go"
+  run "${W4_STAGE}/bin/forward" list --oneline
+  t_exit_ok 0 "${rc}" "Go 路径 list --oneline 退出 0（stderr：${err}）"
+  t_contains "⇅${CLI_PORT}" "${out}" "Go 路径同样输出 ⇅${CLI_PORT}（行为一致）"
+  # 反向：没有 forward-go 时同一脚本回退 bash（两者逐字节相同）
+  dispatcher_out="${out}"
+  rm -f "${W4_STAGE}/bin/forward-go"
+  run "${W4_STAGE}/bin/forward" list --oneline
+  t_exit_ok 0 "${rc}" "bash 回退路径退出 0"
+  t_eq "${dispatcher_out}" "${out}" "Go 与 bash 的 list --oneline 逐字节一致"
+  rm -rf "${W4_STAGE}"
+fi
 
 t_it "doctor 无异常且不误删活隧道"
 run "${WORK_DIR}/bin/forward" doctor
@@ -670,8 +760,14 @@ rm -rf "${A_STAGE_DIR}"
 
 # ---------------------------------------------------------------------------
 # B) 容器内完整基线（Dockerfile 已装齐 shellcheck/shfmt/jq，宿主缺工具不阻塞）
+#
+# ⚠ W4：本段先「暂停」Go CLI（go_cli_park）—— unit/integration 里有一批用例拿
+#   仓库根的 bin/forward 调 list/ports，其历史 golden 是纯 bash 输出（尤其 ports 的
+#   PROCESS 列依赖 ss 的进程名，而 Go 读 /proc 拿不到）。保留 Go 会让它们假红。
+#   切换后的等价验证由紧随的 B2 段负责。
 # ---------------------------------------------------------------------------
 t_describe "B) 容器内完整基线（lint + unit + integration）"
+go_cli_park
 
 t_it "lint 工具齐备（容器是权威基线环境；bwrap 降级时宿主缺工具则显式 SKIP）"
 LINT_TOOLS_MISSING=""
@@ -728,6 +824,116 @@ fi
 t_it "integration 层（无文件时显式 SKIP，不视为失败）"
 run bash tests/run.sh integration
 t_exit_ok 0 "${rc}" "环境内 integration 通过/SKIP"
+
+# ---------------------------------------------------------------------------
+# B2) W4 切换后的 Go CLI 验证（PLAN-GO-MIGRATION §6 Phase 1 / §10 W4）
+#
+# 为什么要单起一段：B 段测的是「纯 bash 基线」（历史 golden），而 W4 的验收是
+# 「把 list/ports 切给 Go 之后，E2E 断言不变且仍绿」。本段恢复到 Go 路径后，把
+# 用户可见的三条 list 形态 + ports 对位 + 回退等价一次性钉住。
+# ---------------------------------------------------------------------------
+t_describe "B2) W4：list/ports 切 Go 后的 E2E 对位"
+go_cli_unpark
+
+FW_W4="${WORK_DIR}/bin/forward"
+
+# 造一条**真实**记录（走 bash cmd_add 的 client 分支，不起 ssh）供 list 三形态用。
+W4_STATE="${HERDR_PLUGIN_STATE_DIR}"
+W4_BAK="${RESULTS_DIR}/forwards.json.b2bak"
+if [[ -f "${W4_STATE}/forwards.json" ]]; then
+  cp "${W4_STATE}/forwards.json" "${W4_BAK}"
+fi
+W4_CLIENT_PORT=24517
+run "${FW_W4}" add "${W4_CLIENT_PORT}" --client
+t_exit_ok 0 "${rc}" "B2 add --client 登记完成（stderr：${err}）"
+run "${FW_W4}" list --json
+t_exit_ok 0 "${rc}" "list --json 退出 0"
+run bash -c "printf '%s' '${out}' | jq -r '[.forwards[] | select(.local_port == ${W4_CLIENT_PORT})] | length'"
+t_eq "1" "${out}" "--json 含刚登记的 client 映射"
+
+# list --oneline：无 client 在线 -> 空；表格仍能看到该行（waiting）。
+run "${FW_W4}" list --oneline
+t_exit_ok 0 "${rc}" "list --oneline 退出 0"
+if [[ -n "${out}" ]]; then
+  t_fail "client 未上线时 oneline 应为空，实际：${out}"
+else
+  t_pass "client 未上线时 oneline 为空（与 bash 一致）"
+fi
+run "${FW_W4}" list
+t_exit_ok 0 "${rc}" "list 退出 0"
+t_contains "${W4_CLIENT_PORT}" "${out}" "表格含该 client 行"
+t_contains "waiting" "${out}" "client 映射状态为 waiting"
+
+# 回退等价：同一状态目录下，Go 路径与 bash 路径的输出必须逐字节相同。
+# 手法：把 bin/forward-go 挪开 -> bin/forward 回退 bash；两侧都跑 list / list --json。
+t_it "B2：Go 与 bash 的 list 输出逐字节一致（回滚等价性）"
+if [[ "${GO_CLI_READY}" -ne 1 ]]; then
+  t_skip "容器内未就绪 Go CLI，跳过回滚等价性对位"
+else
+  run "${FW_W4}" list
+  w4_go_table="${out}"
+  run "${FW_W4}" list --json
+  w4_go_json="${out}"
+  run "${FW_W4}" list --oneline
+  w4_go_oneline="${out}"
+  go_cli_park
+  run "${FW_W4}" list
+  t_eq "${w4_go_table}" "${out}" "list 表格：Go 与 bash 逐字节一致"
+  run "${FW_W4}" list --json
+  t_eq "${w4_go_json}" "${out}" "list --json：Go 与 bash 逐字节一致"
+  run "${FW_W4}" list --oneline
+  t_eq "${w4_go_oneline}" "${out}" "list --oneline：Go 与 bash 逐字节一致"
+  # ports：bash 会优先用 ss（带进程名），Go 读 /proc（无进程名）—— 已知偏离。
+  # 只断言「行集合（端口/地址）」一致，不断言 PROCESS 列。
+  run "${FW_W4}" ports
+  w4_bash_ports="${out}"
+  go_cli_unpark
+  run "${FW_W4}" ports
+  w4_go_ports="${out}"
+  w4_bash_ports_portcol="$(printf '%s\n' "${w4_bash_ports}" | awk 'NR>1 {print $1" "$2}' | sort)"
+  w4_go_ports_portcol="$(printf '%s\n' "${w4_go_ports}" | awk 'NR>1 {print $1" "$2}' | sort)"
+  t_eq "${w4_bash_ports_portcol}" "${w4_go_ports_portcol}" "ports：端口/地址列一致（PROCESS 列有已知偏离）"
+  t_contains "PORT    ADDR             PROCESS              FORWARDED" "${w4_go_ports}" "ports（Go）表头契约不变"
+fi
+
+# tab bar 延迟：`forward list --oneline` 必须秒回（面板/ tab bar 命令的热路径）。
+t_it "B2：list --oneline 延迟 < 1s（tab bar 热路径）"
+START_NS="$(date +%s%N)"
+run "${FW_W4}" list --oneline
+t_exit_ok 0 "${rc}" "oneline 退出 0"
+END_NS="$(date +%s%N)"
+ELAPSED_MS=$(((END_NS - START_NS) / 1000000))
+if [[ "${ELAPSED_MS}" -lt 1000 ]]; then
+  t_pass "oneline 耗时 ${ELAPSED_MS}ms < 1000ms"
+else
+  t_fail "oneline 耗时 ${ELAPSED_MS}ms，超过 1s 预算"
+fi
+
+# 差分测试：容器内可直接跑（能离线 vendor 构建 Go CLI）
+t_it "B2：容器内 bash tests/difftest/run.sh（bash↔Go 逐字节差分）"
+if [[ ! -f "${WORK_DIR}/tests/difftest/run.sh" ]]; then
+  t_skip "tests/difftest/run.sh 不存在，跳过容器内差分测试"
+elif ! command -v go >/dev/null 2>&1; then
+  t_skip "容器内无 go 工具链，无法跑差分测试（bwrap 降级路径已知限制；宿主 ci.sh 已跑该段）"
+else
+  DIFF_LOG="${RESULTS_DIR}/e2e-difftest.log"
+  run bash -c "bash tests/difftest/run.sh >'${DIFF_LOG}' 2>&1"
+  if [[ "${rc}" -eq 0 ]]; then
+    t_pass "容器内差分测试全绿"
+    diff_tail="$(tail -2 "${DIFF_LOG}" || true)"
+    t_contains "RESULT: PASS" "${diff_tail}" "差分测试汇总为 PASS"
+  else
+    diff_fails="$(grep -E '^not ok' "${DIFF_LOG}" | head -10 || true)"
+    t_fail "容器内差分测试失败（rc=${rc}）：${diff_fails}（完整日志：${DIFF_LOG}）"
+  fi
+fi
+
+# 收拾 B2 的状态改动：把 B 段之前的状态文件放回去（C/D 段不依赖它）。
+if [[ -f "${W4_BAK}" ]]; then
+  mv -f "${W4_BAK}" "${W4_STATE}/forwards.json"
+else
+  rm -f "${W4_STATE}/forwards.json"
+fi
 
 # ---------------------------------------------------------------------------
 # C) herdr 挂载模式探测（§C.4 假设#6）
