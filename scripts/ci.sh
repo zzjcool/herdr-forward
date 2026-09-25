@@ -23,6 +23,11 @@
 #     用例，它们的历史 golden 是 bash 输出；本地恰好 build 过二进制会让这些用例
 #     在「本机绿、CI 红」之间抖动（也与 two-machines E2E 的 tar 确定性有关）。
 #     迁移完成后（Phase 3）删掉这段适配器即可。
+#     ⚠ 实测修正（Phase 3）：**仍然需要**。原因：unit 层还有一批走 staged root / 真实 root
+#     调 bin/forward 的用例，其 golden 是 bash 输出 —— 例如 test_client_forwards.sh 的
+#     `ports` 段（bash 走 ss 拿进程名、Go 读 /proc 拿不到，见 PLAN §13.4）、
+#     test_machines_uri_targets.sh 的 `machines list --short` 调用。这些用例要到 Phase 5
+#     （删除 lib/*.sh、bash 版测试一并退役）才会消失，故适配器的删除点顺延到那里。
 #   * 新增 0b/6 difftest 段：直接跑 tests/difftest/run.sh（bash↔Go 逐字节比对）。
 #     缺 go/go.mod 或该脚本时显式 SKIP（使假仓库用例不受影响）。
 #

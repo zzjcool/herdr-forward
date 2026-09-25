@@ -518,3 +518,144 @@ difftest 无 notify 组（bash 侧也没有可对位的 CLI 入口）。
 | 差分 | `bash tests/difftest/run.sh` | `1..270` / `PASS: 270 FAIL: 0` / `RESULT: PASS`（Phase 1 为 123） |
 | 基线 | `bash scripts/ci.sh` | `CI OK: 6/6 全部通过`（含 docker E2E `130 PASS / 0 FAIL`、两机 E2E `62 PASS / 0 FAIL`） |
 | Go 路径证据 | `bash tests/difftest/phase2-go-path.sh` | `40 passed, 0 failed`（真 sshd + 真 ssh -L + 记录型 dispatch shim） |
+
+## 15. Phase 3 实测与偏离记录（machines + 桥接）
+
+铁律与 §13/§14 相同。以下逐条登记 Phase 3 实施中的**实测结论**与**有意偏离**。
+
+### 15.1 dispatch 的整组切换（相对 §6 字面「machines/bridge/open-url 整组切」的落地细节）
+
+§6 写的是「`machines {list,activate,deactivate,doctor}`、`bridge {up,down,status,serve,run}`、
+`open-url`、`add --client`」。实作为：
+
+```bash
+case "${1-}" in
+list | ports | remove | doctor | publish | unpublish | machines | bridge | open-url)
+  if [[ -x "${FORWARD_ROOT}/bin/forward-go" ]]; then
+    exec "${FORWARD_ROOT}/bin/forward-go" "$@"
+  fi
+  ;;
+add)
+  # _hf_add_dispatch_go：出现任一目标 flag（--client / --ssh-target / --machine，含 = 形态）-> Go
+  ;;
+esac
+```
+
+与 Phase 2 的两点差异：
+
+1. **`--client` 不再被排除**：Phase 2 的谓词把 `--client` 精确匹配留给 bash（client 映射的
+   写侧依赖 lib/bridge.sh）。Phase 3 把桥接写侧迁到 Go 后，这条排除不再需要 ——
+   `tests/difftest/phase2-go-path.sh` 第 7 段由「marker 无新增」翻转为「marker 有新增」，
+   由脚本本身钉住这次翻转（不放松断言，只换判据方向）。
+2. **「无目标」的 add 仍留 bash**：那条路径要按「有没有 client 在线」在**运行时**决定走
+   client 分支还是 die 4。Go 侧 `cmdAdd` 已实现完整语义（`anyClientLive`），但迁移期白名单
+   只看 argv、看不到在线状态。留 bash 是行为零变化的选择；Phase 5 删 dispatch 后自然统一。
+
+`watch` / `bootstrap` 两子命令的**函数体一字未改**（用 git show 逐字节比对确认），
+且 `lib/panel.sh`、`scripts/startup-hook.sh`、`scripts/postinstall.sh`、`herdr-plugin.toml`
+在本 phase 零改动。
+
+### 15.2 `internal/jqjson`：jq 兼容 JSON 模型抽出为公共包（重构，无行为变化）
+
+Phase 1 的 `list --json` 需要在 `go/internal/cli/jsonjq.go` 里自带「顺序保留对象 + 保留数字
+字面量」的 jq 兼容模型。Phase 3 的 bridge 状态文档（`session-*.json` / `client-*.json`）
+**也用 jq 的插入序**（bash 是 `jq -c`，不是 `-S`），而 machines 的落盘用 `jq -S -c`（字母序）。
+
+因此把该文件整体迁到 `go/internal/jqjson`（`Parse/Encode/Truthy/ToString/Str/FormatNumber/
+EncodeString/Object/Number`），符号从包内私有改为导出；`internal/cli` 改为 import。
+**逐字节行为不变**：difftest 组 6/8/9（list/help/add/doctor 输出）在重构前后同为绿。
+
+### 15.3 `machines list` 三种形态用 Go 的 rune 填充（与 bash 的 printf 等价）
+
+bash 的表格是 `printf '%-10s …'` 打表头 + `awk -F'\t' '{printf "%-10s …"}'` 打数据行。
+两者的填充口径**不同**：bash `printf` 按**字符（locale）**填充，gawk 在 UTF-8 locale 下按
+**显示宽度**填充（中文 label 会多占位）。实测（本机 gawk 5.4 + en_US.UTF-8）：
+
+```
+bash printf '%-24s' GPU机器   -> 24 字符（22 字节）
+input | awk '{printf "%-24s", $3}' -> 26 字节（按宽度算）
+```
+
+Go 的 `fmt.Printf("%-24s", …)` 与 bash `printf` 同口径（按 rune）。因此 Go 侧输出等于
+**bash 的 printf 形态**，而 bash 的实际输出在**中文 label** 上会多两个空格 —— 这是
+`machines list` 表格的**已知形态差异**，只在 label 含宽字符时可见（`--json`/`--short`
+完全一致，已由 difftest 组 12 逐字节钉住）。
+
+本 phase 未能把这条差异拉平的原因：`awk` 的宽度表随 locale 与实现版本变化（gawk 编译选项
+影响 `wcwidth` 表），而 Go 侧引入「终端显示宽度」需要额外依赖（PLAN §4 只允许两个 vendored
+依赖）。**裁决：Go 以 bash printf 形态为准**（确定性更高），并在 §15.8 记为待裁决项。
+
+### 15.4 HF1 的 STATUS 解析：宽容识别 + 调用方校验（difftest 抓到的真实分叉）
+
+首版 `ParseLine` 对 `HF1 STATUS f-5173`（缺 state 字段）返回 error，理由是「字段不全」。
+difftest 组 11 立刻抓到与 bash 的不一致：**bash 的 serve 先 `IFS=' ' read -a words` 拿到
+words[2]/words[3]，再用正则 + `up|down` 校验**，因此畸形 STATUS 仍被识别为 STATUS，
+并且在 STATUS 分支里**无条件刷新 `srv_last_seen`**（= 算作心跳）。
+
+Go 首版走「未知协议行」分支 → 不刷新心跳 → 与 bash 分叉（后果：B 侧会话文件的心跳时间
+不更新，A 侧看到的心跳超时判定与 bash 不同）。修法：`ParseLine` 对 STATUS 一律**宽容解析**
+（字段缺失填空串），校验交给 `Serve.handleLine`（复用 `statusPort` + state 白名单）。
+与 C6 的安全边界无关 —— 越界 id 仍被 `statusPort` 拒（difftest 组 11 + phase3-go-path.sh 都断言）。
+
+### 15.5 reason 提取：最短前缀匹配而非「重分词」
+
+`STATUS` 的 reason 是**行尾原文**（可含空格、全角括号）。bash 用
+`rest="${line#*STATUS "${fid}" "${st}"}"; rest="${rest# }"` —— 语义是：
+
+* `#*pattern` 取**最短前缀**，即 pattern 的**首次出现**位置；pattern 不在时原样返回；
+* 末尾只吃掉**一个**空格。
+
+用 `strings.Fields(line)[4:]` 重写会在两处不等价（多个连续空格压缩、首次出现位置）。
+因此实现为 `stripReasonPrefix`（`strings.Index` + 单个前导空格）。difftest 组 11 的
+「STATUS down 带 reason（含空格）」用例覆盖。
+
+### 15.6 serve 的读循环用常驻 reader goroutine（相对 bash `read -t` 的唯一差异）
+
+bash 的 serve 循环用 `read -r -t BRIDGE_POLL_S`：每拍最多等 1 秒，超时后回到循环顶部
+刷新期望集合 / 打开队列 / 会话文件。Go 侧实现为「一条常驻 reader goroutine + 每秒 ticker」：
+
+* **为什么不用「每次读开一条 goroutine + select timeout」**：心跳间隔 1s、serve 常驻数天，
+  那种写法按秒泄漏协程（每拍一条永不返回的 `ReadString`）。
+* **语义差异（唯一一处）**：超时那一刻的**半行**。bash 把半行留在变量里下一轮拼；Go 的
+  `ReadString` 会一直等到换行才交付。结果都是「这一行被完整交给协议分发」，只是交付时刻
+  晚（不影响正确性：协议是行导向的）；而 EOF 时未闭合的半行两边都丢弃（bash 的
+  `read` 返回非 0 且 `hf_read_timed_out` 判为 EOF → break，`line` 里的残余不再使用）。
+
+### 15.7 桥接读侧半边搬迁（`internal/cli/view.go` → `internal/bridge/readside.go`）
+
+§13.7 预告了这次搬迁（「Phase 3 迁移 bridge 写侧时，本文件退化为薄包装」）。`sessions_json`
+/ `live_status_json` / `merge_live` / `any_live` / `clients_json` / `client_forwards_json`
+现在住在 `internal/bridge/readside.go`，`cli/view.go` 只保留 `loadView` 的胶水与投影
+（`rowToForward`）。**difftest 组 6 的 client 在线/离线/bridge 行用例在搬迁前后同为绿**
+（逐字节）。
+
+### 15.8 有意偏离与未决项
+
+* **`machines list` 表格的中文 label 宽度**（§15.3）：Go 按 bash `printf` 的 rune 口径输出，
+  bash 实际输出是 awk 的显示宽度口径。只在宽字符 label 上可见。未拉平的理由见 §15.3；
+  已登记为**待裁决项**（若后续要求表格逐字节一致，需要引入显示宽度表或改用 `--short`）。
+* **`bridge serve` 的会话文件名**：仍用 `session-<pid>.json`（pid = 当前进程），与 bash 的
+  `BASHPID` 同语义。Go 没有 `BASHPID` 的 subshell 概念，但 serve 是独立进程，两者一致。
+* **`bridge run` 的 ssh stderr 落盘**：bash 用 `2>>"${errlog}"`（追加）；Go 用
+  `O_CREATE|O_APPEND`，并在每次重连前 `os.Remove`（= bash 的 `: >"${errlog}"`）。
+  `_bridge_exit_reason` 的 `tail -3` 因此读到同一内容。
+* **`notify` 在 `open-url` 路径上的调用**：Phase 2 已交付 `internal/notify`（§14.8 记「尚无
+  调用方」），本 phase 起 `open-url` 会在「有 client 在线」时投递 toast（与 bash 一致）。
+* **`scripts/ci.sh` 的迁移期适配器延到 Phase 5**：§13.2 写「该适配器在 Phase 3 时删除」，
+  实测**仍需要** —— 原因见该脚本内新增的注释：unit 层还有走真实/staged root 调
+  `bin/forward` 的用例（`test_client_forwards.sh` 的 `ports` 段依赖 bash 的 `ss` 进程名、
+  `test_machines_uri_targets.sh` 会调 `machines list --short`），其 golden 是 bash 输出。
+  这些用例要到 Phase 5（bash 版测试退役）才消失，故删除点顺延到那里。
+* **`doctor` 的 bridge 状态行**：bash 用 `jq` 拼字符串；Go 用同一份 `bridge.Clients()` 文档
+  逐个字段读（`bridge.ObjStr`），输出形状一致（`运行中，<state>（<reason>）`）。
+
+### 15.9 验证结果（Phase 3）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| Go 门 | `make check` | gofmt/vet/test/vendor-check 全绿 |
+| 差分 | `bash tests/difftest/run.sh` | `1..426` / `PASS: 426 FAIL: 0` / `RESULT: PASS`（Phase 2 为 270） |
+| 基线 | `bash scripts/ci.sh` | `CI OK: 6/6 全部通过`（含 docker E2E `130 PASS / 0 FAIL`、两机 E2E `62 PASS / 0 FAIL`） |
+| 集成 | `bash tests/run.sh integration` | 7 文件全绿（含 `test_bridge_roundtrip.sh`：真 sshd + 真 ssh 的桥接数据面） |
+| Go 路径证据（Phase 2） | `bash tests/difftest/phase2-go-path.sh` | `40 passed, 0 failed`（dispatch 边界翻转后仍全绿） |
+| Go 路径证据（Phase 3） | `bash tests/difftest/phase3-go-path.sh` | `21 passed, 0 failed`（**serve 与 run 双侧都走 Go** + 真协议往返 + 退避状态机） |
