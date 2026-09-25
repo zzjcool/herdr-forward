@@ -28,12 +28,15 @@ FAILED_CASES=()
 TMP="$(mktemp -d)"
 SERVER_PIDS=()
 cleanup() {
+  # 先按登记 PID 收，再按临时目录路径兜底（防 start_server 在子 shell 里漏登记）。
   local p
   for p in "${SERVER_PIDS[@]:-}"; do
     if [[ -n "${p}" ]]; then
       kill "${p}" 2>/dev/null || true
     fi
   done
+  pkill -f "${TMP}/difftest serve" 2>/dev/null || true
+  pkill -f "${ROOT}/bin/forward-go internal difftest serve" 2>/dev/null || true
   rm -rf "${TMP}"
 }
 trap cleanup EXIT
@@ -272,7 +275,13 @@ _eq "state_save 文件权限 0600" "600" "${perm}"
 # ===========================================================================
 printf '=== 组 3：probe_payload 三态 ===\n'
 
-# start_server <reply|silent|close> -> 打印端口（Go 侧 serve 用 :0 让内核分配）
+# start_server <reply|silent|close> -> 端口写入全局 SERVER_PORT（Go 侧 serve 用 :0 让内核分配）
+#
+# ⚠ 绝不能用 `PORT="$(start_server ...)"` 的形式调用：命令替换会把整个函数放进子
+# shell，于是后台 serve 与其 PID 登记都留在子 shell 里 —— 子 shell 一退出进程就被
+# 摘除父进程，EXIT 陷阱永远收不到它（首版就踩了这个坑，留下 21 个孤儿 serve）。
+# 因此这里显式用全局变量回传，调用处以普通语句形式执行。
+SERVER_PORT=""
 start_server() {
   local mode="$1"
   local outfile="${TMP}/srv.${mode}.out"
@@ -284,7 +293,7 @@ start_server() {
     [[ -s "${outfile}" ]] && break
     sleep 0.1
   done
-  head -1 "${outfile}"
+  SERVER_PORT="$(head -1 "${outfile}")"
 }
 
 probe_both() {
@@ -297,9 +306,12 @@ probe_both() {
   _eq "probe ${label} 期望 ${label}" "${label}" "${go_h}"
 }
 
-REPLY_PORT="$(start_server reply)"
-SILENT_PORT="$(start_server silent)"
-CLOSE_PORT="$(start_server close)"
+start_server reply
+REPLY_PORT="${SERVER_PORT}"
+start_server silent
+SILENT_PORT="${SERVER_PORT}"
+start_server close
+CLOSE_PORT="${SERVER_PORT}"
 
 if [[ -z "${REPLY_PORT}" || -z "${SILENT_PORT}" || -z "${CLOSE_PORT}" ]]; then
   bad "启动测试服务失败（reply=${REPLY_PORT} silent=${SILENT_PORT} close=${CLOSE_PORT}）"
