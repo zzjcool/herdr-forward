@@ -19,6 +19,17 @@
 //	difftest tunnel-args <id> <lp> <remote_host:rp> <target>   tunnel.SSHArgs 一行一个 argv
 //	                                      （与 lib/tunnel.sh 的 tunnel_ssh_args 逐行比对）
 //
+// Phase 3 新增（见 phase3.go）：
+//
+//	difftest hf-parse <line>              HF1 行解析（OK/ERR + 归一化字段）
+//	difftest hf-fmt <kind> …              HF1 行编码（与 lib/bridge.sh 的 printf 对照）
+//	difftest hf-valid <id> <lp> <rp>      C6 安全边界（yes / 空）
+//	difftest ssh-dest <target>            bridge_ssh_destination
+//	difftest remote-cmd <root> <state>    bridge_remote_serve_cmd
+//	difftest bridge-ssh-args <ctl>        bridge_ssh_args（一行一个 argv）
+//	difftest bridge-active <sub> …        激活状态 schema（active/has/view-json/resolve）
+//	difftest probe-kv <text> <KEY>        kv_get 对照
+//
 // 兼容形式：Main 会跳过前导的 "internal"/"difftest" 词元，因此
 // `forward-go internal difftest state-load` 也能工作（W4 接线后零改动复用本包）。
 package difftest
@@ -79,6 +90,22 @@ func Main(args []string) int {
 		return cmdTunnelArgs(args[1:])
 	case "serve":
 		return cmdServe(args[1:])
+	case "hf-parse":
+		return cmdHFParse(args[1:])
+	case "hf-fmt":
+		return cmdHFFmt(args[1:])
+	case "hf-valid":
+		return cmdHFValid(args[1:])
+	case "ssh-dest":
+		return cmdSSHDest(args[1:])
+	case "remote-cmd":
+		return cmdRemoteCmd(args[1:])
+	case "bridge-ssh-args":
+		return cmdBridgeSSHArgs(args[1:])
+	case "bridge-active":
+		return cmdBridgeActive(args[1:])
+	case "probe-kv":
+		return cmdProbeKV(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "difftest: 未知子命令 %q\n", args[0])
 		return exitUsage

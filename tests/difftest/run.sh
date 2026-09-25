@@ -923,6 +923,195 @@ TUNNEL_PCT_STATE="${TMP}/cli10-zzjcool%3Aforward"
 tunnel_args_pair "argv state 目录含 %（percent 转义）" "${TUNNEL_PCT_STATE}" f-9000 9000 127.0.0.1:8080 'user@host'
 
 # ===========================================================================
+# 组 11：HF1 行协议编解码差分（PLAN-GO-MIGRATION §6 Phase 3 / 契约 C6）
+#
+# 目的：HF1 是**跨机器**协议（A 侧 supervisor ↔ B 侧 serve）。它一旦与 bash 分叉，
+# 表现是「连不上 / 映射不生效」这类远端现象，本机很难定位。这里把它拉回同一进程做
+# 逐字节对照：合法行的编码 / 解析，以及**非法行必须同样被拒**（安全边界 C6）。
+#
+# 两侧接线：
+#   * Go  = bin/forward-go internal difftest hf-parse|hf-fmt|hf-valid|…
+#   * bash= tests/difftest/phase3-bashside.sh（source 真 lib/bridge.sh，不复制逻辑）
+# ===========================================================================
+printf '=== 组 11：HF1 编解码差分 ===\n'
+
+P3_BASH="${DIFFTEST_DIR}/phase3-bashside.sh"
+P3_STATE="${TMP}/p3-state"
+mkdir -p "${P3_STATE}"
+
+# p3_bash <state_dir> <args...>：bash 侧对位入口（source 真 lib/bridge.sh + lib/machines.sh）。
+# 与 bashside.sh 同一纪律：**不复制**逻辑，只转调生产函数。
+p3_bash() {
+  local st="$1"
+  shift
+  HERDR_PLUGIN_STATE_DIR="${st}" bash "${P3_BASH}" "$@"
+}
+
+# hf_pair <name> <subcmd> <args...>：两侧跑同一子命令，比 stdout 逐字节
+hf_pair() {
+  local name="$1" sub="$2"
+  shift 2
+  capture go_side "${P3_STATE}" "${sub}" "$@"
+  local g_out="${OUT}" g_rc="${RC}"
+  capture p3_bash "${P3_STATE}" "${sub}" "$@"
+  _eq "${name} rc（bash=${RC} go=${g_rc}）" "${RC}" "${g_rc}"
+  _eq "${name} stdout" "${g_out}" "${OUT}"
+}
+
+# --- hf-fmt：编码侧（bash 的 printf 形态 vs Go 的 String()） ---
+hf_pair "hf-fmt hello 单 host" hf-fmt hello devbox
+hf_pair "hf-fmt hello 带 label" hf-fmt hello laptop my laptop
+hf_pair "hf-fmt sync 空集合" hf-fmt sync -
+hf_pair "hf-fmt sync 两条" hf-fmt sync "f-3000:3000:3000,f-15173:15173:5173"
+hf_pair "hf-fmt sync 含非法条目（丢弃后编码）" hf-fmt sync "f-3000:3000:3000,bogus,f-80:80:80"
+hf_pair "hf-fmt open" hf-fmt open "http://localhost:8080/ok"
+hf_pair "hf-fmt status up（无 reason）" hf-fmt status f-5173 up
+hf_pair "hf-fmt status down（带 reason）" hf-fmt status f-5173 down "client 端口 5173 已被占用（laptop）"
+hf_pair "hf-fmt ping" hf-fmt ping
+
+# --- hf-parse：解析侧（合法行矩阵） ---
+hf_pair "hf-parse HELLO" hf-parse "HF1 HELLO devbox"
+hf_pair "hf-parse HELLO 带标签" hf-parse "HF1 HELLO laptop my laptop"
+hf_pair "hf-parse SYNC 空" hf-parse "HF1 SYNC -"
+hf_pair "hf-parse SYNC 两条" hf-parse "HF1 SYNC f-3000:3000:3000,f-15173:15173:5173"
+hf_pair "hf-parse OPEN" hf-parse "HF1 OPEN http://localhost:6006/x"
+hf_pair "hf-parse STATUS up" hf-parse "HF1 STATUS f-5173 up"
+hf_pair "hf-parse STATUS down 带 reason（含空格）" hf-parse "HF1 STATUS f-5173 down client 端口 5173 已被占用（laptop）"
+hf_pair "hf-parse PING" hf-parse "HF1 PING"
+
+# --- hf-parse：非法/畸形行矩阵（必须同样被拒） ---
+hf_pair "hf-parse 非 HF1 前缀" hf-parse "XX1 HELLO devbox"
+hf_pair "hf-parse 未知动作" hf-parse "HF1 NOPE x"
+hf_pair "hf-parse 空行" hf-parse ""
+hf_pair "hf-parse 仅前缀" hf-parse "HF1"
+hf_pair "hf-parse STATUS 缺字段" hf-parse "HF1 STATUS f-5173"
+hf_pair "hf-parse 注入尝试（;touch）" hf-parse "HF1 SYNC f-4000:4000:4000;touch /tmp/pwn"
+
+# --- hf-valid：C6 安全边界矩阵 ---
+hf_pair "hf-valid 合法" hf-valid f-5173 5173 5173
+hf_pair "hf-valid 本地/远端端口可不同" hf-valid f-15432 15432 5432
+hf_pair "hf-valid 远端端口 < 1024 合法" hf-valid f-1080 1080 80
+hf_pair "hf-valid 本地端口 < 1024 拒绝" hf-valid f-80 80 80
+hf_pair "hf-valid id 与端口不一致 拒绝" hf-valid f-3000 3001 3000
+hf_pair "hf-valid 前导零 拒绝" hf-valid f-08080 08080 80
+hf_pair "hf-valid 本地端口越界 拒绝" hf-valid f-70000 70000 80
+hf_pair "hf-valid 远端端口越界 拒绝" hf-valid f-3000 3000 99999
+hf_pair "hf-valid 远端端口非数字 拒绝" hf-valid f-3000 3000 x
+hf_pair "hf-valid 端口 0 拒绝" hf-valid f-3000 3000 0
+hf_pair "hf-valid 路径穿越 id 拒绝" hf-valid ../../etc/passwd 3000 3000
+
+# --- ssh 目的地与远端命令（A 机真实 target 形态） ---
+hf_pair "ssh-dest 别名原样" ssh-dest workbox
+hf_pair "ssh-dest user@host 原样" ssh-dest me@b-host
+hf_pair "ssh-dest user@host:port 转 URI" ssh-dest me@b-host:2222
+hf_pair "ssh-dest ssh:// URI 原样" ssh-dest "ssh://me@b-host:31415"
+hf_pair "ssh-dest [v6]:port 转 URI" ssh-dest "[::1]:22"
+hf_pair "ssh-dest 裸 IPv6 原样" ssh-dest "fe80::1"
+hf_pair "remote-cmd 含空格与单引号" remote-cmd "/opt/my plugins/it's here" "/st ate/zzjcool%3Aforward"
+hf_pair "remote-cmd 常规" remote-cmd "/home/b/.config/herdr/plugins/github/zzjcool-forward-ab12cd34" "/home/b/.local/state/herdr/plugins/zzjcool%3Aforward"
+
+# --- bridge ssh argv 逐行（钉死信任边界） ---
+hf_pair "bridge-ssh-args 常规" bridge-ssh-args "/s/zzjcool%3Aforward/ssh-ctl/b-abc"
+hf_pair "bridge-ssh-args 短路径" bridge-ssh-args "/c"
+
+# ===========================================================================
+# 组 12：machines 合并视图 + 激活状态 schema 差分（契约 C5/C8）
+#
+# 两个状态目录各铺同一份 fixture（herdr 列表由 PATH 前置的假 herdr 提供），
+# 比 `machines list --json`（合并视图）与 active/has/resolve 的判定。
+# ===========================================================================
+printf '=== 组 12：machines 视图与激活状态 schema 差分 ===\n'
+
+P3_HERDR_DIR="${TMP}/p3-herdr-bin"
+mkdir -p "${P3_HERDR_DIR}"
+P3_HERDR_JSON='[{"id":"m-probe","label":"test-probe","target":"user@b-host:22","session":"default","enabled":true,"selected":false},{"id":"m-local","label":"this-host","target":"127.0.0.1","session":"default","enabled":true,"selected":false},{"id":"m-uri","label":"uri-box","target":"ssh://dev@b-host:2222","session":"default","enabled":true,"selected":false}]'
+cat >"${P3_HERDR_DIR}/herdr" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1-}" == "machine" && "\${2-}" == "list" ]]; then
+  printf '%s\n' '${P3_HERDR_JSON}'
+  exit 0
+fi
+exit 127
+EOF
+chmod +x "${P3_HERDR_DIR}/herdr"
+export HERDR_BIN_PATH="${P3_HERDR_DIR}/herdr"
+
+# seed_activation <state_dir>：铺一份含 active + orphan 的激活状态
+seed_activation() {
+  local st="$1"
+  mkdir -p "${st}"
+  cat >"${st}/activated-machines.json" <<'JSON'
+{"version":1,"active":"m-uri","machines":{"m-uri":{"label":"uri-box","ssh_target":"ssh://dev@b-host:2222","server_root":"/home/b/plugin","state_dir":"/home/b/state","local":false,"activated_unix":1790000000},"m-ghost":{"label":"gone-box","ssh_target":"u@gone:22","server_root":"/home/g/plugin","state_dir":"/home/g/state","local":false,"activated_unix":1790000001}}}
+JSON
+}
+
+# p3_pair <name> <subcmd> <args...>：两侧各铺同一激活状态后比 stdout + rc
+p3_pair() {
+  local name="$1" sub="$2"
+  shift 2
+  local bst="${TMP}/p3-bash-state" gst="${TMP}/p3-go-state"
+  rm -rf "${bst}" "${gst}"
+  seed_activation "${bst}"
+  seed_activation "${gst}"
+  capture go_side "${gst}" "${sub}" "$@"
+  local g_out="${OUT}" g_rc="${RC}"
+  capture p3_bash "${bst}" "${sub}" "$@"
+  _eq "${name} rc（bash=${RC} go=${g_rc}）" "${RC}" "${g_rc}"
+  _eq "${name} stdout" "${g_out}" "${OUT}"
+}
+
+p3_pair "machines view-json（active + orphan）" bridge-active view-json
+p3_pair "machines active" bridge-active active
+p3_pair "machines has 命中" bridge-active has m-uri
+p3_pair "machines has 未命中" bridge-active has nope
+p3_pair "machines has orphan 命中" bridge-active has m-ghost
+p3_pair "machines resolve by id" bridge-active resolve m-probe
+p3_pair "machines resolve by label" bridge-active resolve test-probe
+p3_pair "machines resolve label 大小写不敏感" bridge-active resolve TEST-PROBE
+p3_pair "machines resolve orphan label" bridge-active resolve gone-box
+p3_pair "machines resolve 不存在" bridge-active resolve definitely-nope
+
+# 空状态（无 activated-machines.json）：视图仍输出三台，全 inactive/local
+p3_pair_empty() {
+  local name="$1" sub="$2"
+  shift 2
+  local bst="${TMP}/p3-bash-state" gst="${TMP}/p3-go-state"
+  rm -rf "${bst}" "${gst}"
+  mkdir -p "${bst}" "${gst}"
+  capture go_side "${gst}" "${sub}" "$@"
+  local g_out="${OUT}" g_rc="${RC}"
+  capture p3_bash "${bst}" "${sub}" "$@"
+  _eq "${name} rc（bash=${RC} go=${g_rc}）" "${RC}" "${g_rc}"
+  _eq "${name} stdout" "${g_out}" "${OUT}"
+}
+p3_pair_empty "machines view-json（无激活记录）" bridge-active view-json
+p3_pair_empty "machines active（无记录 -> 空行）" bridge-active active
+
+unset HERDR_BIN_PATH
+
+# ===========================================================================
+# 组 13：前导零矩阵（bridge_valid_entry 的两段判定）
+#
+# 与组 11 的 hf-valid 同源，但补足**前导零**的边界组合：bash 用正则挡前导零，
+# Go 用字面量判定；任何一处写成 Atoi 后比较都会在这里分叉。
+# ===========================================================================
+printf '=== 组 13：端口字面量边界矩阵 ===\n'
+for lp in 1024 1025 9999 10000 65535 99999; do
+  hf_pair "hf-valid lp=${lp}" hf-valid "f-${lp}" "${lp}" "${lp}"
+done
+for lp in 0 80 102 1023; do
+  hf_pair "hf-valid lp=${lp}（<1024 拒绝）" hf-valid "f-${lp}" "${lp}" "${lp}"
+done
+for rp in 1 22 80 1024 65535 65536; do
+  hf_pair "hf-valid rp=${rp}" hf-valid f-3000 3000 "${rp}"
+done
+for raw in 01024 05173 65535 010234; do
+  hf_pair "hf-valid 前导零 lp=${raw} 拒绝" hf-valid "f-${raw}" "${raw}" 5173
+done
+hf_pair "hf-valid 前导零 rp 拒绝" hf-valid f-5173 5173 05173
+hf_pair "hf-valid 六位端口拒绝" hf-valid f-100000 100000 100000
+
+# ===========================================================================
 # 汇总
 # ===========================================================================
 printf '1..%d\n' "$((PASS + FAIL))"

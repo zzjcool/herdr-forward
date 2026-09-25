@@ -154,11 +154,22 @@ func ParseLine(line string) (Msg, error) {
 		}
 		return Open{URL: url}, nil
 	case "STATUS":
-		if len(words) < 4 {
-			return nil, fmt.Errorf("bridge: STATUS 行缺少字段: %q", line)
+		// 宽容解析（与 bash 的 serve 分派同构）：bash 先 `IFS=' ' read -a words` 拿到
+		// words[2]/words[3]，**再**用 `^f-([1-9][0-9]{0,4})$` + `up|down` 校验；因此
+		// 字段不全的行仍然被识别为 STATUS（只是随后校验失败、什么都不写），并且**会刷新
+		// last_seen**（bash 在 STATUS 分支里无条件 `srv_last_seen=${now}`）。
+		//
+		// 早先这里返回 error 会让 handleLine 走「未知协议行」分支 —— 后果是畸形 STATUS
+		// 不再算心跳，与 bash 分叉。故解析与校验必须分开（校验在 Serve.handleLine 里）。
+		id := ""
+		if len(words) > 2 {
+			id = words[2]
 		}
-		reason := afterFields(line, 4)
-		return Status{ID: words[2], State: words[3], Reason: reason}, nil
+		state := ""
+		if len(words) > 3 {
+			state = words[3]
+		}
+		return Status{ID: id, State: state, Reason: stripReasonPrefix(line, id, state)}, nil
 	case "PING":
 		return Ping{}, nil
 	default:
@@ -177,28 +188,23 @@ func afterVerb(line, verb string) string {
 	return line[idx+len(needle):]
 }
 
-// afterFields 取「跳过前 n 个空格分隔词」之后的原文（复刻 bash 的
-// `rest="${line#*STATUS "${fid}" "${st}"}"; rest="${rest# }"`）。
-func afterFields(line string, n int) string {
-	i := 0
-	skipped := 0
-	for skipped < n {
-		for i < len(line) && line[i] == ' ' {
-			i++
-		}
-		if i >= len(line) {
-			return ""
-		}
-		for i < len(line) && line[i] != ' ' {
-			i++
-		}
-		skipped++
+// stripReasonPrefix 复刻 bash 的 reason 提取：
+//
+//	rest="${line#*STATUS "${fid}" "${st}"}"; rest="${rest# }"
+//
+// 注意两点（都与“用 Fields 重写”不等价）：
+//   - `${var#*pattern}` 取**最短前缀**，即 pattern 的**首次出现**；pattern 不在时原样返回；
+//   - 末尾只吃掉**一个**空格（`${rest# }`），不是全部空白。
+func stripReasonPrefix(line, id, state string) string {
+	pattern := Proto + " STATUS " + id + " " + state
+	rest := line
+	if idx := strings.Index(line, pattern); idx >= 0 {
+		rest = line[idx+len(pattern):]
 	}
-	// bash：`rest="${rest# }"` 只吃掉**一个**前导空格
-	if i < len(line) && line[i] == ' ' {
-		i++
+	if strings.HasPrefix(rest, " ") {
+		rest = rest[1:]
 	}
-	return line[i:]
+	return rest
 }
 
 // spaceFields 复刻 `IFS=' ' read -r -a`：只按空格切分，折叠连续空格并忽略首尾。

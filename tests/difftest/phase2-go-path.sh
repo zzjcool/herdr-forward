@@ -338,33 +338,63 @@ done < <(pgrep -f 'ssh.*herdr-forward' 2>/dev/null || true)
 eq "${RESIDUE}" "0" "t_no_zombie_ssh 口径无残留（pgrep -f 'ssh.*herdr-forward'，排除祖先链）"
 
 # ---------------------------------------------------------------------------
-# 7) dispatch 边界：`add --client` 仍由 bash 处理（Phase 3 才迁）
+# 7) dispatch 边界：`add --client` 现已交给 Go（Phase 3 的迁移点）
 #
-# `machines activate` / panel 的自发 add 走的正是这条路径（client 映射的写侧依赖
-# lib/bridge.sh）。验收要求：即使在 forward-go 可用时，显式 --client 也不得路由到 Go。
-# 证据：shim 的 marker 里不得出现该次调用，而记录仍被正确写入（说明 bash 处理了它）。
+# Phase 2 时这条路径留在 bash（client 映射的写侧依赖 lib/bridge.sh）；Phase 3 把桥接写侧
+# 迁到 Go 后，显式 --client 也路由到 Go。证据：shim 的 marker 出现该次调用，且记录形态
+# 与 bash 版一致（mode=client）。
 # ---------------------------------------------------------------------------
 CLIENT_PORT=24517
 before="$(wc -l <"${MARKER}")"
 run "${FW}" add "${CLIENT_PORT}" --client
 after="$(wc -l <"${MARKER}")"
-eq "${rc}" "0" "add --client 退出 0（bash 分支）"
+eq "${rc}" "0" "add --client 退出 0（Go 分支）"
 eq "${out}" "f-${CLIENT_PORT}" "add --client stdout = id"
-eq "${before}" "${after}" "dispatch：add --client 未走 Go（marker 无新增行 -> bash 处理）"
+if [[ "${after}" -gt "${before}" ]]; then
+  ok "dispatch：add --client 交给了 Go（Phase 3 迁移点）"
+else
+  no "dispatch：add --client 未走 Go 实现"
+fi
 state_field "[.forwards[] | select(.id == \"f-${CLIENT_PORT}\")][0].mode"
-eq "${sf}" "client" "bash 已写入 mode=client 记录"
+eq "${sf}" "client" "Go 已写入 mode=client 记录"
 
 # ---------------------------------------------------------------------------
-# 8) 未迁移子命令零变化：machines / bridge / open-url / bootstrap / help 仍由 bash 处理
+# 8) Phase 3 新增子命令整组走 Go：machines / bridge / open-url
 #
-# 这些子命令的实现在 Phase 2 **一字未改**，且 dispatch 白名单里没有它们。证据：即使
-# forward-go 可执行，marker 也不得新增行（说明这次调用完全由 bash 完成）。
-#
-# 故意**不**用 `watch` 作为样本：非 TTY 下它 exec `watch -n 3 forward list`，嵌套的
-# `list` 本来就应该走 Go（list 是已迁移的），marker 出现的 GO 行是正确行为而不是回归。
+# 证据：shim 的 marker 出现对应调用（machines list / bridge status / open-url）。
+# 只跑**零副作用**的形态（list / status / help）；activate/doctor 会 ssh 到远端，
+# 交给 tests/unit/test_machines_cmd.sh 与 integration/test_machines_probe.sh。
 # ---------------------------------------------------------------------------
-for unmigrated in "machines list --short" "machines doctor" "bridge status" \
-  "open-url http://localhost:3000" "bootstrap" "help"; do
+for migrated in "machines list --short" "bridge status" "machines help"; do
+  read -r -a migrated_argv <<<"${migrated}"
+  before="$(wc -l <"${MARKER}")"
+  run timeout 20 "${FW}" "${migrated_argv[@]}"
+  after="$(wc -l <"${MARKER}")"
+  if [[ "${after}" -gt "${before}" ]]; then
+    ok "migrated 子命令走 Go：${migrated}（rc=${rc}）"
+  else
+    no "migrated 子命令未走 Go：${migrated}（rc=${rc}）"
+  fi
+done
+
+# open-url 无 client 在线时走本机浏览器（HERDR_FORWARD_OPENER 指到探针脚本），
+# 本身不做任何写操作；这里只要求它被路由到 Go。
+before="$(wc -l <"${MARKER}")"
+run timeout 20 "${FW}" open-url "http://localhost:3000/x"
+after="$(wc -l <"${MARKER}")"
+if [[ "${after}" -gt "${before}" ]]; then
+  ok "migrated 子命令走 Go：open-url（rc=${rc}）"
+else
+  no "migrated 子命令未走 Go：open-url（rc=${rc}）"
+fi
+
+# ---------------------------------------------------------------------------
+# 9) 仍未迁移的子命令零变化：bootstrap 仍由 bash 处理
+#
+# `watch` 故意不做样本：非 TTY 下它 exec `watch -n 3 forward list`，嵌套的 list 本来就
+# 应该走 Go（list 是已迁移的），marker 出现 GO 行是正确行为而不是回归。
+# ---------------------------------------------------------------------------
+for unmigrated in "bootstrap" "help"; do
   read -r -a unmigrated_argv <<<"${unmigrated}"
   before="$(wc -l <"${MARKER}")"
   run timeout 20 "${FW}" "${unmigrated_argv[@]}"
