@@ -659,3 +659,13 @@ bash 的 serve 循环用 `read -r -t BRIDGE_POLL_S`：每拍最多等 1 秒，�
 | 集成 | `bash tests/run.sh integration` | 7 文件全绿（含 `test_bridge_roundtrip.sh`：真 sshd + 真 ssh 的桥接数据面） |
 | Go 路径证据（Phase 2） | `bash tests/difftest/phase2-go-path.sh` | `40 passed, 0 failed`（dispatch 边界翻转后仍全绿） |
 | Go 路径证据（Phase 3） | `bash tests/difftest/phase3-go-path.sh` | `21 passed, 0 failed`（**serve 与 run 双侧都走 Go** + 真协议往返 + 退避状态机） |
+
+## 16. Phase 3 未决问题裁决（主 agent，2026-09-25）
+
+Phase 3 验收（独立复跑：difftest 426/426、ci.sh 6/6、phase2/phase3-go-path 40+21 全绿）后，对 worker 报告 §7 五条未决问题的裁决：
+
+1. **§15.3 表格宽度**：**保 Go 的确定性**（= bash printf 字节口径，不做显示宽度对齐）。理由：difftest 的逐字节契约是整个迁移的护栏，引入 awk 宽度对齐会破坏字节可比性；宽字符机器名属边角显示美观问题，Phase 5 后如需再单独提案。已生效。
+2. **本地 `make build` 后手跑 unit 3 红**（`test_client_forwards.sh` 的 ports PROCESS 列）：已知偏离 §13.4 的自然结果，CI 判据不受影响。**Phase 5 收口清单**：删 ci.sh 适配器时，把这 3 条断言改为同时接受 bash/Go 两种 PROCESS 形态（或改用 --json 断言端口/地址列，对齐 E2E 口径）。
+3. **activated-machines.json 双读取点**（machine 写侧 / bridge 只读）：接受当前策略（与 bash 同构）。约束：Phase 4/5 若新增字段，两处必须同步改，difftest 的 schema 对照用例负责抓漂移。
+4. **两机 E2E tar 未含 forward-go**：**Phase 4 处理**——把 Go CLI 注入两机 tar，让两机 E2E 直接裁判 Go 路径（62 断言是最接近真实用户的验收）。归入 Phase 4 任务书。
+5. **watch/bootstrap 仍在 bash**：Phase 4 主任务，无异议。
