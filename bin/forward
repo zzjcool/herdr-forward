@@ -1723,30 +1723,27 @@ cmd_machines() {
 }
 
 # _hf_add_dispatch_go <add 的全部参数（不含子命令名）>：stdout "yes" 表示该次 add 可
-# 交给 Go 实现（Phase 2 的迁移边界，见 main() 顶部注释）。
+# 交给 Go 实现。
 #
-# 规则（保守优先，宁可多跑一轮 bash）：
-#   * 出现 `--client`（精确匹配）-> 归 bash。显式 client 映射的写侧依赖 lib/bridge.sh，
-#     属 Phase 3；`panel.sh` / `machines activate` 走的正是这条路径。
-#   * 否则给了 `--ssh-target` / `--machine`（含 `--flag=value` 形态）-> 切 Go。
-#   * 其余（无目标、只有位置参数/未知 flag）-> 归 bash，行为零变化。
+# Phase 3 起 `--client` 的写侧（lib/bridge.sh）已迁到 Go，故本谓词不再排除它：
+# 给了任何一个目标 flag（--client / --ssh-target / --machine，含 `--flag=value` 形态）
+# 就切 Go；其余（无目标、只有位置参数/未知 flag）仍归 bash。
+#
+# 为什么「无目标」仍留 bash：那条路径要按「有没有 client 在线」临时决定走 client
+# 分支还是 die 4，属于**参数解析后的运行时判定**；bash 侧的 cmd_add 与 Go 侧的
+# cmdAdd 都已实现完整语义（Go 侧走 anyClientLive），但白名单只看 argv，看不到在线
+# 状态，因此保守留给 bash（行为零变化）。
 _hf_add_dispatch_go() {
   local arg=""
-  local has_target=""
   for arg in "$@"; do
     case "${arg}" in
-    --client)
+    --client | --ssh-target | --ssh-target=* | --machine | --machine=*)
+      printf 'yes\n'
       return 0
-      ;;
-    --ssh-target | --ssh-target=* | --machine | --machine=*)
-      has_target="yes"
       ;;
     *) ;;
     esac
   done
-  if [[ -n "${has_target}" ]]; then
-    printf 'yes\n'
-  fi
   return 0
 }
 
@@ -1760,20 +1757,18 @@ main() {
 
   local _hf_add_go=""
 
-  # --- W4/Phase 2 迁移接线（PLAN-GO-MIGRATION §6/§10）：已迁移子命令交给 Go 实现 ---
+  # --- W4/Phase 2/Phase 3 迁移接线（PLAN-GO-MIGRATION §6/§10）：已迁移子命令交给 Go ---
   # 只有本块允许在迁移期改动（见 PLAN §3 的 bin/forward dispatch 边界）。
   # 条件式而非无条件 exec：
   #   * 单元/集成测试会把 bin/forward + lib/ 拷成「staged root」，那里没有
   #     forward-go —— 无条件 exec 会 127 直接弄红 ci.sh；
   #   * 回滚方案就是删掉这个 if 块（bash 立即恢复全权处理）。
   #
-  # Phase 2 起：list/ports/remove/doctor/publish/unpublish 整体切 Go；`add` 按参数细分
-  # （显式 `--client` 与「无目标」的隐式 client 分支留在 bash —— client 映射的写侧
-  # 依赖 lib/bridge.sh，Phase 3 才迁；`machines activate`/panel 走的正是这条路径）。
-  # 目标复用 bin/forward-go（构建产物，.gitignore 排除；见 Makefile 的 build 目标与
-  # scripts/e2e 的容器内构建）。
+  # Phase 3 起：machines / bridge / open-url 整组切 Go（bridge 的 serve 与 run **同
+  # phase 一起切**，不留 HF1 mixed-version 窗口）；`add` 的显式目标（含 `--client`）
+  # 也切 Go（client 映射的写侧已迁）。此后仅剩 watch / bootstrap 走 bash（Phase 4）。
   case "${1-}" in
-  list | ports | remove | doctor | publish | unpublish)
+  list | ports | remove | doctor | publish | unpublish | machines | bridge | open-url)
     if [[ -x "${FORWARD_ROOT}/bin/forward-go" ]]; then
       exec "${FORWARD_ROOT}/bin/forward-go" "$@"
     fi

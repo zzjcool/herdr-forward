@@ -711,3 +711,94 @@ func rawString(o *jqjson.Object, key string) string {
 	s, _ := v.(string)
 	return s
 }
+
+// Up 复刻 bridge_up：后台启动 supervisor（已在运行则直接返回）。
+//
+// 返回值 = 是否「启动成功且拿到 pid」。它 setsid 出去跑 `forward bridge run`，
+// 因此面板/popup 关闭时 herdr 对其进程组发的信号带不走 supervisor。
+//
+// binPath 由调用方给出（= <plugin_root>/bin/forward），与 bash 的 bridge_up <mid> <bin> 一致。
+func Up(machineID, binPath string) (string, bool) {
+	if holder := LockHolder(machineID); holder != "" {
+		return fmt.Sprintf("桥接已在运行（pid=%s）。", holder), true
+	}
+	outlog := filepath.Join(Dir(), "client-"+SafeID(machineID)+".out")
+	logFile, err := os.OpenFile(outlog, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "桥接进程未能启动；日志：%s\n", outlog)
+		return "", false
+	}
+	cmd := exec.Command(binPath, "bridge", "run", machineID)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+	if err == nil {
+		cmd.Stdin = devNull
+		defer func() { _ = devNull.Close() }()
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		fmt.Fprintf(os.Stderr, "桥接进程未能启动；日志：%s\n", outlog)
+		return "", false
+	}
+	_ = logFile.Close()
+	go func() { _ = cmd.Wait() }()
+
+	// 等锁文件出现（最长 2s，与 bash 的 20×0.1s 一致）
+	holder := ""
+	for tries := 0; tries < 20; tries++ {
+		if holder = LockHolder(machineID); holder != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if holder == "" {
+		fmt.Fprintf(os.Stderr, "桥接进程未能启动；日志：%s\n", outlog)
+		return "", false
+	}
+	return fmt.Sprintf("桥接已启动（pid=%s）。", holder), true
+}
+
+// Down 复刻 bridge_down：停 supervisor（它的 EXIT trap 会关掉 master，映射随之释放）；幂等。
+func Down(machineID string) {
+	if holder := LockHolder(machineID); holder != "" {
+		if pid, ok := atoiOKPublic(holder); ok {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+			for waits := 0; waits < 50; waits++ {
+				if syscall.Kill(pid, 0) != nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	ctlExit(ControlPath(machineID))
+	ReleaseLock(machineID)
+	_ = os.Remove(ClientFile(machineID))
+}
+
+// ObjStr 读一个 client 文档的字符串字段（供 CLI 层复用同一份对象模型）。
+func ObjStr(o any, key string) string {
+	obj, ok := o.(*jqjson.Object)
+	if !ok {
+		return ""
+	}
+	return jqjson.Str(valOf(obj, key))
+}
+
+// Machines 复刻 `bridge_clients_json | jq -r '.[].machine'`：有 client 记录的机器 id。
+func Machines() []string {
+	out := []string{}
+	for _, c := range Clients() {
+		mid := jqjson.Str(valOf(c, "machine"))
+		if mid != "" {
+			out = append(out, mid)
+		}
+	}
+	return out
+}
+
+// atoiOKPublic 解析十进制整数。
+func atoiOKPublic(s string) (int, bool) { return atoiOK(s) }

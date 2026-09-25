@@ -40,15 +40,12 @@ const (
 
 // unmigrated 是「在 Bash 侧实现、Go 侧尚未迁移」的子命令集合（C1 的 15 项之一部分）。
 //
-// Phase 2 之后只剩 5 个：watch/bootstrap（Phase 4）、machines/bridge/open-url（Phase 3）。
+// Phase 3 之后只剩 2 个：watch / bootstrap（Phase 4 的交互面板 + 安装器）。
 // 它们出现在 dispatch 表里只为了让契约清单完整、并让哨兵行为可测：生产路径由
 // bin/forward 的白名单保证不会走到这里。
 var unmigrated = map[string]bool{
 	"watch":     true,
 	"bootstrap": true,
-	"machines":  true,
-	"bridge":    true,
-	"open-url":  true,
 }
 
 // Main 是 CLI 入口，返回值即进程退出码。
@@ -82,6 +79,12 @@ func Main(args []string) int {
 		return cmdUnpublish(rest)
 	case "ports":
 		return cmdPorts(rest)
+	case "machines":
+		return cmdMachines(rest)
+	case "bridge":
+		return cmdBridge(rest)
+	case "open-url":
+		return cmdOpenURL(rest)
 	case "help", "--help", "-h":
 		// bash: usage 到 stdout，return 0
 		fmt.Print(usageText)

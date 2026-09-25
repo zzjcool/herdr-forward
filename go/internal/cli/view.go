@@ -27,13 +27,11 @@ package cli
 
 import (
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
+	"github.com/zzjcool/herdr-forward/internal/bridge"
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
 	"github.com/zzjcool/herdr-forward/internal/jqjson"
 )
@@ -62,6 +60,26 @@ type view struct {
 	mergeOK bool  // false = bash 侧 bridge_merge_live 的 jq 报错，视图退化为空串
 }
 
+// anyObjects 把 bridge 包的「插入序对象」列表转成本包内部使用的 any 切片。
+func anyObjects(objs []*jqjson.Object) []any {
+	out := make([]any, 0, len(objs))
+	for _, o := range objs {
+		out = append(out, o)
+	}
+	return out
+}
+
+// objList 把 any 切片里的对象挑出来（非对象元素由调用方另行处理）。
+func objList(rows []any) []*jqjson.Object {
+	out := make([]*jqjson.Object, 0, len(rows))
+	for _, r := range rows {
+		if o, ok := r.(*jqjson.Object); ok {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // loadView 复刻 _hf_view_json：
 //
 //	forwards = forward_list_json          （= state_load）
@@ -71,17 +89,15 @@ type view struct {
 //	remote == "[]"          -> merged
 //	否则                     -> merged ++ remote
 func loadView() view {
-	raw := readRawForwards()
-	if !allObjects(raw) {
+	raw, allObjects := bridge.RawForwards()
+	if !allObjects {
 		// bash：bridge_merge_live 的 jq 对非对象元素报 `Cannot index number with
 		// string ("mode")`，该赋值失败 -> merged 空串 -> 视图整体为空。
 		// 下游表现（实测）：`list --json`/`--oneline` 空 stdout 且 rc 0；表格只剩表头。
-		return view{raw: raw, mergeOK: false}
+		return view{raw: anyObjects(raw), mergeOK: false}
 	}
-	sessions := bridgeSessions()
-	merged := mergeLive(raw, sessions)
-	remote := bridgeClientForwards()
-	return view{raw: raw, rows: append(merged, remote...), mergeOK: true}
+	rows, _ := bridge.MergeView()
+	return view{raw: anyObjects(raw), rows: anyObjects(rows), mergeOK: true}
 }
 
 // allObjects 报告数组里是否每个元素都是 JSON 对象（空数组为真）。
@@ -94,405 +110,7 @@ func allObjects(arr []any) bool {
 	return true
 }
 
-// readRawForwards 复刻 state_load 的 stdout（不含 `[]` 打印形态，直接给数组），
-// 并把 bash 的 warn 文案按同一格式写日志/stderr。
-//
-// 降级规则（与 bash 一一对应）：文件不存在/读不到、不可解析、顶层非对象 -> warn 1；
-// 缺 forwards 键、forwards 非数组 -> warn 2；一律返回空数组且不报错（绝不 crash）。
-func readRawForwards() []any {
-	path := stateFilePath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// bash：`[[ ! -f ${file} ]]` -> 直接 `printf '[]\n'`，无 warn
-			return []any{}
-		}
-		hfcommon.Logf("warn", stateWarnUnparsable, path)
-		return []any{}
-	}
-	parsed, err := jqjson.Parse(data)
-	if err != nil {
-		hfcommon.Logf("warn", stateWarnUnparsable, path)
-		return []any{}
-	}
-	obj, ok := parsed.(*jqjson.Object)
-	if !ok {
-		hfcommon.Logf("warn", stateWarnUnparsable, path)
-		return []any{}
-	}
-	fv, ok := obj.Get("forwards")
-	if !ok {
-		hfcommon.Logf("warn", stateWarnNoForwards, path)
-		return []any{}
-	}
-	arr, ok := fv.([]any)
-	if !ok {
-		hfcommon.Logf("warn", stateWarnNoForwards, path)
-		return []any{}
-	}
-	return arr
-}
-
-// --- 桥接会话（B 侧只读） ---------------------------------------------------
-
-// bridgeDir 复刻 bridge_dir：首次使用时建 700 目录。
-func bridgeDir() string {
-	dir := filepath.Join(hfcommon.StateDir(), "bridge")
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		_ = os.MkdirAll(dir, 0o700)
-		_ = os.Chmod(dir, 0o700)
-	}
-	return dir
-}
-
-// safeID 复刻 _bridge_safe_id：非 [A-Za-z0-9_.-] 一律换成下划线。
-func safeID(raw string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			return r
-		case r == '_' || r == '.' || r == '-':
-			return r
-		default:
-			return '_'
-		}
-	}, raw)
-}
-
-// pidAlive 复刻 bash 的 `kill -0 <pid>` 判定。
-//
-// ⚠ 关键细节（实测）：bash 的 `kill -0` 对「存在但无权发信号的进程」返回 1（EPERM），
-// 于是 bridge_sessions_json 会把这类会话文件当**已死**并删除。Go 必须一致：任何错误
-// 都视作已死（只有 err == nil 才活着）。
-func pidAlive(pidText string) bool {
-	pid, err := strconv.Atoi(pidText)
-	if err != nil {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
-}
-
-// killZeroErrnoHint 仅用于文档化：syscall.Kill 在 EPERM/ESRCH 下都返回非 nil，
-// 与 bash `kill -0` 的「非 0 即死」语义一致（保留函数以免误改判定）。
-func killZeroErrnoHint() string { return "EPERM 与 ESRCH 一律视为已死（bash kill -0 语义）" }
-
-var _ = killZeroErrnoHint
-
-// bridgeLiveWindow 读 BRIDGE_LIVE_WINDOW_S：
-//
-//	bash: 未设置/空 -> 20；设了非数字 -> 算术展开报错，`((...))` 为假 -> 永不 live。
-//	Go 用 -1 表达「永不 live」，与 bash 的失败分支同效果。
-func bridgeLiveWindow() int64 {
-	raw := os.Getenv("BRIDGE_LIVE_WINDOW_S")
-	if raw == "" {
-		return bridgeLiveWindowDefault
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return -1
-	}
-	return n
-}
-
-// bridgeSessions 复刻 bridge_sessions_json：
-//
-//	$(state_dir)/bridge/session-*.json -> [{..., pid, live}]
-//	  * 文件名里的 pid 非数字 -> 跳过；
-//	  * pid 已死 -> **删掉文件** 后跳过；
-//	  * 内容不是对象 / 不可解析 -> 跳过；
-//	  * live = now - floor(.last_seen_unix // 0) <= BRIDGE_LIVE_WINDOW_S；
-//	结果按 .last_seen_unix 稳定升序后整体 reverse()（等值项随之倒序，与 jq 一致）。
-func bridgeSessions() []any {
-	dir := bridgeDir()
-	now := hfcommon.NowUnix()
-	window := bridgeLiveWindow()
-
-	matches, _ := filepath.Glob(filepath.Join(dir, "session-*.json"))
-	docs := []any{}
-	for _, path := range matches {
-		st, err := os.Stat(path)
-		if err != nil || st.IsDir() {
-			continue // bash: `[[ -f ${f} ]] || continue`
-		}
-		name := filepath.Base(path)
-		pidText := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".json")
-		if !isDigits(pidText) {
-			continue
-		}
-		if !pidAlive(pidText) {
-			_ = os.Remove(path) // 复刻 bash：SIGKILL 留下的会话文件顺手清掉
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		parsed, err := jqjson.Parse(data)
-		if err != nil {
-			continue
-		}
-		doc, ok := parsed.(*jqjson.Object)
-		if !ok {
-			continue
-		}
-		seen, _ := doc.Get("last_seen_unix")
-		seenDigits := floorDigits(seen)
-		live := false
-		if n, err := strconv.ParseInt(seenDigits, 10, 64); err == nil {
-			live = now-n <= window
-		}
-		doc.Set("pid", jsonNumber(pidText))
-		doc.Set("live", live)
-		docs = append(docs, doc)
-	}
-	if len(docs) == 0 {
-		return docs
-	}
-	sortByKeyStable(docs, "last_seen_unix")
-	reverseAny(docs)
-	return docs
-}
-
-// bridgeLiveStatus 复刻 bridge_live_status_json：
-//
-//	只统计 live 会话；同一 id 被多个 client 汇报时 up 优先（否则取会话顺序里的第一条）。
-//	返回「按 id 分组顺序」排列的结果（jq from_entries 保留 group_by 的顺序）。
-func bridgeLiveStatus(sessions []any) []liveStatus {
-	type entry struct {
-		id     string
-		state  string
-		reason string
-		client string
-		order  int
-	}
-	entries := []entry{}
-	for _, s := range sessions {
-		doc, ok := s.(*jqjson.Object)
-		if !ok {
-			continue
-		}
-		if v, _ := doc.Get("live"); !jqjson.Truthy(v) {
-			continue
-		}
-		client := jqjson.Str(jqGet(doc, "client_host"))
-		statusVal, _ := doc.Get("status")
-		statusObj, ok := statusVal.(*jqjson.Object)
-		if !ok {
-			// jq 在此处对非对象 .status 会报错（现实中不会出现）；Go 退化为「无汇报」。
-			continue
-		}
-		for _, k := range statusObj.Keys() {
-			val, _ := statusObj.Get(k)
-			vo, _ := val.(*jqjson.Object)
-			state := "down"
-			reason := ""
-			if vo != nil {
-				if v, ok := vo.Get("state"); ok && v != nil {
-					state = jqjson.ToString(v)
-				}
-				if v, ok := vo.Get("reason"); ok && v != nil {
-					reason = jqjson.ToString(v)
-				}
-			}
-			entries = append(entries, entry{id: k, state: state, reason: reason, client: client})
-		}
-	}
-	// group_by(.id)：先稳定按 id 排序（jq 的 group_by 先排序再分组）
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
-
-	out := []liveStatus{}
-	for i := 0; i < len(entries); {
-		j := i
-		for j < len(entries) && entries[j].id == entries[i].id {
-			j++
-		}
-		pick := entries[i]
-		for k := i; k < j; k++ {
-			if entries[k].state == "up" {
-				pick = entries[k]
-				break
-			}
-		}
-		out = append(out, liveStatus{ID: pick.id, State: pick.state, Reason: pick.reason, Client: pick.client})
-		i = j
-	}
-	return out
-}
-
-// liveStatus 是一个 id 的实时状态（← bridge_live_status_json 的 value）。
-type liveStatus struct {
-	ID     string
-	State  string
-	Reason string
-	Client string
-}
-
-// mergeLive 复刻 bridge_merge_live：client 映射注入实时状态；其余记录原样。
-//
-//	pending = 有 client 在线但尚未汇报该映射；waiting = 没有 client 连着。
-//	status_reason / client 恒为字符串（"up/down/waiting/pending" 分支都赋值）。
-func mergeLive(raw []any, sessions []any) []any {
-	lives := bridgeLiveStatus(sessions)
-	byID := map[string]liveStatus{}
-	for _, l := range lives {
-		byID[l.ID] = l
-	}
-	anyLive := false
-	for _, s := range sessions {
-		if doc, ok := s.(*jqjson.Object); ok {
-			if v, _ := doc.Get("live"); jqjson.Truthy(v) {
-				anyLive = true
-				break
-			}
-		}
-	}
-	out := make([]any, 0, len(raw))
-	for _, e := range raw {
-		doc, ok := e.(*jqjson.Object)
-		if !ok {
-			// 调用方已用 allObjects 拦掉；保底不变形。
-			out = append(out, e)
-			continue
-		}
-		mode := jqjson.Str(jqGet(doc, "mode"))
-		if mode != "client" {
-			out = append(out, doc)
-			continue
-		}
-		l, has := byID[jqjson.ToString(jqGet(doc, "id"))]
-		switch {
-		case has:
-			doc.Set("status", l.State)
-			doc.Set("status_reason", l.Reason)
-			doc.Set("client", l.Client)
-		case anyLive:
-			doc.Set("status", "pending")
-			doc.Set("status_reason", "")
-			doc.Set("client", "")
-		default:
-			doc.Set("status", "waiting")
-			doc.Set("status_reason", "")
-			doc.Set("client", "")
-		}
-		out = append(out, doc)
-	}
-	return out
-}
-
-// bridgeClientForwards 复刻 bridge_client_forwards_json（A 侧生效中的映射）。
-//
-// 只有 running（supervisor 活）且 state=connected 的 client 文件参与；
-// 行字段与键序与 bash 完全一致（id, local_port, remote_host, remote_port, machine,
-// ssh_target, pid, status, status_reason, mode），最后按 local_port 稳定升序。
-func bridgeClientForwards() []any {
-	clients := bridgeClients()
-	rows := []any{}
-	for _, c := range clients {
-		doc, ok := c.(*jqjson.Object)
-		if !ok {
-			continue
-		}
-		if v, _ := doc.Get("running"); !jqjson.Truthy(v) {
-			continue
-		}
-		if jqjson.Str(jqGet(doc, "state")) != "connected" {
-			continue
-		}
-		fwVal, _ := doc.Get("forwards")
-		fwObj, ok := fwVal.(*jqjson.Object)
-		if !ok {
-			continue
-		}
-		for _, id := range fwObj.Keys() {
-			val, _ := fwObj.Get(id)
-			vo, _ := val.(*jqjson.Object)
-			if vo == nil {
-				continue
-			}
-			spec := jqjson.Str(jqGet(vo, "spec"))
-			parts := strings.Split(spec, " ")
-			if len(parts) < 2 {
-				continue // `split(" ")` 后取 $p[1] 会得到 null，tonumber 报错（bash 整体失败）
-			}
-			lp, ok1 := atoiOK(parts[0])
-			rp, ok2 := atoiOK(parts[1])
-			if !ok1 || !ok2 {
-				continue
-			}
-			row := jqjson.NewObject()
-			row.Set("id", id)
-			row.Set("local_port", jsonNumber(strconv.Itoa(lp)))
-			row.Set("remote_host", "localhost")
-			row.Set("remote_port", jsonNumber(strconv.Itoa(rp)))
-			label, hasLabel := doc.Get("label")
-			if !hasLabel || label == nil {
-				row.Set("machine", jqGet(doc, "machine"))
-			} else {
-				row.Set("machine", label)
-			}
-			target, hasTarget := doc.Get("target")
-			if !hasTarget || target == nil {
-				row.Set("ssh_target", "")
-			} else {
-				row.Set("ssh_target", target)
-			}
-			row.Set("pid", jqGet(doc, "pid"))
-			row.Set("status", jqGet(vo, "state"))
-			row.Set("status_reason", jqGet(vo, "reason"))
-			row.Set("mode", "bridge")
-			rows = append(rows, row)
-		}
-	}
-	sortByKeyStable(rows, "local_port")
-	return rows
-}
-
-// bridgeClients 复刻 bridge_clients_json：client-*.json + running 标记（顺序 = glob 顺序）。
-func bridgeClients() []any {
-	dir := bridgeDir()
-	matches, _ := filepath.Glob(filepath.Join(dir, "client-*.json"))
-	docs := []any{}
-	for _, path := range matches {
-		st, err := os.Stat(path)
-		if err != nil || st.IsDir() {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		parsed, err := jqjson.Parse(data)
-		if err != nil {
-			continue
-		}
-		doc, ok := parsed.(*jqjson.Object)
-		if !ok {
-			continue
-		}
-		mid := jqjson.Str(jqGet(doc, "machine"))
-		doc.Set("running", bridgeLockHolder(mid) != "")
-		docs = append(docs, doc)
-	}
-	return docs
-}
-
-// bridgeLockHolder 复刻 _bridge_lock_holder：client-<safe(mid)>.lock/pid 里活着的 pid。
-func bridgeLockHolder(machine string) string {
-	lock := filepath.Join(bridgeDir(), "client-"+safeID(machine)+".lock")
-	data, err := os.ReadFile(filepath.Join(lock, "pid"))
-	if err != nil {
-		return ""
-	}
-	pid := strings.TrimSpace(string(data))
-	// bash：`pid="$(<file)"` 保留尾部换行，但 `=~ ^[0-9]+$` 对含换行的串不匹配 -> 视为无锁。
-	if !isDigits(pid) {
-		return ""
-	}
-	if !pidAlive(pid) {
-		return ""
-	}
-	return pid
-}
+// RawForwards 的两个 warn 文案与 bridge 包同源，本包不再重复定义。
 
 // --- 小工具 ---------------------------------------------------------------
 

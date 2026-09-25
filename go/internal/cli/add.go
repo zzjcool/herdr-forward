@@ -23,8 +23,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzjcool/herdr-forward/internal/bridge"
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
-	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/machine"
 	"github.com/zzjcool/herdr-forward/internal/state"
 	"github.com/zzjcool/herdr-forward/internal/tunnel"
@@ -184,15 +184,7 @@ func addClient(localPort, remotePort int) int {
 // 级别的目录可读性前置），Go 侧只看会话文件的 pid 存活 + 心跳窗口，两者在正常环境
 // （目录 700、会话文件可读）下完全一致。
 func anyClientLive() bool {
-	sessions := bridgeSessions()
-	for _, s := range sessions {
-		if doc, ok := s.(*jqjson.Object); ok {
-			if v, _ := doc.Get("live"); jqjson.Truthy(v) {
-				return true
-			}
-		}
-	}
-	return false
+	return bridge.AnyLive(bridge.Sessions())
 }
 
 // resolveTarget 复刻 _hf_resolve_target：ssh_target 直连优先，否则走 machines.toml。

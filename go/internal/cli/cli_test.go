@@ -154,9 +154,9 @@ func TestDispatchExitCodes(t *testing.T) {
 }
 
 func TestUnmigratedCoverage(t *testing.T) {
-	// 契约 C1 的 15 个子命令：Phase 2 之后 10 个已迁移/内建（add/list/remove/doctor/
-	// publish/unpublish/ports/help/version + internal 探针），5 个未迁移
-	// （watch/bootstrap 属 Phase 4；machines/bridge/open-url 属 Phase 3）。
+	// 契约 C1 的 15 个子命令：Phase 3 之后 13 个已迁移/内建（add/list/remove/doctor/
+	// publish/unpublish/machines/bridge/ports/open-url/help/version + internal 探针），
+	// 仅 2 个未迁移（watch/bootstrap 属 Phase 4）。
 	// 这条断言防「漏登记」导致某子命令静默落到 default 分支。
 	want := map[string]bool{
 		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
@@ -166,6 +166,7 @@ func TestUnmigratedCoverage(t *testing.T) {
 	migrated := map[string]bool{
 		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
 		"unpublish": true, "ports": true, "help": true, "version": true,
+		"machines": true, "bridge": true, "open-url": true,
 	}
 	for sub := range want {
 		if unmigrated[sub] {
@@ -178,8 +179,8 @@ func TestUnmigratedCoverage(t *testing.T) {
 	if got := len(want); got != 14 {
 		t.Fatalf("契约清单长度 = %d, want 14（+internal 探针 = 15）", got)
 	}
-	if got := len(unmigrated); got != 5 {
-		t.Fatalf("未迁移子命令数 = %d, want 5（Phase 2 后）", got)
+	if got := len(unmigrated); got != 2 {
+		t.Fatalf("未迁移子命令数 = %d, want 2（Phase 4 前仅 watch/bootstrap）", got)
 	}
 }
 

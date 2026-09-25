@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzjcool/herdr-forward/internal/bridge"
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
 	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"github.com/zzjcool/herdr-forward/internal/ports"
@@ -87,11 +88,8 @@ func portsJSONModel(listeners []ports.Listener) any {
 // forward_list_json 而不是 _hf_view_json。
 func forwardedMap() map[string]string {
 	out := map[string]string{}
-	for _, e := range readRawForwards() {
-		o, ok := e.(*jqjson.Object)
-		if !ok {
-			continue
-		}
+	raw, _ := bridge.RawForwards()
+	for _, o := range raw {
 		if jqjson.Str(jqGet(o, "mode")) != "client" {
 			continue
 		}

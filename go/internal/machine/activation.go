@@ -62,6 +62,18 @@ func (r activationRecord) String(key string) string {
 	return s
 }
 
+// Map 返回记录的原始键值（**副本**，供 doctor 的就地改写路径使用）。
+//
+// 为什么给副本而不是内部 map：doctor 的更新路径语义是「读 → 改两个键 → 写回」，
+// 直接暴露内部 map 会让调用方在无锁状态下改动共享结构。
+func (r activationRecord) Map() map[string]any {
+	out := make(map[string]any, len(r.vals))
+	for k, v := range r.vals {
+		out[k] = v
+	}
+	return out
+}
+
 // Bool 取布尔键（非布尔 → false）。
 func (r activationRecord) Bool(key string) bool {
 	b, _ := r.vals[key].(bool)

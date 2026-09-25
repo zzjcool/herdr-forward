@@ -135,3 +135,6 @@ const muxTimeout = 10 * time.Second
 
 // ctlExitTimeout 是 `-O exit` 的硬上限（bash: `timeout 5`）。
 const ctlExitTimeout = 5 * time.Second
+
+// ShQuote 复刻 _bridge_sq 的导出形态（供 cli 层拼远端命令串时复用同一实现）。
+func ShQuote(s string) string { return shQuote(s) }
