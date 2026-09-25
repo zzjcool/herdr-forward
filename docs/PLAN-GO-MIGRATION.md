@@ -71,6 +71,8 @@ go/
 
 **依赖纪律**：stdlib 优先；仅允许三个 vendored 依赖 —— `BurntSushi/toml`（machines.toml + herdr config.toml 编辑）、`golang.org/x/term`（panel raw mode）。E2E 容器运行期不出网，`go mod vendor` 必须完整。禁止 gopsutil（macOS 走系统 lsof 即可，减一个重依赖）。
 
+> **Phase 1 并行协调修正**：W2/W3 依赖 `state.Forward` 与 `hfcommon.Health` 类型才能并行编译，故共享类型桩（`go/internal/state/types.go`、`go/internal/hfcommon/health.go`，均按 §5 冻结签名）已由主 agent 预先提交（a1e1150）。W1 拥有这两个文件的后续全权（实现可重构，冻结签名不得变）；W2/W3 只 import，不得修改。
+
 **依赖映射**（用户已验证，落地为）：jq→encoding/json；/dev/tcp/nc→net.Dial（C7 probe 用 `net.DialTimeout`+`SetReadDeadline`）；tcp_serve_once→测试内 net.Listen；setsid 链→`exec.Cmd{SysProcAttr:{Setsid:true}}`（hf_detach_exec 的 perl/python3/nohup 三级兜底全部删除）；timeout→context；/proc/net/tcp 解析→纯 Go（hex 端口/地址、states 0A=LISTEN）；macOS 端口→`exec lsof -nP -iTCP -sTCP:LISTEN`。
 
 ## 5. 冻结 Go 接口（worker 不得自行发明）
