@@ -1,0 +1,56 @@
+# .github/workflows/ci.yml — 每次 push / PR 跑完整 CI 基线（PLAN-GO-MIGRATION §7）
+#
+# 裁决：ubuntu-latest 上跑 scripts/ci.sh（GitHub runner 自带 docker，E2E 走主路径）。
+# go 段由 scripts/ci.sh 内部负责（Phase 0 新增），本 workflow 不重复 go 命令，
+# 保证「本地跑 ci.sh」与「CI 跑 ci.sh」是同一套判据（单一权威）。
+#
+# 工具预装：scripts/ci.sh 对 shellcheck/shfmt/jq 缺失是硬 FAIL（契约 B.4，绝不静默绿），
+# 因此这里显式按 Dockerfile 的同一固定版本装齐 —— runner 镜像不保证 shfmt 存在，
+# 且滚动版本会让同一份源码在不同环境得出不同结论（基线拦截最忌讳）。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # 与 scripts/e2e/Dockerfile 的 ARG 保持一致（同一版本 = 同一判据）
+  SHFMT_VERSION: 3.10.0
+  SHELLCHECK_VERSION: 0.10.0
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 与 go/go.mod 的 go 指令一致（PLAN §4 的 1.22 兼容线）
+          go-version: "1.22.x"
+          cache-dependency-path: go/go.sum
+
+      - name: 安装 shellcheck / shfmt（固定版本）+ jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq xz-utils curl
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
+          curl -fsSL -o /tmp/sc.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shfmt --version
+          shellcheck --version | head -3
+          jq --version
+
+      - name: CI 基线（scripts/ci.sh）
+        run: bash scripts/ci.sh

@@ -3,6 +3,7 @@
 #
 # 6 段：1) shellcheck 严格  2) shfmt  3) unit  4) integration
 #       5) e2e（docker 优先，不可用降级 bwrap）  6) e2e 完整性哨兵 + 红线 grep
+# 另加 0 段：go（Go 二进制脚手架 vet + build + test，Phase 0 新增，见 PLAN-GO-MIGRATION §6）
 #
 # 工具缺失策略（B.4 + SCOUT-FACTS §1.4：本机无 shellcheck/shfmt/nc）：
 #   * shellcheck/shfmt/jq 任一缺失 → CI FAIL 并打印安装提示（绝不静默绿）
@@ -68,6 +69,39 @@ precheck_tools() {
   if command -v shfmt >/dev/null 2>&1; then HAS_SHFMT=1; fi
 }
 precheck_tools
+
+# ---------------------------------------------------------------------------
+# 0/6 go（Go 二进制脚手架：vet + build + test）—— Phase 0 新增（PLAN-GO-MIGRATION §6）
+#
+# 语义对齐现有工具预检：go 缺失 → FAIL（LAX=1 时显式 WARN 降级，绝不静默绿）。
+# 缺 go/go.mod → SKIP：与 shellcheck 段「lib/、bin/ 尚未交付就显式 SKIP」同一策略，
+# 使本仓库 Phase 0 之前的历史用例/假仓库不受影响。
+# 全程 -mod=vendor：依赖真身提交在 go/vendor/，既保证 CI 不出网，也用「离线构建成功」
+# 顺带证明 vendor 与 go.mod 一致（PLAN §9 R3 的 CI 哨兵语义）。
+# ---------------------------------------------------------------------------
+echo "== 0/6 go（vet + build + test，-mod=vendor） =="
+HAS_GO=0
+if [[ ! -f go/go.mod ]]; then
+  echo "SKIP 0/6 go（go/go.mod 尚未交付）"
+elif ! command -v go >/dev/null 2>&1; then
+  if [[ "${LAX}" == "1" ]]; then
+    warn "缺少 go —— HERDR_FORWARD_CI_LAX=1 显式降级，跳过 go 段"
+  else
+    fail "go 未安装（go/go.mod 已存在，Go 段是硬依赖）。
+  安装提示：Arch 用 'pacman -S --noconfirm go'，其余平台见 https://go.dev/dl/
+  或设 HERDR_FORWARD_CI_LAX=1 显式降级（会打印 CI WARN，不静默通过）"
+  fi
+else
+  HAS_GO=1
+fi
+if [[ "${HAS_GO}" -eq 1 ]]; then
+  cd go
+  go vet -mod=vendor ./... || fail "go vet（go/ 目录）"
+  go build -mod=vendor ./... || fail "go build（go/ 目录）"
+  go test -mod=vendor ./... || fail "go test（go/ 目录）"
+  cd ..
+  echo "   go 段通过（vet + build + test，离线 vendor 构建）"
+fi
 
 # ---------------------------------------------------------------------------
 # 1/6 shellcheck（严格：-S style -o all）

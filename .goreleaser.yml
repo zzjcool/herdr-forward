@@ -1,0 +1,51 @@
+# .goreleaser.yml — herdr-forward release 产物（PLAN-GO-MIGRATION §7）
+#
+# 裁决（§7）：不手写 matrix —— checksums.txt、4 平台命名、GH Action 集成都用 goreleaser。
+# 产物：linux/darwin × amd64/arm64，archive 名 herdr-forward_{version}_{os}_{arch}.tar.gz，
+# 内含单二进制 forward + LICENSE + README.md；ldflags -s -w -X main.version={{.Version}}。
+#
+# 注意：Go module 根在 go/，故 builds[].dir = go；binary 名在 archive 内固定为 forward
+# （与 scripts/postinstall.sh 解包后 mv 到 bin/forward-go 的约定一致）。
+version: 2
+
+project_name: herdr-forward
+
+builds:
+  - id: forward
+    dir: go
+    main: ./cmd/forward
+    binary: forward
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      herdr-forward_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  # 不用默认的 {{ incpatch .Version }}-snapshot：它要求 .Version 是合法 semver，
+  # 而本仓库当前 HEAD 的最近 tag 是规划用的非 semver tag（go-mig/plan），会让
+  # `goreleaser build --snapshot` 直接失败。{{ .Version }}-snapshot 两者都能跑
+  # （semver tag 去 v 前缀；非 semver tag 原样保留），本地快照验收不受 tag 形态影响。
+  version_template: "{{ .Version }}-snapshot"
+
+changelog:
+  disable: true

@@ -2,3 +2,7 @@
 *.lock
 .pi-subagents/
 test-results/
+
+# Go 构建产物（PLAN §6 Phase 0）：二进制与 goreleaser 输出不入库
+bin/forward-go
+dist/
