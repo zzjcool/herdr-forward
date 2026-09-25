@@ -415,3 +415,106 @@ bash 是 jq 报错 rc **2**、stdout 空；Go 打印一条自己的可诊断 err
 | 差分 | `bash tests/difftest/run.sh` | `1..123` / `PASS: 123 FAIL: 0` / `RESULT: PASS` |
 | 基线 | `bash scripts/ci.sh` | `CI OK: 6/6 全部通过`（含 docker E2E `130 PASS / 0 FAIL`、两机 E2E `62 PASS / 0 FAIL`） |
 | E2E 切后 | `run-inside.sh` B2 段 | 回滚等价性 3 条逐字节 + ports 端口/地址列一致 + oneline 65ms |
+
+## 14. Phase 2 实测与偏离记录（状态写入 + 隧道生命周期）
+
+铁律与 §13 相同。以下逐条登记 Phase 2 实施中的**实测结论**与**有意偏离**，并区分
+「用户可见契约不变」与「已知形态差异」。
+
+### 14.1 dispatch 的 add 细分（相对 §6「dispatch 行扩为 list|ports|add|remove|doctor|publish|unpublish」的偏离）
+
+§6 的字面写法是 `add` 整体切 Go。Phase 2 实作为**按参数细分**（`bin/forward` 的
+`_hf_add_dispatch_go`）：
+
+```bash
+add)
+  if [[ -x "${FORWARD_ROOT}/bin/forward-go" ]] && (($# > 1)); then
+    if [[ "$(_hf_add_dispatch_go "${@:2}")" == "yes" ]]; then
+      exec "${FORWARD_ROOT}/bin/forward-go" "$@"
+    fi
+  fi
+  ;;
+```
+
+`_hf_add_dispatch_go` 的规则（保守优先）：
+
+* 参数里出现**精确** `--client` → 归 bash；
+* 否则出现 `--ssh-target` / `--ssh-target=*` / `--machine` / `--machine=*` → 切 Go；
+* 其余（无目标、只有位置参数）→ 归 bash。
+
+理由：**client 映射的写侧（lib/bridge.sh）属 Phase 3**，而 `add --client` 与「没给目标但
+有 client 在线 → 隐式 client 映射」这两种形态都要写 client 记录 + 影响桥接。Phase 3 之前
+把它们留在 bash 是唯一能保证「双实现不打架」的切法；`panel.sh` 与 `machines activate` 走的
+正是这条路径（`lib/panel.sh:797` 的 `"${bin}" add "${item}" --client`）。
+
+Go 侧的 `cmd_add` **完整实现**了 client 分支（含 `bridge_any_live` 的只读判定与
+`_hf_add_client` 的两行 stderr 文案），因此 Phase 3 把 bridge 写侧迁完后不需要再补语义；
+difftest 组 9 的 `add 5173 --client` / `add 80 --client` 用例走的是 **bash 侧 staged root**，
+用 `internal/cli` 的单测覆盖 Go 侧这一分支（`TestAddClientRecordsWaitingWithoutLiveClient`）。
+
+### 14.2 Doctor 的 `status` 缺失：`""` vs bash 的 `"null"`（已知形态差异）
+
+bash 的 `tunnel_doctor` 用 `jq -r ".[i].status"` 取状态：字段**缺失**时 jq 输出字面
+`null`，于是报告行是 `f-x: degraded (no application-layer reply; status=null)`；Go 的
+`state.Load` 把缺失字段填零值 `""`，报告行成为 `… status=`。只有手改/损坏记录才可能触及；
+`--fix` 的比较 `status != "up"` / `!= "down"` 在两种形态下结果相同（都不等于 up/down）。
+
+### 14.3 `ssh -O check` / `-O exit` 的 5s 硬上限（新增）
+
+bash 只给 `-O exit` 包了 `timeout 5`，`-O check` 没有上限。Go 侧两者都包 `context` 5s
+（`ctlSSHTimeout`）—— ControlMaster socket 卡住时 bash 的 Start 会无限期轮询（50×0.1s 的
+循环体内每次都挂），Go 保证有界。这是**加固**而不是行为变化：正常环境两者都在毫秒级返回。
+
+### 14.4 launcher 的回收：goroutine Wait（相对 bash `disown`）
+
+bash 用 `setsid ssh … &` + `disown`，让 launcher 被 init 收养；Go 用
+`SysProcAttr{Setsid:true}` + `go cmd.Wait()`。ControlPersist=yes 下 launcher 很快就退出，
+`Wait` 保证它不会变成僵尸（E2E 的 `t_no_zombie_ssh` 是这条的证据）。
+
+### 14.5 Doctor 不依赖 jq（相对 bash 的 `require_cmd jq`）
+
+bash 的 `tunnel_doctor` 第一行 `require_cmd jq`（缺失 → die 127）。Go 的 `tunnel.Doctor`
+直接读 `state.Load()`，不需要 jq。用户可见行为零变化（jq 是 bash 侧的硬依赖，插件环境必有），
+差异只在「Go 侧少一个外部依赖」。
+
+### 14.6 tunnel_failure 路径的 stderr 分层（已知文案差异）
+
+`add` 隧道失败时，bash 的顺序是：`tunnel_start` 的 stderr 被 `2>errfile` 捕获 → die 5 打印
+`隧道启动失败（<id>）：<err>。…`。Go 侧同形（error 文本前缀与 bash 的
+`tunnel start failed: <id> -> 127.0.0.1:<lp> via <target> (ssh: <tail>)` 逐字一致），
+但 **stderr 前缀里的时间戳来自 `hfcommon.Log` 的 error 镜像**（`[ts] error: …`），
+而 bash 的同一条也是经 `log error`，因此两边的**可见行数**一致。difftest 组 9 的 add 用例
+全部是**参数错误**（在写记录之前就 die，零副作用），隧道失败路径由 integration
+`test_cli_full_cycle.sh` + `phase2-go-path.sh` 覆盖。
+
+### 14.7 notify 的传输实现与转义（有意偏离）
+
+* bash 依次试 `python3` / `socat` / `nc`（各起一个 session + watchdog 进程）；Go 用
+  `net.DialTimeout("unix", …)` + `SetWriteDeadline(1s)`，不派生任何进程。语义等价
+  （1s 内投不出去就降级），且消除了对三个外部命令的依赖。
+* payload 转义：bash 在**有 jq** 时用 `jq -cn`（完整 jq 转义），无 jq 时用手写回退
+  （只转 `\` `"` 换行）。Go 恒用完整 jq 规则 —— 与「bash 有 jq」逐字节一致，是更严格的一侧。
+* `socketUsable` 用 `os.Stat` + `syscall.Access(W_OK)` 表达 `[[ -S && -w ]]`；`-/w` 的
+  root 语义（root 对任何文件 W_OK 都通过）在两者下一致。
+
+### 14.8 `notify` 尚无调用方（Phase 2 只交付库）
+
+Phase 2 的任务范围是「mirror lib/notify.sh」；`bin/forward` 里没有任何 `notify_toast` 调用
+（既有的调用点都在 panel/桥接，属 Phase 3/4）。因此本 phase 交付的是**库 + 单测**，
+difftest 无 notify 组（bash 侧也没有可对位的 CLI 入口）。
+
+### 14.9 组 9/10 的状态比对口径
+
+* `created_unix` 用两侧各自的真实时钟写入 → 比对前归零（`masked_state`），其余 11 字段逐字节。
+* doctor 的 down/degraded 用例用组 3 起的**真实监听 socket**（reply ⇒ up / silent ⇒ degraded）；
+  活记录的 `master` pid 用当前测试进程（`kill -0` 判活）。
+* 两侧各指独立的 `HERDR_PLUGIN_CONFIG_DIR`（`add --machine` 要读 machines.toml）。
+
+### 14.10 验证结果（Phase 2）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| Go 门 | `make check` | gofmt/vet/test/vendor-check 全绿 |
+| 差分 | `bash tests/difftest/run.sh` | `1..270` / `PASS: 270 FAIL: 0` / `RESULT: PASS`（Phase 1 为 123） |
+| 基线 | `bash scripts/ci.sh` | `CI OK: 6/6 全部通过`（含 docker E2E `130 PASS / 0 FAIL`、两机 E2E `62 PASS / 0 FAIL`） |
+| Go 路径证据 | `bash tests/difftest/phase2-go-path.sh` | `40 passed, 0 failed`（真 sshd + 真 ssh -L + 记录型 dispatch shim） |
