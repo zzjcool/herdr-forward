@@ -16,6 +16,7 @@
 #   remove <id>              forward_remove_record <id>
 #   set-status <id> <status> forward_set_status <id> <status>
 #   probe <host> <port> <s>  probe_payload <host> <port> <s>
+#   tunnel-args <id> <lp> <remote> <target>   tunnel_ssh_args（一行一个 argv 元素）
 #   normalize                stdin: forward 数组 -> stdout: 补全 schema 的数组（jq）
 #                            （用于「bash 原样透传 vs Go 类型化补零」的可比化）
 set -Eeuo pipefail
@@ -27,6 +28,8 @@ DIFFTEST_ROOT="$(cd "${DIFFTEST_HERE}/../.." && pwd)"
 source "${DIFFTEST_ROOT}/lib/common.sh"
 # shellcheck source=/dev/null
 source "${DIFFTEST_ROOT}/lib/state.sh"
+# shellcheck source=/dev/null
+source "${DIFFTEST_ROOT}/lib/tunnel.sh"
 
 # 确定化 now_unix（仅测试用；生产路径不受影响）
 if [[ -n ${DIFFTEST_NOW_UNIX:-} ]]; then
@@ -82,6 +85,9 @@ set-status)
   ;;
 probe)
   probe_payload "${1}" "${2}" "${3}"
+  ;;
+tunnel-args)
+  tunnel_ssh_args "${1}" "${2}" "${3}" "${4}"
   ;;
 normalize)
   jq -S -c "${DIFFTEST_NORMALIZE}"

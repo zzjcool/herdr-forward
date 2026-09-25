@@ -40,14 +40,10 @@ const (
 
 // unmigrated 是「在 Bash 侧实现、Go 侧尚未迁移」的子命令集合（C1 的 15 项之一部分）。
 //
-// 它们出现在 dispatch 表里只为了让契约清单完整、并让哨兵行为可测：
-// 生产路径由 bin/forward 的 `list|ports` 白名单保证不会走到这里。
+// Phase 2 之后只剩 5 个：watch/bootstrap（Phase 4）、machines/bridge/open-url（Phase 3）。
+// 它们出现在 dispatch 表里只为了让契约清单完整、并让哨兵行为可测：生产路径由
+// bin/forward 的白名单保证不会走到这里。
 var unmigrated = map[string]bool{
-	"add":       true,
-	"remove":    true,
-	"doctor":    true,
-	"publish":   true,
-	"unpublish": true,
 	"watch":     true,
 	"bootstrap": true,
 	"machines":  true,
@@ -72,8 +68,18 @@ func Main(args []string) int {
 	}
 
 	switch sub {
+	case "add":
+		return cmdAdd(rest)
 	case "list":
 		return cmdList(rest)
+	case "remove":
+		return cmdRemove(rest)
+	case "doctor":
+		return cmdDoctor(rest)
+	case "publish":
+		return cmdPublish(rest)
+	case "unpublish":
+		return cmdUnpublish(rest)
 	case "ports":
 		return cmdPorts(rest)
 	case "help", "--help", "-h":

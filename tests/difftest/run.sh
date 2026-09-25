@@ -751,6 +751,178 @@ _eq "缺子命令 stderr（去时间戳）" "${b_no_err}" "${g_no_err}"
 unset BRIDGE_LIVE_WINDOW_S
 
 # ===========================================================================
+# 组 9：CLI 差分（Phase 2：add / remove / doctor / publish / unpublish）
+#
+# 比对对象与组 6/7/8 相同（bash staged root vs 真 Go CLI），但额外：
+#   * 两侧各自一份 HERDR_PLUGIN_CONFIG_DIR（machines.toml 解析不碰用户真实配置）；
+#   * 落盘状态也纳入比较（created_unix 用 0 掩掉，因为两侧用不同的真实时钟）。
+#
+# ⚠ 真实隧道行为（起 ssh、-O exit、reap socket）不在本组：那是 E2E 的裁判。
+#   这里只钉「参数校验 / 退出码 / 用户可见文案 / 状态字段变换」。
+# ===========================================================================
+printf '=== 组 9：CLI 差分（add / remove / doctor / publish / unpublish） ===\n'
+
+cli_bash_cfg() {
+  local st="$1"
+  shift
+  HERDR_PLUGIN_STATE_DIR="${st}" HERDR_PLUGIN_CONFIG_DIR="${st}/cfg" \
+    env PATH="${NO_SS_FARM}" bash "${BASH_ROOT}/bin/forward" "$@"
+}
+cli_go_cfg() {
+  local st="$1"
+  shift
+  HERDR_PLUGIN_STATE_DIR="${st}" HERDR_PLUGIN_CONFIG_DIR="${st}/cfg" "${CLI_GO}" "$@"
+}
+
+# masked_state <file> -> stdout: 把 created_unix 归零后的 jq -S -c 形态
+masked_state() {
+  jq -S -c '{version: (.version // 1), forwards: [(.forwards // [])[] | .created_unix = 0]}' "$1" 2>/dev/null || printf '<unreadable>'
+}
+
+# cli_pair_state <name> <fixture|-> <args...>
+CLI9_STRICT_STDERR=0
+cli_pair_state() {
+  local name="$1" fixture="$2"
+  shift 2
+  local bst="${TMP}/cli9-bash-state" gst="${TMP}/cli9-go-state"
+  rm -rf "${bst}" "${gst}"
+  mkdir -p "${bst}/cfg" "${gst}/cfg" "${bst}/bridge" "${gst}/bridge"
+  if [[ "${fixture}" != "-" ]]; then
+    cp "${fixture}" "${bst}/forwards.json"
+    cp "${fixture}" "${gst}/forwards.json"
+  fi
+  capture cli_bash_cfg "${bst}" "$@"
+  local b_out="${OUT}" b_rc="${RC}" b_err="" g_out="" g_rc="" g_err=""
+  b_err="$(printf '%s' "${ERR}" | strip_ts)"
+  capture cli_go_cfg "${gst}" "$@"
+  g_out="${OUT}"
+  g_rc="${RC}"
+  g_err="$(printf '%s' "${ERR}" | strip_ts)"
+  # 两侧落盘状态（created_unix 掩掉）—— 先落变量再断言，避开 SC2312。
+  local b_state="" g_state=""
+  b_state="$(masked_state "${bst}/forwards.json")"
+  g_state="$(masked_state "${gst}/forwards.json")"
+  _eq "${name} 退出码（bash=${b_rc} go=${g_rc}）" "${b_rc}" "${g_rc}"
+  _eq "${name} stdout 逐字节" "${b_out}" "${g_out}"
+  if [[ "${CLI9_STRICT_STDERR}" -eq 1 ]]; then
+    _eq "${name} stderr（去时间戳）" "${b_err}" "${g_err}"
+  fi
+  _eq "${name} 落盘状态（created_unix 掩掉）" \
+    "${b_state}" "${g_state}"
+}
+
+CLI9_STRICT_STDERR=1
+# add：参数校验与退出码（全部零副作用）
+cli_pair_state "add 缺 spec" - add
+cli_pair_state "add 非法 spec" - add 5173:x
+cli_pair_state "add 非法 spec（多冒号）" - add 1:2:3
+cli_pair_state "add 端口 0" - add 0
+cli_pair_state "add 端口越界" - add 70000
+cli_pair_state "add 未知参数" - add 5173 --wat
+cli_pair_state "add 多余位置参数" - add 5173 5173
+cli_pair_state "add 缺目标机器" - add 3000
+cli_pair_state "add machine 无法解析" - add 3000 --machine nope
+cli_pair_state "add --machine 缺值" - add 3000 --machine
+cli_pair_state "add --ssh-target 缺值" - add 3000 --ssh-target
+cli_pair_state "add client 端口 <1024" - add 80 --client
+cli_pair_state "add client 互斥" - add 6000 --client --ssh-target u@h:22
+cli_pair_state "add 隧道路径不可达（--client 路径写记录）" - add 5173 --client
+CLI9_STRICT_STDERR=0
+
+# remove：不存在的记录 / 参数错误 / 一期未实现
+CLI9_STRICT_STDERR=1
+cli_pair_state "remove 缺 id" "${CLI_TWO}" remove
+cli_pair_state "remove 未知参数" "${CLI_TWO}" remove --wat
+cli_pair_state "remove 多余参数" "${CLI_TWO}" remove f-3000 extra
+cli_pair_state "remove 记录不存在" "${CLI_TWO}" remove f-nope
+CLI9_STRICT_STDERR=0
+cli_pair_state "remove --pick（exit 9）" "${CLI_TWO}" remove --pick
+cli_pair_state "remove --all（exit 9）" "${CLI_TWO}" remove --all
+
+# publish / unpublish：恒 exit 9（忽略参数）
+cli_pair_state "publish（exit 9）" - publish 3000
+cli_pair_state "publish 无参（exit 9）" - publish
+cli_pair_state "publish 多余参数（exit 9）" - publish 3000 extra
+cli_pair_state "unpublish（exit 9）" - unpublish
+cli_pair_state "unpublish 带参（exit 9）" - unpublish 3000
+
+# doctor：参数错误
+CLI9_STRICT_STDERR=1
+cli_pair_state "doctor 未知参数" "${CLI_TWO}" doctor --wat
+cli_pair_state "doctor 位置参数" "${CLI_TWO}" doctor xyz
+CLI9_STRICT_STDERR=0
+
+# doctor：死记录（pid 不存在、端口无人监听）—— 报告 / --fix / --prune
+DEAD_FIXTURE="${TMP}/cli9-dead.json"
+cat >"${DEAD_FIXTURE}" <<JSON
+{"version":1,"forwards":[
+ {"control_socket":"","created_unix":1,"id":"f-45811","local_port":45811,"machine":"","mode":"tunnel","pid":999998,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"127.0.0.1","remote_port":45811,"ssh_target":"u@h:22","status":"up"},
+ {"control_socket":"","created_unix":1,"id":"f-45812","local_port":45812,"machine":"","mode":"tunnel","pid":999999,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"127.0.0.1","remote_port":45812,"ssh_target":"u@h:22","status":"down"}
+]}
+JSON
+cli_pair_state "doctor 报告（两条 down）" "${DEAD_FIXTURE}" doctor
+cli_pair_state "doctor --fix（down 保持 down）" "${DEAD_FIXTURE}" doctor --fix
+cli_pair_state "doctor --prune（清掉死记录）" "${DEAD_FIXTURE}" doctor --prune
+cli_pair_state "doctor --fix --prune（prune 优先）" "${DEAD_FIXTURE}" doctor --fix --prune
+
+# doctor：master 活着 + 真实监听 socket（组 3 起来的 reply/silent 服务）
+if [[ -n "${REPLY_PORT}" && -n "${SILENT_PORT}" ]]; then
+  LIVE_FIXTURE="${TMP}/cli9-live.json"
+  printf '{"version":1,"forwards":[{"control_socket":"","created_unix":1,"id":"f-%s","local_port":%s,"machine":"","mode":"tunnel","pid":%s,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"127.0.0.1","remote_port":%s,"ssh_target":"u@h:22","status":"up"},{"control_socket":"","created_unix":1,"id":"f-%s","local_port":%s,"machine":"","mode":"tunnel","pid":%s,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"127.0.0.1","remote_port":%s,"ssh_target":"u@h:22","status":"up"}]}\n' \
+    "${REPLY_PORT}" "${REPLY_PORT}" "$$" "${REPLY_PORT}" \
+    "${SILENT_PORT}" "${SILENT_PORT}" "$$" "${SILENT_PORT}" >"${LIVE_FIXTURE}"
+  cli_pair_state "doctor 报告（up + degraded）" "${LIVE_FIXTURE}" doctor
+  cli_pair_state "doctor --fix（degraded -> down）" "${LIVE_FIXTURE}" doctor --fix
+
+  # master 活着但 status=down（stale）-> --fix 修回 up
+  STALE_FIXTURE="${TMP}/cli9-stale.json"
+  jq -c '.forwards[0].status = "down"' "${LIVE_FIXTURE}" >"${STALE_FIXTURE}"
+  cli_pair_state "doctor --fix（stale=down -> up）" "${STALE_FIXTURE}" doctor --fix
+fi
+
+# doctor：client 记录不参与隧道分级（两种 --fix/--prune 都不能碰）
+CLIENT_FIXTURE="${TMP}/cli9-client.json"
+cat >"${CLIENT_FIXTURE}" <<'JSON'
+{"version":1,"forwards":[{"control_socket":"","created_unix":1,"id":"f-5173","local_port":5173,"machine":"","mode":"client","pid":null,"publish":{"pid":null,"url":null,"started_unix":null},"remote_host":"localhost","remote_port":5173,"ssh_target":"","status":"starting"}]}
+JSON
+cli_pair_state "doctor（仅 client 记录，waiting 行）" "${CLIENT_FIXTURE}" doctor
+cli_pair_state "doctor --prune（client 记录不删）" "${CLIENT_FIXTURE}" doctor --prune
+cli_pair_state "doctor --fix（client 记录不改）" "${CLIENT_FIXTURE}" doctor --fix
+
+# ===========================================================================
+# 组 10：tunnel ssh argv 逐行差分（lib/tunnel.sh vs internal/tunnel）
+#
+# Phase 2 的核心风险（PLAN §6）：ControlMaster option set 必须逐 flag 复刻。
+# 这里用两侧的「纯 argv 拼装」入口（不 spawn ssh）逐行比对。
+# ===========================================================================
+printf '=== 组 10：tunnel ssh argv 差分 ===\n'
+
+TUNNEL_ARG_STATE="${TMP}/cli10-state"
+mkdir -p "${TUNNEL_ARG_STATE}"
+tunnel_args_pair() {
+  local name="$1" state="$2"
+  shift 2
+  mkdir -p "${state}"
+  capture bash_side "${state}" tunnel-args "$@"
+  local b_out="${OUT}" b_rc="${RC}"
+  capture go_side "${state}" tunnel-args "$@"
+  _eq "${name} argv 逐行" "${b_out}" "${OUT}"
+  _eq "${name} rc" "${b_rc}" "${RC}"
+}
+
+tunnel_args_pair "argv 常规（显式端口）" "${TUNNEL_ARG_STATE}" f-3000 3000 127.0.0.1:8080 'user@host.example:2222'
+tunnel_args_pair "argv 缺省端口 22" "${TUNNEL_ARG_STATE}" f-22 22 localhost:8000 'user@host'
+tunnel_args_pair "argv 方括号 IPv6 + 端口" "${TUNNEL_ARG_STATE}" f-9000 9000 127.0.0.1:8080 'user@[::1]:2222'
+tunnel_args_pair "argv 方括号 IPv6 无端口" "${TUNNEL_ARG_STATE}" f-9001 9001 127.0.0.1:8080 '[::1]'
+tunnel_args_pair "argv 尾部冒号" "${TUNNEL_ARG_STATE}" f-9002 9002 127.0.0.1:8080 'user@host:'
+tunnel_args_pair "argv 非数字端口后缀（不剥端口）" "${TUNNEL_ARG_STATE}" f-9003 9003 127.0.0.1:8080 'user@host:abc'
+tunnel_args_pair "argv 远端规格随参数" "${TUNNEL_ARG_STATE}" f-5173 5173 '10.0.0.9:5173' 'bob@10.0.0.9:2200'
+
+# state 目录名含 %（herdr 真实布局 zzjcool%3Aforward）：ControlPath/UserKnownHostsFile 的 %% 转义
+TUNNEL_PCT_STATE="${TMP}/cli10-zzjcool%3Aforward"
+tunnel_args_pair "argv state 目录含 %（percent 转义）" "${TUNNEL_PCT_STATE}" f-9000 9000 127.0.0.1:8080 'user@host'
+
+# ===========================================================================
 # 汇总
 # ===========================================================================
 printf '1..%d\n' "$((PASS + FAIL))"

@@ -16,6 +16,8 @@
 //	difftest set-status <id> <status>     state.SetStatus
 //	difftest probe <host> <port> <secs>   hfcommon.ProbePayload，stdout: up|degraded|down
 //	difftest serve <reply|silent|close>   起 127.0.0.1 测试服务并打印监听端口，前台运行
+//	difftest tunnel-args <id> <lp> <remote_host:rp> <target>   tunnel.SSHArgs 一行一个 argv
+//	                                      （与 lib/tunnel.sh 的 tunnel_ssh_args 逐行比对）
 //
 // 兼容形式：Main 会跳过前导的 "internal"/"difftest" 词元，因此
 // `forward-go internal difftest state-load` 也能工作（W4 接线后零改动复用本包）。
@@ -33,6 +35,7 @@ import (
 
 	"github.com/zzjcool/herdr-forward/internal/hfcommon"
 	"github.com/zzjcool/herdr-forward/internal/state"
+	"github.com/zzjcool/herdr-forward/internal/tunnel"
 )
 
 // 退出码（对齐 ARCHITECTURE §A.3 冻结退出码表里本层会用到的子集）。
@@ -72,6 +75,8 @@ func Main(args []string) int {
 		return cmdSetStatus(args[1:])
 	case "probe":
 		return cmdProbe(args[1:])
+	case "tunnel-args":
+		return cmdTunnelArgs(args[1:])
 	case "serve":
 		return cmdServe(args[1:])
 	default:
@@ -172,6 +177,29 @@ func cmdProbe(args []string) int {
 		return exitInvalidArg
 	}
 	fmt.Println(hfcommon.ProbePayload(args[0], port, timeout).String())
+	return exitOK
+}
+
+// cmdTunnelArgs 输出 tunnel.SSHArgs 的 argv，一行一个元素，供 harness 与 bash 的
+// tunnel_ssh_args（lib/tunnel.sh）逐行比对。这是「ssh argv 逐 flag 复刻」的实测门。
+func cmdTunnelArgs(args []string) int {
+	if len(args) != 4 {
+		fmt.Fprintln(os.Stderr, "difftest tunnel-args: 用法 tunnel-args <id> <lp> <remote_host:rp> <target>")
+		return exitUsage
+	}
+	lp, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "difftest tunnel-args: 非法 lp %q\n", args[1])
+		return exitInvalidArg
+	}
+	argv, err := tunnel.SSHArgs(args[0], lp, args[2], args[3])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "difftest tunnel-args: %v\n", err)
+		return exitInternal
+	}
+	for _, a := range argv {
+		fmt.Println(a)
+	}
 	return exitOK
 }
 

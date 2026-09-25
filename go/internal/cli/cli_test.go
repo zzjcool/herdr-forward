@@ -153,25 +153,32 @@ func TestDispatchExitCodes(t *testing.T) {
 }
 
 func TestUnmigratedCoverage(t *testing.T) {
-	// 契约 C1 的 15 个子命令：4 个已迁移/内建（list/ports/help/version）+ internal 探针
-	// + 10 个未迁移。这条断言防止「漏登记」导致某子命令静默落到 default 分支。
+	// 契约 C1 的 15 个子命令：Phase 2 之后 10 个已迁移/内建（add/list/remove/doctor/
+	// publish/unpublish/ports/help/version + internal 探针），5 个未迁移
+	// （watch/bootstrap 属 Phase 4；machines/bridge/open-url 属 Phase 3）。
+	// 这条断言防「漏登记」导致某子命令静默落到 default 分支。
 	want := map[string]bool{
 		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
 		"unpublish": true, "watch": true, "bootstrap": true, "machines": true,
 		"bridge": true, "ports": true, "open-url": true, "help": true, "version": true,
 	}
+	migrated := map[string]bool{
+		"add": true, "list": true, "remove": true, "doctor": true, "publish": true,
+		"unpublish": true, "ports": true, "help": true, "version": true,
+	}
 	for sub := range want {
 		if unmigrated[sub] {
 			continue
 		}
-		switch sub {
-		case "list", "ports", "help", "version":
-		default:
+		if !migrated[sub] {
 			t.Errorf("子命令 %q 既未迁移也未登记为未迁移", sub)
 		}
 	}
 	if got := len(want); got != 14 {
 		t.Fatalf("契约清单长度 = %d, want 14（+internal 探针 = 15）", got)
+	}
+	if got := len(unmigrated); got != 5 {
+		t.Fatalf("未迁移子命令数 = %d, want 5（Phase 2 后）", got)
 	}
 }
 

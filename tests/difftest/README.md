@@ -50,7 +50,7 @@ bash tests/difftest/run.sh
 > W4 接线后只需在 `cli.Main` 加一行 `case "internal": return difftest.Main(args)`
 > （本包已自带 `internal` / `difftest` 前缀跳过，无需改本包）。
 
-## 覆盖的用例（123 条）
+## 覆盖的用例（270 条）
 
 | 组 | 用例 | 比对方式 |
 |---|---|---|
@@ -62,12 +62,42 @@ bash tests/difftest/run.sh
 | 6 | **CLI `list`**（W4）：table/`--json`/`--oneline` × 双 tunnel / 空状态 / 文件不存在 / client 离线；client 在线（up·down·未上报）；本机 bridge 行；`>6` 截断；`FORWARD_STATE_VERSION=2`；损坏记录；参数错误（rc + 去时间戳 stderr） | **逐字节** stdout + 退出码 |
 | 7 | **CLI `ports`**（W4）：table/`--json`/`--json extra`/多余参数，两侧都屏蔽 `ss`/`lsof` 同读 `/proc` | **逐字节** stdout + 退出码 |
 | 8 | **CLI `help` / 未知子命令 / 缺子命令**（W4） | **逐字节** stdout（usage 文本冻结）+ 退出码 |
+| 9 | **CLI `add` / `remove` / `doctor` / `publish` / `unpublish`**（Phase 2）：add 参数校验矩阵（缺/非法 spec、端口越界、未知 flag、多余位置参数、缺目标、machine 无法解析、`--client` 端口下限与互斥）；remove（缺 id/未知/多余/不存在/`--pick`/`--all`）；publish · unpublish（恒 9，含多余参数）；doctor 参数错误 + 死记录报告/`--fix`/`--prune`/`fix+prune` + 真监听 socket 的 up·degraded·stale 修正 + client 记录三态不动 | stdout + rc（参数错误另比去时间戳 stderr）+ **落盘状态逐字节**（`created_unix` 掩掉） |
+| 10 | **tunnel ssh argv**（Phase 2）：`lib/tunnel.sh tunnel_ssh_args` vs `internal/tunnel.SSHArgs` —— 常规/缺省端口/方括号 IPv6（含无端口）/尾部冒号/非数字端口后缀/远端规格可变/state 目录含 `%`（percent 转义） | argv **逐行** |
 
 组 3 的 probe 用例用的是 Go 侧 `serve reply|silent|close` 起的**真实**监听 socket
 （`net.Listen("tcp","127.0.0.1:0")`，端口由内核分配后打印，无竞态），bash 与 Go
 两侧探测的是**同一个**服务 —— 这才是真差分。
 
-### 组 6/7/8 的两侧接线（为什么这么搭）
+### 组 9/10 的两侧接线（Phase 2 补齐的部分）
+
+* **组 9 的 `HERDR_PLUGIN_CONFIG_DIR`**：`add --machine …` 会读 machines.toml，两侧各指到自己的
+  临时 config 目录，绝不碰用户真实配置。
+* **组 9 的状态比对**：两侧用**不同时刻**的真实时钟写 `created_unix`，故比对前把该字段归零
+  （`masked_state`），其余 11 个字段逐字节比。
+* **组 9 的 doctor 夹具**：down/degraded 用组 3 起的**真实监听 socket**（reply 服务 => up；
+  silent 服务 => degraded）；活记录用当前测试进程的 pid 当 master（`kill -0` 判定为活）。
+* **组 10 的隧道 argv**：bash 侧 `bashside.sh tunnel-args` 直接调 `lib/tunnel.sh` 的
+  `tunnel_ssh_args`（生产函数）；Go 侧 `internal difftest tunnel-args` 调 `tunnel.SSHArgs`。
+  两侧都不 spawn ssh。真实隧道行为（起 master / -O exit / reap socket / 无残留进程）走 E2E 与
+  `tests/difftest/phase2-go-path.sh`。
+
+### 真实隧道行为由谁裁判（Phase 2）
+
+| 断言 | 裁判 |
+|---|---|
+| add → status=up + master pid 活 + ctl socket 存在 | E2E A2 段（docker）+ `phase2-go-path.sh` |
+| 经 `ssh -L` 的数据面回环 | E2E A2 段（nc）+ `phase2-go-path.sh`（无 nc 时 `/dev/tcp`） |
+| doctor `--fix` 修 down、`--prune` 不误删活隧道 | E2E A2 段 + integration `test_cli_full_cycle.sh` + `phase2-go-path.sh` |
+| `--prune` 真 reap 死隧道（删 stale control socket） | integration `test_cli_full_cycle.sh` + `phase2-go-path.sh` |
+| remove 后无监听 / 无 ctl socket / `t_no_zombie_ssh` | E2E A2 段 + `phase2-go-path.sh` |
+
+`tests/difftest/phase2-go-path.sh` 不在 `tests/run.sh` 的判据内（文件名不是 `test_*.sh`），
+是**可复现的证据脚本**：它在隔离 HOME 里起真 sshd + echo 服务，用「记录型 shim」替换
+`bin/forward-go`（记录一行后 exec 真二进制），因此能同时断言「dispatch 到了 Go」与
+「Go 实现的行为」，并断言 `add --client` 与 5 个未迁移子命令**没有**被路由到 Go。
+
+### 组 6/7/8 的两侧接线（为什么这么搭，Phase 1 的原始设计）
 
 * **Go 侧**：现场 `go build ./cmd/forward` 到 `${TMP}/forward-go`（仓库的 `bin/` 绝不落产物）。
   比的是**用户可见 CLI** 的字节，而不是 internal 层的函数输出。
