@@ -50,7 +50,7 @@ bash tests/difftest/run.sh
 > W4 接线后只需在 `cli.Main` 加一行 `case "internal": return difftest.Main(args)`
 > （本包已自带 `internal` / `difftest` 前缀跳过，无需改本包）。
 
-## 覆盖的用例（270 条）
+## 覆盖的用例（426 条）
 
 | 组 | 用例 | 比对方式 |
 |---|---|---|
@@ -64,6 +64,9 @@ bash tests/difftest/run.sh
 | 8 | **CLI `help` / 未知子命令 / 缺子命令**（W4） | **逐字节** stdout（usage 文本冻结）+ 退出码 |
 | 9 | **CLI `add` / `remove` / `doctor` / `publish` / `unpublish`**（Phase 2）：add 参数校验矩阵（缺/非法 spec、端口越界、未知 flag、多余位置参数、缺目标、machine 无法解析、`--client` 端口下限与互斥）；remove（缺 id/未知/多余/不存在/`--pick`/`--all`）；publish · unpublish（恒 9，含多余参数）；doctor 参数错误 + 死记录报告/`--fix`/`--prune`/`fix+prune` + 真监听 socket 的 up·degraded·stale 修正 + client 记录三态不动 | stdout + rc（参数错误另比去时间戳 stderr）+ **落盘状态逐字节**（`created_unix` 掩掉） |
 | 10 | **tunnel ssh argv**（Phase 2）：`lib/tunnel.sh tunnel_ssh_args` vs `internal/tunnel.SSHArgs` —— 常规/缺省端口/方括号 IPv6（含无端口）/尾部冒号/非数字端口后缀/远端规格可变/state 目录含 `%`（percent 转义） | argv **逐行** |
+| 11 | **HF1 行协议**（Phase 3）：`hf-fmt` 编码（HELLO/SYNC 空与多条/含非法条目/OPEN/STATUS 无·带 reason/PING）× `hf-parse` 解析（合法矩阵 + 非 HF1 前缀/未知动作/空行/仅前缀/STATUS 缺字段/注入尝试）× `hf-valid` C6 边界（合法/端口下限/前导零/id 不一致/越界/非数字/路径穿越）× `ssh-dest`（别名/`user@host`/`host:port`→URI/`ssh://`/`[v6]:port`/裸 IPv6）× `remote-cmd`（含空格与单引号）× `bridge-ssh-args`（信任边界 argv） | **逐字节** stdout + 退出码 |
+| 12 | **machines 合并视图 + 激活 schema**（Phase 3）：`view-json`（active/activated/local/inactive + orphan）× `active` / `has`（命中·未命中·orphan）/ `resolve`（id·label·大小写不敏感·orphan label·不存在）× **空状态**（无 activated-machines.json） | **逐字节** stdout + 退出码 |
+| 13 | **端口字面量边界矩阵**（Phase 3）：lp ∈ {1024,1025,9999,10000,65535,99999,0,80,102,1023}、rp ∈ {1,22,80,1024,65535,65536}、前导零 {01024,05173,010234}、六位端口 | **逐字节** stdout + 退出码 |
 
 组 3 的 probe 用例用的是 Go 侧 `serve reply|silent|close` 起的**真实**监听 socket
 （`net.Listen("tcp","127.0.0.1:0")`，端口由内核分配后打印，无竞态），bash 与 Go
@@ -95,7 +98,30 @@ bash tests/difftest/run.sh
 `tests/difftest/phase2-go-path.sh` 不在 `tests/run.sh` 的判据内（文件名不是 `test_*.sh`），
 是**可复现的证据脚本**：它在隔离 HOME 里起真 sshd + echo 服务，用「记录型 shim」替换
 `bin/forward-go`（记录一行后 exec 真二进制），因此能同时断言「dispatch 到了 Go」与
-「Go 实现的行为」，并断言 `add --client` 与 5 个未迁移子命令**没有**被路由到 Go。
+「Go 实现的行为」。Phase 3 起它同时钉住 dispatch 边界的翻转：`add --client` 与
+`machines`/`bridge`/`open-url` **必须**被路由到 Go，而 `bootstrap`/`help` 仍留 bash。
+
+### 组 11/12 的两侧接线（Phase 3）
+
+* **bash 侧**：`tests/difftest/phase3-bashside.sh` —— 与 `bashside.sh` 同一纪律，只
+  `source` 真 `lib/bridge.sh` + `lib/machines.sh` + `lib/ssh-probe.sh` 后转调生产函数，
+  **不复制**任何逻辑。
+* **Go 侧**：`bin/forward-go internal difftest hf-parse|hf-fmt|hf-valid|ssh-dest|remote-cmd|
+  bridge-ssh-args|bridge-active|probe-kv`（`go/internal/difftest/phase3.go`）。
+* **组 12 的 herdr 列表**：两侧都用同一份假 `herdr`（`machine list --json` 回放固定 JSON），
+  经 `HERDR_BIN_PATH` 注入；激活状态文件由 `seed_activation` 铺进各自的状态目录。
+
+### HF1 两侧同切的证据（Phase 3）
+
+| 断言 | 裁判 |
+|---|---|
+| `forward bridge serve` 走 Go | `phase3-go-path.sh` 第 1 段（记录型 shim 的 marker） |
+| `forward bridge run` 走 Go | `phase3-go-path.sh` 第 1 段 |
+| HELLO/SYNC/STATUS 真协议往返（含「期望集合变化 → 推送新 SYNC」） | `phase3-go-path.sh` 第 2 段（真 Go serve 进程经 FIFO 驱动） |
+| C6 边界在**真实 serve 进程**上拒绝越界 id/端口/前导零 | `phase3-go-path.sh` 第 2 段 |
+| OPEN 只在端口已进 SYNC 后转发 | `phase3-go-path.sh` 第 3 段 |
+| 退避状态机（127 → retrying + next_retry_unix） | `phase3-go-path.sh` 第 4 段 |
+| 真 ssh 的桥接数据面（loopback-only / 端口占用自愈 / 断线重连） | integration `test_bridge_roundtrip.sh` + 两机 E2E |
 
 ### 组 6/7/8 的两侧接线（为什么这么搭，Phase 1 的原始设计）
 
