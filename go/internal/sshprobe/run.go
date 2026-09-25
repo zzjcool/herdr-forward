@@ -10,9 +10,11 @@
 //
 //	[timeout 15] ssh -n -o BatchMode=yes -o ConnectTimeout=8 [-p PORT] HOST REMOTE_CMD
 //
-//   - `-n` 必需：`curl … | bash -s` 形态下 stdin 是脚本本体，ssh 读走它就等于吃掉剩余脚本；
-//   - `-p` 只在 target 显式带端口时传（裸 host 交给 ssh_config 的 Port / 默认 22）；
-//   - timeout 缺失时靠 ConnectTimeout=8 兜住建连阶段（不静默降级，行为仍可预期）。
+// 三个细节都是必需的：
+//
+//   - `-n`：`curl … | bash -s` 形态下 stdin 是脚本本体，ssh 读走它就等于吃掉剩余脚本；
+//   - `-p`：只在 target 显式带端口时传（裸 host 交给 ssh_config 的 Port / 默认 22）；
+//   - timeout：缺失时靠 ConnectTimeout=8 兜住建连阶段（不静默降级，行为仍可预期）。
 //
 // 只读保证：只跑 `herdr plugin list` 与远端路径推导（读 plugins.json / 目录 glob），
 // 绝不执行 `herdr plugin install` 等写动作。
