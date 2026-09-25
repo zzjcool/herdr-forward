@@ -299,9 +299,18 @@ func (s *Supervisor) connectOnce(ctx context.Context, rec activationRecord, herd
 	s.sshPID = 0
 	s.lock.Unlock()
 
+	// 退出码语义对齐 bash 的 `wait "${_BRIDGE_RUN_SSH_PID}"`：
+	//
+	//   * ssh 自己退出 -> 它的真实退出码（127/126 闸插件缺失、64 闸版本过旧、255 闸连不上）；
+	//   * 被信号杀死（上面我们发的 SIGTERM，或远端/内核发的）-> wait 返回 128+signum。
+	//     Go 的 ExitCode() 对这种情形返回 -1，所以显式补成 143（SIGTERM），
+	//     这样 _bridge_exit_reason 的 default 分支文案与 bash 逐字一致。
 	if cmd.ProcessState != nil {
 		if code := cmd.ProcessState.ExitCode(); code >= 0 {
 			return code
+		}
+		if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal())
 		}
 	}
 	return 255
