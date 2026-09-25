@@ -201,11 +201,13 @@ func Main(args []string) int                    // 返回值即进程退出码�
 - **依赖**：Phase 4。
 - **验收（终态门）**：`bash scripts/ci.sh` 全绿（docker 主路径 + bwrap 降级路径各跑一次）；`HERDR_E2E_ONLINE=1 bash scripts/e2e/run-real-install.sh` 对**打了 tag 的真实 GitHub release** 全绿（install→下载→校验→prefix+f→升级场景）；`grep -r 'lib/.*\.sh' bin/ scripts/` 无引用；仓库无预编译二进制（CI 哨兵：`git ls-files | grep -E 'forward-go|dist/'` 为空）。
 
+> **迁移期间基线纪律**：worker 在 Phase 0 实测发现 `main` 上存在既有红灯（tests/unit/test_bridge.sh SC2034，disable 注释只覆盖了下一条赋值，`cl_status[6006]=` 漏盖，已于迁移开始时修复）。今后任何 phase 验收时，与既有基线的偏差必须先对照 pristine main 确认是否新增回归，不得把既有红灯计入本 phase 失败，也不得借此放松断言。
+
 ## 7. Releases 流水线与 postinstall 下载
 
 **GoReleaser**（裁决：不手写 matrix —— checksums.txt、4 平台命名、GH Action 集成都是现成的，手写只会重造）。`.goreleaser.yml`：`goos: [linux, darwin] × goarch: [amd64, arm64]`，archive 名 `herdr-forward_{version}_{os}_{arch}.tar.gz`（内含单二进制 `forward` + LICENSE/README），`ldflags: -s -w -X main.version={{.Version}}`；`.github/workflows/release.yml`：push tag `v*` → goreleaser → 上传（含 checksums.txt）；`ci.yml`：ubuntu-latest 跑 `scripts/ci.sh`（有 docker）。
 
-**postinstall 下载（scripts/postinstall.sh 重写，纯 POSIX sh —— 裁决理由：[[build]] 在二进制存在**之前**运行，不能用 Go 二进制 bootstrap 自己，鸡生蛋；curl（macOS 必有、Linux 普遍）与 wget 双兜底是唯一零新增依赖方案）：
+**postinstall 下载（scripts/postinstall.sh 重写，纯 POSIX sh —— 裁决理由：`[[build]]` 在二进制存在**之前**运行，不能用 Go 二进制 bootstrap 自己，鸡生蛋；curl（macOS 必有、Linux 普遍）与 wget 双兜底是唯一零新增依赖方案）：
 
 ```sh
 # 伪代码骨架（实现保持现有 note/say 风格）

@@ -290,7 +290,9 @@ export HERDR_FORWARD_OPENER="${TMP}/opener"
 cl_mid="m1"
 # shellcheck disable=SC2034 # 同上（下标是 A 侧端口号）
 cl_status=()
+# shellcheck disable=SC2034 # 同上
 cl_status[5173]="up"
+# shellcheck disable=SC2034 # 同上
 cl_status[6006]="down"
 
 t_it "已映射端口：打开"
