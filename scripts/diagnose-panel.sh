@@ -41,8 +41,7 @@ LIB_DIR="${PLUGIN_ROOT}/lib"
 # ---------------------------------------------------------------------------
 # 采集（全部只读；每个探针都自己吞掉失败，rc 单独记录）
 # ---------------------------------------------------------------------------
-NOW_UTC=""
-TZ=UTC0 printf -v NOW_UTC '%(%Y-%m-%dT%H:%M:%SZ)T' "${EPOCHSECONDS:--1}"
+NOW_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 
 HERDR_BIN="${HERDR_BIN_PATH:-}"
 HERDR_BIN_EXEC="no"

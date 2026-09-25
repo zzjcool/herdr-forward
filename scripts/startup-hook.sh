@@ -301,7 +301,8 @@ fi
 installer_rc=0
 installer_out=""
 set +o errexit
-installer_out="$(bash "${TABBAR_INSTALLER}" --config "${config_path}" "${state_dir_args[@]}" "${dry_flag[@]}" "${plugin_root_args[@]}" 2>&1)"
+# ${a[@]+"${a[@]}"}：空数组在 bash < 4.4 + set -u 下直接展开会报 unbound variable
+installer_out="$(bash "${TABBAR_INSTALLER}" --config "${config_path}" ${state_dir_args[@]+"${state_dir_args[@]}"} ${dry_flag[@]+"${dry_flag[@]}"} ${plugin_root_args[@]+"${plugin_root_args[@]}"} 2>&1)"
 installer_rc=$?
 set -o errexit
 

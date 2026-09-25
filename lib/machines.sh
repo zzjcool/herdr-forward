@@ -429,9 +429,10 @@ machines_is_local_target() {
 
   local host="${raw}"
   # ssh:// scheme（大小写不敏感，与 _ssh_probe_strip_scheme 同源语义）
-  if [[ ${host,,} == ssh://* ]]; then
-    host="${host:6}"
-  fi
+  case "${host}" in
+  [Ss][Ss][Hh]://*) host="${host:6}" ;;
+  *) ;;
+  esac
   # user@ 前缀（ssh_target 形如 user@host[:port]）
   if [[ ${host} == *@* ]]; then
     host="${host##*@}"
@@ -444,7 +445,8 @@ machines_is_local_target() {
     host="${BASH_REMATCH[1]}"
   fi
 
-  local lowered="${host,,}"
+  local lowered=""
+  lowered="$(hf_lower "${host}")"
   case "${lowered}" in
   localhost | localhost.localdomain | 127.0.0.1 | ::1 | 0:0:0:0:0:0:0:1)
     printf 'yes\n'
@@ -457,9 +459,11 @@ machines_is_local_target() {
   local names=""
   local name=""
   names="$(_machines_host_names)"
+  local name_lc=""
   while IFS= read -r name; do
     [[ -z ${name} ]] && continue
-    if [[ "${name,,}" == "${lowered}" ]]; then
+    name_lc="$(hf_lower "${name}")"
+    if [[ ${name_lc} == "${lowered}" ]]; then
       printf 'yes\n'
       return 0
     fi

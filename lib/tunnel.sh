@@ -92,7 +92,10 @@ tunnel_ssh_args() {
   local parsed_raw=""
   parsed_raw="$(tunnel_parse_ssh_target "${ssh_target}")"
   local -a parsed=()
-  mapfile -t parsed <<<"${parsed_raw}"
+  local item=""
+  while IFS= read -r item; do
+    parsed+=("${item}")
+  done <<<"${parsed_raw}"
   local port="${parsed[0]}"
   local dest="${parsed[1]}"
   local dir
@@ -200,7 +203,10 @@ tunnel_start() {
   local args_raw=""
   args_raw="$(tunnel_ssh_args "${id}" "${local_port}" "${remote}" "${ssh_target}")"
   local -a args=()
-  mapfile -t args <<<"${args_raw}"
+  local arg=""
+  while IFS= read -r arg; do
+    args+=("${arg}")
+  done <<<"${args_raw}"
 
   printf '%s\n' "${ssh_target}" >"${target_file}"
 

@@ -476,7 +476,7 @@ if ((do_tabbar == 1)); then
   step=$((step + 1))
   printf '\n== [%d/%d] tab bar 状态条（command 在 herdr server 上执行）==\n' "${step}" "${total}"
   bash "${TABBAR_INSTALLER}" --config "${config_path}" \
-    --plugin-root "${server_root}" --state-dir "${server_state_dir}" "${dry_flag[@]}" ||
+    --plugin-root "${server_root}" --state-dir "${server_state_dir}" ${dry_flag[@]+"${dry_flag[@]}"} ||
     die 1 "install-tabbar.sh 失败（见上方输出）。config 未被部分破坏；修正后重跑本命令即可。"
 fi
 
@@ -484,7 +484,8 @@ if ((do_keys == 1)); then
   step=$((step + 1))
   printf '\n== [%d/%d] 键绑定（plugin_action；由 server 上的插件响应，A 无需装插件）==\n' \
     "${step}" "${total}"
-  bash "${KEYS_INSTALLER}" --config "${config_path}" "${dry_flag[@]}" ||
+  # ${a[@]+"${a[@]}"}：空数组在 bash < 4.4 + set -u 下直接展开会报 unbound variable
+  bash "${KEYS_INSTALLER}" --config "${config_path}" ${dry_flag[@]+"${dry_flag[@]}"} ||
     die 1 "install-keys.sh 失败（见上方输出）。config 未被部分破坏；修正后重跑本命令即可。"
 fi
 

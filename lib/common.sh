@@ -23,6 +23,69 @@ if [[ -z ${FORWARD_PROBE_PAYLOAD_MARKER:-} ]]; then
   readonly FORWARD_PROBE_PAYLOAD_MARKER='herdr-forward-probe'
 fi
 
+# bash 3.2 兼容（macOS 自带的 /bin/bash；herdr server 若由非交互 ssh 拉起，PATH 里
+# 只有它）。新版 bash 走无 fork 的内建写法，旧版退回外部命令：
+#   printf '%(fmt)T' 需要 4.2；read -N 需要 4.1；${x,,} / ${x^^} 需要 4.0。
+if [[ -z ${_HF_BASH42:-} ]]; then
+  if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2))); then
+    readonly _HF_BASH42=1
+  else
+    readonly _HF_BASH42=0
+  fi
+fi
+
+# hf_lower <string> -> stdout: 小写
+hf_lower() {
+  if ((_HF_BASH42 == 1)); then
+    printf '%s\n' "${1,,}"
+  else
+    printf '%s\n' "${1-}" | tr '[:upper:]' '[:lower:]'
+  fi
+}
+
+# hf_upper <string> -> stdout: 大写
+hf_upper() {
+  if ((_HF_BASH42 == 1)); then
+    printf '%s\n' "${1^^}"
+  else
+    printf '%s\n' "${1-}" | tr '[:lower:]' '[:upper:]'
+  fi
+}
+
+# hf_detach_exec <cmd...>：把命令 exec 到新会话里（脱离调用方的进程组与控制终端）
+#   调用方负责 & 与重定向：hf_detach_exec cmd args </dev/null >>log 2>&1 &
+#   macOS 没有 setsid(1)，用系统自带的 perl / python3 调 setsid()；都没有才退 nohup。
+hf_detach_exec() {
+  if command -v setsid >/dev/null 2>&1; then
+    exec setsid "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    exec perl -MPOSIX -e 'POSIX::setsid(); exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    exec python3 -c 'import os, sys
+try:
+    os.setsid()
+except OSError:
+    pass
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  fi
+  exec nohup "$@"
+}
+
+# hf_read_timed_out <read_rc> <SECONDS_before_read> <timeout_s>：0 = `read -t` 超时，1 = EOF
+#   bash ≥ 4 超时返回 >128；bash 3.2 超时与 EOF 都返回 1，只能看耗时：EOF 立即返回，
+#   超时要等满 timeout 整秒（SECONDS 取整，但等满 t 秒必然跨过 t 个整秒边界）。
+#   3.2 超时还会丢掉已读的半行，所以调用方的半行拼接只在新版 bash 上生效。
+hf_read_timed_out() {
+  local rc="${1-1}" started="${2-0}" timeout="${3-1}"
+  if ((rc > 128)); then
+    return 0
+  fi
+  if ((BASH_VERSINFO[0] >= 4)); then
+    return 1
+  fi
+  ((SECONDS - started >= timeout))
+}
+
 # state_dir
 #   stdout: 插件状态目录绝对路径（A.2：env 优先，缺失回退 ~/.local/state/herdr-forward）
 #   备注：A.3 未冻结此名，属 T1 附加 helper（log / state_file / control socket 共用）。
@@ -43,9 +106,15 @@ log() {
   local msg="$*"
 
   local ts=""
-  # TZ=UTC0 只作用于本条 printf（bash 普通 builtin 的临时环境赋值不泄漏）；
-  # EPOCHSECONDS 缺失时回退 -1（printf 语义：取当前时间），故无 date fork。
-  TZ=UTC0 printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' "${EPOCHSECONDS:--1}"
+  if ((_HF_BASH42 == 1)); then
+    # TZ=UTC0 只作用于本条 printf（bash 普通 builtin 的临时环境赋值不泄漏）；
+    # EPOCHSECONDS 缺失时回退 -1（printf 语义：取当前时间），故无 date fork。
+    TZ=UTC0 printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' "${EPOCHSECONDS:--1}"
+  else
+    # 关掉协议 fd：命令替换子 shell 若继承 supervisor 的 7/8，bash 3.2 会把写进管道的
+    # 协议行（HF1 PING）卷进时间戳。
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 7<&- 8<&- 2>/dev/null || true)"
+  fi
   local line="[${ts}] ${level}: ${msg}"
 
   if [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
@@ -76,6 +145,17 @@ log() {
 _log_rotate() {
   local logfile="${1-}"
   [[ -f "${logfile}" ]] || return 0
+  if ((_HF_BASH42 == 0)); then
+    local size=""
+    size="$(wc -c <"${logfile}" 2>/dev/null || true)"
+    size="${size//[[:space:]]/}"
+    [[ ${size} =~ ^[0-9]+$ ]] || return 0
+    ((size > FORWARD_LOG_MAX_BYTES)) || return 0
+    local kept=""
+    kept="$(tail -c "${FORWARD_LOG_KEEP_BYTES}" "${logfile}" 2>/dev/null || true)"
+    printf '%s\n' "${kept}" >"${logfile}" 2>/dev/null || true
+    return 0
+  fi
   local LC_ALL=C # 使 ${#var} / ${var: -n} 按字节而非字符计数（与 wc -c 语义一致）
   local data=""
   IFS= read -r -N $((FORWARD_LOG_MAX_BYTES + 1)) -d "" data <"${logfile}" 2>/dev/null || true
@@ -111,7 +191,7 @@ now_unix() {
     return 0
   fi
   local t=""
-  t="$(date +%s)"
+  t="$(date +%s 7<&- 8<&-)"
   printf '%s\n' "${t}"
 }
 
@@ -197,12 +277,17 @@ probe_payload() {
   #   0   = 读到回包 -> up
   #   128+= timeout 杀掉的 read（读超时）-> degraded
   #   其他 = connect/write 失败 -> down
+  #   bash 3.2 的 read 超时也返回 1（同 EOF），按耗时补成 142（见 hf_read_timed_out）。
   local script=""
+  # shellcheck disable=SC2016 # $SECONDS / $rc 属于子 bash，必须原样写进脚本
   printf -v script 'exec 3<>"%s" 2>/dev/null || exit 2
 printf "%%s\\n" "%s" >&3 2>/dev/null || exit 3
+s=$SECONDS
 IFS= read -r -n 1 -t "%s" -u 3 _ 2>/dev/null
-exit $?' \
-    "/dev/tcp/${host}/${port}" "${FORWARD_PROBE_PAYLOAD_MARKER}" "${timeout_s}"
+rc=$?
+if [ "$rc" -eq 1 ] && [ "${BASH_VERSINFO[0]}" -lt 4 ] && [ $((SECONDS - s)) -ge "%s" ]; then rc=142; fi
+exit "$rc"' \
+    "/dev/tcp/${host}/${port}" "${FORWARD_PROBE_PAYLOAD_MARKER}" "${timeout_s}" "${timeout_s}"
 
   local rc=0
   set +o errexit

@@ -652,7 +652,7 @@ panel_confirm() {
   # 去前后空白（bash 内建，无 fork）
   ans="${ans#"${ans%%[![:space:]]*}"}"
   ans="${ans%"${ans##*[![:space:]]}"}"
-  ans="${ans,,}"
+  ans="$(hf_lower "${ans}")"
 
   if [[ "${ans}" == "y" || "${ans}" == "yes" ]]; then
     printf 'yes\n'
@@ -832,7 +832,7 @@ panel_main() {
   fi
 
   local refresh="${PANEL_REFRESH_S:-3}"
-  local key="" rrc=0 action=""
+  local key="" rrc=0 action="" read_at=0
 
   while true; do
     _panel_clear
@@ -844,16 +844,17 @@ panel_main() {
       key="${PANEL_PENDING_KEY}"
       PANEL_PENDING_KEY=""
     else
+      read_at="${SECONDS}"
       set +o errexit
       IFS= read -r -n 1 -t "${refresh}" key
       rrc=$?
       set -o errexit
     fi
 
-    if [[ "${rrc}" -gt 128 ]]; then
-      continue # 超时 = 自动刷新（forward 状态可能是别的 pane 改的）
-    fi
     if [[ "${rrc}" -ne 0 ]]; then
+      if hf_read_timed_out "${rrc}" "${read_at}" "${refresh}"; then
+        continue # 超时 = 自动刷新（forward 状态可能是别的 pane 改的）
+      fi
       return 0 # EOF（终端消失 / 输入被关闭）：干净退出，trap EXIT 会恢复终端
     fi
     if [[ -z "${key}" ]]; then

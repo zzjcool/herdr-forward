@@ -270,10 +270,13 @@ bridge_remote_serve_cmd() {
 #   激活记录里也可能是 user@host:port。ssh 不认 host:port 形式，统一转成 ssh:// URI。
 bridge_ssh_destination() {
   local target="${1-}"
-  if [[ ${target,,} == ssh://* ]]; then
+  case "${target}" in
+  [Ss][Ss][Hh]://*)
     printf '%s\n' "${target}"
     return 0
-  fi
+    ;;
+  *) ;;
+  esac
   if [[ ${target} =~ ^([^:@/]+@)?\[[0-9A-Fa-f:.]+\]:[0-9]+$ || ${target} =~ ^([^:@/]+@)?[^:@/\[]+:[0-9]+$ ]]; then
     printf 'ssh://%s\n' "${target}"
     return 0
@@ -435,10 +438,11 @@ _bridge_serve_cleanup() {
 }
 
 # _bridge_serve_write：把 serve 的会话状态原子写盘（读 bridge_serve 的局部变量，动态作用域）
+#   srv_state / srv_reason 以端口号为下标（映射 id 恒为 f-<端口>）：bash 3.2 没有关联数组。
 _bridge_serve_write() {
   local rows="" k=""
   for k in "${!srv_state[@]}"; do
-    rows+="${k}"$'\t'"${srv_state[${k}]}"$'\t'"${srv_reason[${k}]-}"$'\n'
+    rows+="f-${k}"$'\t'"${srv_state[k]}"$'\t'"${srv_reason[k]-}"$'\n'
   done
   local doc=""
   doc="$(printf '%s' "${rows}" | jq -R -s -c \
@@ -493,8 +497,8 @@ bridge_serve() {
   trap '_bridge_serve_cleanup' EXIT
   trap 'exit 0' TERM HUP INT PIPE
 
-  local -A srv_state=()
-  local -A srv_reason=()
+  local -a srv_state=()
+  local -a srv_reason=()
   local srv_client_host=""
   local srv_client_label=""
   local srv_host=""
@@ -509,8 +513,8 @@ bridge_serve() {
   printf '%s HELLO %s\n' "${BRIDGE_PROTO}" "${srv_host}"
   log info "bridge serve: 会话开始（pid=${me}）。"
 
-  local desired="" sync="" last_sync="" line="" buf="" rrc=0 now=""
-  local verb="" rest="" fid="" st="" reason=""
+  local desired="" sync="" last_sync="" line="" buf="" rrc=0 now="" read_at=0
+  local verb="" rest="" fid="" st="" reason="" port=""
   local -a words=()
   while true; do
     set +o errexit
@@ -522,9 +526,9 @@ bridge_serve() {
       printf '%s\n' "${sync}"
       last_sync="${sync}"
       # 已不在期望集合里的映射，其旧状态没有意义（否则会残留一条过期的 up）
-      for fid in "${!srv_state[@]}"; do
-        if [[ ${sync} != *" ${fid}:"* && ${sync} != *",${fid}:"* ]]; then
-          unset 'srv_state[${fid}]' 'srv_reason[${fid}]'
+      for port in "${!srv_state[@]}"; do
+        if [[ ${sync} != *" f-${port}:"* && ${sync} != *",f-${port}:"* ]]; then
+          unset "srv_state[${port}]" "srv_reason[${port}]"
           dirty=1
         fi
       done
@@ -533,11 +537,13 @@ bridge_serve() {
 
     line=""
     rrc=0
+    read_at="${SECONDS}"
     IFS= read -r -t "${BRIDGE_POLL_S}" line || rrc=$?
-    if ((rrc > 128)); then
+    if ((rrc != 0)); then
+      if ! hf_read_timed_out "${rrc}" "${read_at}" "${BRIDGE_POLL_S}"; then
+        break # EOF：client 断开
+      fi
       buf+="${line}" # 超时时 read 已消费的半行留到下次拼上
-    elif ((rrc != 0)); then
-      break # EOF：client 断开
     else
       line="${buf}${line}"
       buf=""
@@ -561,10 +567,13 @@ bridge_serve() {
           st="${words[3]-}"
           reason="${line#*STATUS "${fid}" "${st}"}"
           reason="${reason# }"
-          if [[ ${fid} =~ ^f-[0-9]+$ && (${st} == "up" || ${st} == "down") ]]; then
-            srv_state[${fid}]="${st}"
-            srv_reason[${fid}]="${reason:0:200}"
-            dirty=1
+          if [[ ${fid} =~ ^f-([1-9][0-9]{0,4})$ && (${st} == "up" || ${st} == "down") ]]; then
+            port="${BASH_REMATCH[1]}"
+            if ((port <= 65535)); then
+              srv_state[port]="${st}"
+              srv_reason[port]="${reason:0:200}"
+              dirty=1
+            fi
           fi
           srv_last_seen="${now}"
           ;;
@@ -652,12 +661,13 @@ _bridge_lock_acquire() {
 }
 
 # _bridge_client_write <state> [reason]：supervisor 状态原子写盘（读 bridge_run 的局部变量）
+#   cl_spec / cl_status / cl_reason 以 A 侧端口号为下标（映射 id 恒为 f-<端口>）。
 _bridge_client_write() {
   local state="${1-}"
   local reason="${2-}"
   local rows="" k=""
   for k in "${!cl_status[@]}"; do
-    rows+="${k}"$'\t'"${cl_spec[${k}]-}"$'\t'"${cl_status[${k}]}"$'\t'"${cl_reason[${k}]-}"$'\n'
+    rows+="f-${k}"$'\t'"${cl_spec[k]-}"$'\t'"${cl_status[k]}"$'\t'"${cl_reason[k]-}"$'\n'
   done
   local now=""
   now="$(now_unix)"
@@ -701,9 +711,14 @@ _bridge_mux() {
   return "${rc}"
 }
 
+# 会话 fd：_BRIDGE_FD_IN 读 ssh 的 stdout，_BRIDGE_FD_OUT 写 ssh 的 stdin。
+#   固定编号而非 {fd} 自动分配（bash 3.2 没有）；supervisor 进程里没有别的代码用 7/8。
+_BRIDGE_FD_IN=7
+_BRIDGE_FD_OUT=8
+
 # _bridge_send <line>：写给 B（写失败 = 会话已断，由读循环在下一轮发现 EOF）
 _bridge_send() {
-  printf '%s\n' "${1-}" 1>&"${cl_out_fd}" 2>/dev/null || true
+  printf '%s\n' "${1-}" 1>&"${_BRIDGE_FD_OUT}" 2>/dev/null || true
 }
 
 # _bridge_reconcile <sync-payload>：把 A 上已生效的映射对齐到 B 的期望集合
@@ -713,68 +728,69 @@ _bridge_reconcile() {
   local payload="${1-}"
   local parsed=""
   parsed="$(bridge_parse_sync "${payload}")"
-  local -A want=()
-  local fid="" lp="" rp=""
+  # bridge_parse_sync 已校验：id 恒为 f-<lp>，lp 无前导零且 ≤ 65535，可直接当数组下标
+  local -a want=()
+  local fid="" lp="" rp="" k=""
   while IFS=' ' read -r fid lp rp; do
     [[ -n ${fid} ]] || continue
-    want[${fid}]="${lp} ${rp}"
+    want[lp]="${lp} ${rp}"
   done <<<"${parsed}"
 
   local why=""
-  for fid in "${!cl_spec[@]}"; do
-    if [[ ${want[${fid}]-} != "${cl_spec[${fid}]}" ]]; then
-      if [[ ${cl_status[${fid}]-} == "up" ]]; then
-        IFS=' ' read -r lp rp <<<"${cl_spec[${fid}]}"
+  for k in "${!cl_spec[@]}"; do
+    if [[ ${want[k]-} != "${cl_spec[k]}" ]]; then
+      if [[ ${cl_status[k]-} == "up" ]]; then
+        IFS=' ' read -r lp rp <<<"${cl_spec[k]}"
         why="$(_bridge_mux "${cl_ctl}" cancel "${lp}" "${rp}")"
         log info "bridge ${cl_mid}: 已撤销 localhost:${lp} → ${cl_label}:${rp}${why:+（${why}）}"
       fi
-      unset 'cl_spec[${fid}]' 'cl_status[${fid}]' 'cl_reason[${fid}]'
+      unset "cl_spec[${k}]" "cl_status[${k}]" "cl_reason[${k}]"
     fi
   done
 
-  for fid in "${!want[@]}"; do
-    [[ -z ${cl_spec[${fid}]-} ]] || continue
-    cl_spec[${fid}]="${want[${fid}]}"
-    _bridge_apply_one "${fid}"
+  for k in "${!want[@]}"; do
+    [[ -z ${cl_spec[k]-} ]] || continue
+    cl_spec[k]="${want[k]}"
+    _bridge_apply_one "${k}"
   done
   _bridge_client_write connected
 }
 
-# _bridge_apply_one <id>：按 cl_spec 在 master 上开一条 -L，并把结果报告给 B
+# _bridge_apply_one <local_port>：按 cl_spec 在 master 上开一条 -L，并把结果报告给 B
 _bridge_apply_one() {
-  local fid="${1-}"
+  local k="${1-}"
   local lp="" rp=""
-  IFS=' ' read -r lp rp <<<"${cl_spec[${fid}]}"
+  IFS=' ' read -r lp rp <<<"${cl_spec[k]}"
   local busy=""
   busy="$(probe_tcp 127.0.0.1 "${lp}" 1)"
   if [[ ${busy} == "ok" ]]; then
-    cl_status[${fid}]="down"
-    cl_reason[${fid}]="client 端口 ${lp} 已被占用（${cl_host}）"
-    _bridge_send "${BRIDGE_PROTO} STATUS ${fid} down ${cl_reason[${fid}]}"
+    cl_status[k]="down"
+    cl_reason[k]="client 端口 ${lp} 已被占用（${cl_host}）"
+    _bridge_send "${BRIDGE_PROTO} STATUS f-${k} down ${cl_reason[k]}"
     return 0
   fi
   local why="" rc=0
   why="$(_bridge_mux "${cl_ctl}" forward "${lp}" "${rp}")"
   rc=$?
   if ((rc == 0)); then
-    cl_status[${fid}]="up"
-    cl_reason[${fid}]=""
-    _bridge_send "${BRIDGE_PROTO} STATUS ${fid} up"
+    cl_status[k]="up"
+    cl_reason[k]=""
+    _bridge_send "${BRIDGE_PROTO} STATUS f-${k} up"
     log info "bridge ${cl_mid}: localhost:${lp} → ${cl_label}:${rp} 已生效。"
   else
-    cl_status[${fid}]="down"
-    cl_reason[${fid}]="ssh 拒绝转发：${why:-rc=${rc}}"
-    _bridge_send "${BRIDGE_PROTO} STATUS ${fid} down ${cl_reason[${fid}]}"
+    cl_status[k]="down"
+    cl_reason[k]="ssh 拒绝转发：${why:-rc=${rc}}"
+    _bridge_send "${BRIDGE_PROTO} STATUS f-${k} down ${cl_reason[k]}"
   fi
   return 0
 }
 
 # _bridge_retry_failed：重试 down 的映射（端口被短暂占用、旧 master 尚未释放等会自愈）
 _bridge_retry_failed() {
-  local fid="" changed=0
-  for fid in "${!cl_status[@]}"; do
-    [[ ${cl_status[${fid}]} == "down" ]] || continue
-    _bridge_apply_one "${fid}"
+  local k="" changed=0
+  for k in "${!cl_status[@]}"; do
+    [[ ${cl_status[k]} == "down" ]] || continue
+    _bridge_apply_one "${k}"
     changed=1
   done
   if ((changed == 1)); then
@@ -795,8 +811,8 @@ _bridge_open_url() {
     port=80
     [[ ${url} == https://* ]] && port=443
   fi
-  local key="f-${port}"
-  if [[ ${cl_status[${key}]-} != "up" ]]; then
+  # 端口要当数组下标（算术求值）：前导零会按八进制解析，先挡掉
+  if [[ ! ${port} =~ ^[1-9][0-9]*$ ]] || ((port > 65535)) || [[ ${cl_status[port]-} != "up" ]]; then
     log warn "bridge ${cl_mid}: 拒绝打开 ${url:0:120}（端口 ${port} 不是本桥接已生效的映射）。"
     return 0
   fi
@@ -812,11 +828,8 @@ _bridge_open_url() {
     fi
   fi
   log info "bridge ${cl_mid}: 打开 ${url}"
-  if command -v setsid >/dev/null 2>&1; then
-    setsid "${opener}" "${url}" </dev/null >/dev/null 2>&1 &
-  else
-    "${opener}" "${url}" </dev/null >/dev/null 2>&1 &
-  fi
+  # 关掉会话 fd：浏览器等长寿子进程若继承了 ssh stdin 的写端，会话就收不到 EOF
+  hf_detach_exec "${opener}" "${url}" </dev/null >/dev/null 2>&1 7<&- 8>&- &
   disown "$!" 2>/dev/null || true
   return 0
 }
@@ -829,7 +842,10 @@ _bridge_connect_once() {
   local args_raw=""
   args_raw="$(bridge_ssh_args "${cl_ctl}")"
   local -a args=()
-  mapfile -t args <<<"${args_raw}"
+  local arg=""
+  while IFS= read -r arg; do
+    args+=("${arg}")
+  done <<<"${args_raw}"
   local errlog=""
   errlog="$(bridge_client_log "${cl_mid}")"
   : >"${errlog}"
@@ -837,31 +853,40 @@ _bridge_connect_once() {
   _bridge_ctl_exit "${cl_ctl}"
   rm -f "${cl_ctl}" 2>/dev/null || true
 
-  local -A cl_spec=()
-  local -A cl_status=()
-  local -A cl_reason=()
+  local -a cl_spec=()
+  local -a cl_status=()
+  local -a cl_reason=()
   cl_server_host=""
   _bridge_client_write connecting
 
-  coproc HF_BRIDGE { exec ssh "${args[@]}" "${dest}" "${remote}" 2>>"${errlog}"; }
-  # shellcheck disable=SC2154 # HF_BRIDGE_PID 由 bash 随 coproc HF_BRIDGE 自动定义
-  _BRIDGE_RUN_SSH_PID="${HF_BRIDGE_PID}"
-  local cl_in_fd="" cl_out_fd=""
-  # 复制一份 fd：coproc 退出时 bash 会关掉并 unset HF_BRIDGE，读循环不能再依赖它
-  exec {cl_in_fd}<&"${HF_BRIDGE[0]}" {cl_out_fd}>&"${HF_BRIDGE[1]}"
+  # 两个 FIFO 接 ssh 的 stdin/stdout（bash 3.2 没有 coproc）。打开顺序必须与子进程的
+  # 重定向顺序一致（先 in 后 out）：FIFO 的 open 会阻塞到对端也打开为止。
+  local fifo_dir=""
+  fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/hf-bridge.XXXXXX")" || return 255
+  if ! mkfifo "${fifo_dir}/in" "${fifo_dir}/out"; then
+    rm -rf "${fifo_dir}"
+    return 255
+  fi
+  # shellcheck disable=SC2029 # remote 是 bridge_remote_serve_cmd 按远端 shell 转义好的命令串
+  ssh "${args[@]}" "${dest}" "${remote}" <"${fifo_dir}/in" >"${fifo_dir}/out" 2>>"${errlog}" &
+  _BRIDGE_RUN_SSH_PID=$!
+  exec 8>"${fifo_dir}/in" 7<"${fifo_dir}/out"
+  rm -rf "${fifo_dir}"
 
   _bridge_send "${BRIDGE_PROTO} HELLO ${cl_host} ${cl_label}"
 
-  local line="" buf="" rrc=0 now="" last_ping=""
+  local line="" buf="" rrc=0 now="" last_ping="" read_at=0
   last_ping="$(now_unix)"
   while ((_BRIDGE_RUN_STOP == 0)); do
     line=""
     rrc=0
-    IFS= read -r -t "${BRIDGE_POLL_S}" -u "${cl_in_fd}" line || rrc=$?
-    if ((rrc > 128)); then
+    read_at="${SECONDS}"
+    IFS= read -r -t "${BRIDGE_POLL_S}" -u "${_BRIDGE_FD_IN}" line || rrc=$?
+    if ((rrc != 0)); then
+      if ! hf_read_timed_out "${rrc}" "${read_at}" "${BRIDGE_POLL_S}"; then
+        break
+      fi
       buf+="${line}"
-    elif ((rrc != 0)); then
-      break
     else
       line="${buf}${line}"
       buf=""
@@ -895,7 +920,7 @@ _bridge_connect_once() {
     fi
   done
 
-  exec {cl_in_fd}<&- {cl_out_fd}>&-
+  exec 7<&- 8>&-
   kill -TERM "${_BRIDGE_RUN_SSH_PID}" 2>/dev/null || true
   local rc=0
   wait "${_BRIDGE_RUN_SSH_PID}" 2>/dev/null || rc=$?
@@ -992,9 +1017,9 @@ bridge_run() {
   local cl_herdr_sock="${HERDR_SOCKET_PATH:-}"
   local cl_label="" cl_target="" cl_root="" cl_rstate="" cl_server_host=""
   local cl_since=0 cl_next_retry=0
-  local -A cl_spec=()
-  local -A cl_status=()
-  local -A cl_reason=()
+  local -a cl_spec=()
+  local -a cl_status=()
+  local -a cl_reason=()
   local backoff="${BRIDGE_BACKOFF_MIN_S}"
   local rec="" rc=0 started=0 lasted=0 reason="" last_reason="" waited=0 now=0
 
@@ -1079,11 +1104,8 @@ bridge_up() {
   safe="$(_bridge_safe_id "${mid}")"
   local outlog="${dir}/client-${safe}.out"
   : >"${outlog}"
-  if command -v setsid >/dev/null 2>&1; then
-    setsid "${bin}" bridge run "${mid}" </dev/null >>"${outlog}" 2>&1 &
-  else
-    nohup "${bin}" bridge run "${mid}" </dev/null >>"${outlog}" 2>&1 &
-  fi
+  # 新会话：面板 / popup 关闭时 herdr 对其进程组发的信号不能带走 supervisor
+  hf_detach_exec "${bin}" bridge run "${mid}" </dev/null >>"${outlog}" 2>&1 &
   disown "$!" 2>/dev/null || true
   local tries=0
   while ((tries < 20)); do

@@ -169,7 +169,9 @@ if ((do_tabbar)); then
   printf '\n== [%d/%d] tab bar 状态条 ==\n' "${step}" "${total}"
   [[ -f "${TABBAR_INSTALLER}" ]] ||
     die "缺少 ${TABBAR_INSTALLER}。请确认插件安装完整（herdr plugin link/install 后重试）。"
-  bash "${TABBAR_INSTALLER}" --config "${config_path}" "${plugin_root_args[@]}" "${state_dir_args[@]}" "${dry_flag[@]}" ||
+  # ${a[@]+"${a[@]}"}：空数组在 bash < 4.4 + set -u 下直接展开会报 unbound variable
+  bash "${TABBAR_INSTALLER}" --config "${config_path}" ${plugin_root_args[@]+"${plugin_root_args[@]}"} \
+    ${state_dir_args[@]+"${state_dir_args[@]}"} ${dry_flag[@]+"${dry_flag[@]}"} ||
     die "install-tabbar.sh 失败（见上方输出）。文件未被部分破坏；修正后重跑本命令即可。"
 fi
 
@@ -178,7 +180,7 @@ if ((do_keys)); then
   printf '\n== [%d/%d] 键绑定 ==\n' "${step}" "${total}"
   [[ -f "${KEYS_INSTALLER}" ]] ||
     die "缺少 ${KEYS_INSTALLER}。请确认插件安装完整（herdr plugin link/install 后重试）。"
-  bash "${KEYS_INSTALLER}" --config "${config_path}" "${key_args[@]}" "${dry_flag[@]}" ||
+  bash "${KEYS_INSTALLER}" --config "${config_path}" ${key_args[@]+"${key_args[@]}"} ${dry_flag[@]+"${dry_flag[@]}"} ||
     die "install-keys.sh 失败（见上方输出）。文件未被部分破坏；修正后重跑本命令即可。"
 fi
 

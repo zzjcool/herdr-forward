@@ -64,7 +64,7 @@ ports_parse_ss() {
 # _ports_proc_addr <hex> -> stdout: 人类可读地址（/proc/net/tcp 的 little-endian 十六进制）
 _ports_proc_addr() {
   local hex="${1-}"
-  hex="${hex^^}"
+  hex="$(hf_upper "${hex}")"
   if ((${#hex} == 8)); then
     printf '%d.%d.%d.%d\n' "$((16#${hex:6:2}))" "$((16#${hex:4:2}))" "$((16#${hex:2:2}))" "$((16#${hex:0:2}))"
     return 0

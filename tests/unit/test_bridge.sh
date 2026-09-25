@@ -288,8 +288,10 @@ chmod +x "${TMP}/opener"
 export HERDR_FORWARD_OPENER="${TMP}/opener"
 # shellcheck disable=SC2034 # _bridge_open_url 经动态作用域读取 supervisor 的 cl_* 变量
 cl_mid="m1"
-# shellcheck disable=SC2034 # 同上
-declare -A cl_status=(["f-5173"]="up" ["f-6006"]="down")
+# shellcheck disable=SC2034 # 同上（下标是 A 侧端口号）
+cl_status=()
+cl_status[5173]="up"
+cl_status[6006]="down"
 
 t_it "已映射端口：打开"
 _bridge_open_url "http://localhost:5173/app"
@@ -303,6 +305,8 @@ _bridge_open_url "http://localhost:22/"
 _bridge_open_url "http://192.168.1.10:5173/"
 _bridge_open_url "http://localhost@evil.example:5173/"
 _bridge_open_url "file:///etc/passwd"
+_bridge_open_url "http://localhost:05173/"
+_bridge_open_url "http://localhost:08080/"
 sleep 0.5
 t_eq "" "$(cat "${OPENED}" 2>/dev/null || true)" "一个都没打开"
 

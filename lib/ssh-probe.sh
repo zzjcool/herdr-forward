@@ -71,12 +71,15 @@ _SSH_PROBE_HAS_PORT=0
 #   大小写不敏感（SSH:// 也认）；只剥前缀（不动 user/port/IPv6）。
 _ssh_probe_strip_scheme() {
   local target="${1-}"
-  # ${target,,} 取小写副本判断前缀，命中后用 ${#target} 与固定长度切片剥原始串
-  # （不用 sed/awk：本库在 curl|bash 形态下要尽量少依赖，且参数展开零 fork）。
-  if [[ "${target,,}" == ssh://* ]]; then
+  # 逐字母大小写的 glob 判断前缀，命中后用固定长度切片剥原始串（不用 sed/awk：本库
+  # 在 curl|bash 形态下要尽量少依赖，且零 fork；也不用 ${x,,}：macOS 的 bash 3.2 没有）。
+  case "${target}" in
+  [Ss][Ss][Hh]://*)
     printf '%s\n' "${target:6}"
     return 0
-  fi
+    ;;
+  *) ;;
+  esac
   printf '%s\n' "${target}"
 }
 

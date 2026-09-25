@@ -205,12 +205,32 @@ require_cmd() {
     die "缺少依赖 '$1'${2:+，请先安装（$2）}"
   fi
 }
-require_cmd python3 "用于安全解析/生成 TOML（Python 3.11+）"
+
+# find_toml_python：找一个带 tomllib（Python 3.11+）的解释器写入 PY（找不到则 PY 为空）。
+#   herdr server 由非交互 ssh / launchd 拉起时 PATH 常只有 /usr/bin:/bin：macOS 那里的
+#   python3 是 3.9（无 tomllib），Homebrew 的又不在 PATH 里，所以还要看常见安装位置。
+PY=""
+find_toml_python() {
+  local c=""
+  for c in "${HERDR_FORWARD_PYTHON:-}" python3 python3.14 python3.13 python3.12 python3.11 \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3 /home/linuxbrew/.linuxbrew/bin/python3 \
+    "${HOME:-/nonexistent}/.local/bin/python3" /opt/local/bin/python3; do
+    [[ -n ${c} ]] || continue
+    command -v "${c}" >/dev/null 2>&1 || continue
+    if "${c}" -c 'import tomllib' 2>/dev/null; then
+      PY="${c}"
+      return 0
+    fi
+  done
+  return 0
+}
+
 require_cmd mktemp
 require_cmd date
 
-if ! python3 -c 'import tomllib' 2>/dev/null; then
-  die "python3 缺少 tomllib（需 Python 3.11+），无法安全处理 config.toml"
+find_toml_python
+if [[ -z ${PY} ]]; then
+  die "找不到带 tomllib 的 Python（需 3.11+），无法安全处理 config.toml。已找过 PATH 里的 python3 与 /opt/homebrew/bin、/usr/local/bin 等位置；请安装（macOS：brew install python）或用 HERDR_FORWARD_PYTHON=/path/to/python3 指定。"
 fi
 
 # --- 目标目录准备 ---
@@ -228,11 +248,10 @@ trap 'rm -f "${tmp_file}"' EXIT
 
 # --- 计算出改动后的完整 TOML 文本 ---
 # 退出码：0=有新内容 10=已安装（幂等） 其它=失败
-new_content=""
-rc=0
-new_content="$(
-  HF_CONFIG="${config_path}" HF_COMMAND="${command_str}" HF_MARKER="${MARKER_COMMENT}" \
-    python3 - <<'PY'
+# 程序先读进变量再 `-c` 执行：heredoc 放在 $( ) 里时，bash 3.2 会把正文当 shell 扫描，
+# 正文里的反引号 / 单引号会让整个脚本解析失败。
+PY_BUILD=""
+IFS= read -r -d '' PY_BUILD <<'PY' || true
 import os
 import sys
 import tomllib
@@ -477,6 +496,11 @@ if not out.endswith("\n"):
     out += "\n"
 sys.stdout.write(out)
 PY
+new_content=""
+rc=0
+new_content="$(
+  HF_CONFIG="${config_path}" HF_COMMAND="${command_str}" HF_MARKER="${MARKER_COMMENT}" \
+    "${PY}" -c "${PY_BUILD}"
 )" || rc=$?
 
 if [[ "${rc}" -eq 10 ]]; then
@@ -494,7 +518,7 @@ fi
 printf '%s\n' "${new_content}" >"${tmp_file}" || die "无法写入临时文件"
 selfcheck_rc=0
 set +o errexit
-python3 - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null
+"${PY}" - "${tmp_file}" "${MARKER_COMMENT}" "${command_str}" <<'PY' 2>/dev/null
 import sys
 import tomllib
 
