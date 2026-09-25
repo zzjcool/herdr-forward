@@ -281,3 +281,137 @@ sha256 校验：sha256sum（Linux）/ shasum -a 256（macOS）
 | 3 machines+bridge | ~2500 行 | 4-5 天 |
 | 4 panel+安装器 | ~1500 行 | 2-3 天 |
 | 5 退役+真安装验证 | ~删除 6500 行 bash + 少量 | 1-2 天 |
+
+## 13. W4 实测与偏离记录（Phase 1 · cli 接线 + 切 list/ports）
+
+铁律：「任何偏离先改本文再动代码」。以下逐条登记 W4 实施中的**实测结论**与**有意偏离**，
+区分「契约不变」（用户可见行为零变化）与「已知形态差异」（会被 difftest 显式拉平或钉住）。
+
+### 13.1 接线方式：条件式 dispatch（相对 §3 字面「无条件 exec」的偏离）
+
+§3 写的是「已迁移子命令 `exec bin/forward-go "$@"`」。W4 实作为**条件式**：
+
+```bash
+case "${1-}" in
+list | ports)
+  if [[ -x "${FORWARD_ROOT}/bin/forward-go" ]]; then
+    exec "${FORWARD_ROOT}/bin/forward-go" "$@"
+  fi
+  ;;
+*) ;;
+esac
+```
+
+理由（两条，都是实测踩出来的）：
+
+1. **staged root 测试会 127 假红**：`test_cli.sh`、`test_machines_cmd.sh`、`test_bootstrap.sh`、
+   `test_panel_bridge.sh`、`test_machines_bridge.sh` 都把 `bin/forward` + 部分 `lib/` 拷成
+   独立 root 再调用，那里没有 `forward-go`；无条件 exec 会让这些用例 rc=127 直接弄红 ci.sh。
+2. **回滚故事**：删掉这个 `if` 块（或让 `bin/forward-go` 不可执行）bash 立即恢复全权处理，
+   无需改任何其它文件。已实测：删除 `bin/forward-go` 后 `list`/`ports` 与 Go 版输出逐字节一致
+   （E2E B2「回滚等价性」三条断言 + difftest 组 6/7 的 bash 侧 staged root 都是这条证据）。
+
+### 13.2 `bin/forward-go` 的产物位置与 CI 确定性（迁移期适配器）
+
+* 产物仍固定为仓库根 `bin/forward-go`（Makefile / goreleaser / postinstall.sh 的既有约定），
+  `.gitignore` 已排除它。difftest 与 E2E **绝不**往仓库根的 `bin/` 写二进制（difftest 写
+  `${TMP}`、E2E 写容器内 `/work/bin` 或沙箱 `src/bin`）。
+* `scripts/ci.sh` 在整轮开始前把本地已构建的 `bin/forward-go` **暂存到 `$TMPDIR`**（EXIT 陷阱
+  还原）。原因：unit/integration 里有一批直接调仓库根 `bin/forward` 的用例，其 golden 是纯
+  bash 输出（尤其 `ports` 的 PROCESS 列——见 13.4），本地恰好 `make build` 过就会「本机红、
+  CI 绿」。暂存到 `$TMPDIR` 而非仓库内加后缀，是为了不让任何残留文件被 E2E 的源码拷贝或
+  两机 tar 带进沙箱。**该适配器在 Phase 3（bash 退役）时必须删除。**
+
+### 13.3 `list --json` 走「原始 jq 视图」而非类型化模型（实现裁决）
+
+`state.Load()` 返回冻结类型 `[]state.Forward`，它无法表达 bash 的 jq 透传语义：
+未知键要保留、缺失键要缺失、数字字面量要逐字节保留（`2.50` 不能变 `2.5`）、
+`forwards` 里出现非对象元素时 jq 会**报错**而不是补零。因此 `list --json` 另走一条
+「顺序保留对象 + 保留数字字面量」的原始视图（`go/internal/cli/jsonjq.go` + `view.go`），
+并在其中逐字复刻 `lib/state.sh` 的三条 warn 文案。实测比对 60+ 组 golden 全绿。
+
+配套的 jq 兼容规则（全部由本机 jq 1.8.2 实测反推，单测钉住）：
+字符串转义（`"` `\` `\b` `\t` `\n` `\f` `\r`、其余 <0x20 与 **0x7f** 转 `\u00xx` 小写；
+U+2028/U+2029 与 `<` `>` `&` **不**转义）；数字规范化（decNumber `decNumberToString`：
+`1e3`->`1E+3`、`1.5e3`->`1.5E+3`、`1e-6`->`0.000001`、`1e-7`->`1E-7`、`0.0000000`->`0E-7`、
+`2.50`->`2.50`、`-0`->`-0`、`0e5`->`0E+5`、`1000000e-6`->`1.000000`）。
+
+**已知边缘（Go 与 bash 一致的降级）**：`forwards` 含非对象元素时，bash 的
+`bridge_merge_live` 因 jq 报错得到空串 → `list --json` **stdout 为空、rc 0**，
+`list`/`list --oneline` 只输出表头/空串、rc 0。Go 侧刻意复刻这一形态（difftest 组 6 三条用例
+比 stdout + rc）。
+
+### 13.4 `ports` 的 PROCESS 列：Go 恒为空（有意偏离，已在 difftest/E2E 拉平）
+
+bash 的 `ports_listening_json` 优先用 `ss -Htlnp`（能拿到进程名），Go 的 W3 冻结实现
+`ports.List()` 在 Linux 上读 `/proc/net/tcp{,6}`（**拿不到进程名**），故 PROCESS 列恒为 `-`。
+- difftest 组 7：给 bash 侧一个**不含 `ss`/`lsof`** 的 symlink PATH 农场 → 两侧同源（都读
+  `/proc`），比的是同一数据源下的输出字节。
+- E2E B2：`ports` 只断言「端口 + 地址」列一致（显式不比对 PROCESS 列）。
+- 升级到 `lsof`/`ss` 采集进程名属 Phase 2+ 的独立决定（未在 W4 变更 W3 的冻结实现）。
+
+另：`ports --json` 在 bash 里**没有** `-S`，键序是插入序 `port,addr,process`（与
+`list --json` 的 `-S` 字母序不同）→ Go 侧为此单独用「保留插入序」的编码路径。
+
+### 13.5 Go 侧新增的 `version` 子命令（对用户零影响）
+
+`bin/forward` 的 `main()` **没有** `version` 分支（`forward --version` 实际是
+usage + rc 64）。Go 的 `Main` 增加了 `version|--version|-v` → `forward <Version>` rc 0。
+由于 `bin/forward` 只 dispatch `list|ports`，这条分支在迁移期**不可达**（用户可见行为零变化）；
+保留它是为了让最终 Go 二进制在 Phase 5 接管时不需要额外补默认行为。已在此登记。
+
+### 13.6 表格渲染：代理行而非改冻结签名
+
+`render.Table` 是冻结实现，且对 `ModeClient` 硬编码 `"client"`、第 6 列恒 `-`。
+而 bash 的表格对 client 记录要显示 `client:<client>`（MACHINE 列）与 `status_reason`（第 6 列），
+对 bridge 记录要显示 `<machine>(桥接)`。W4 **不改 render.Table**，而是在 `list.go` 里把视图行
+「投影」成 render.Table 能表达的形状（client 行借用 `ModeTunnel` + `Machine`/`SshTarget`
+承载那两个值）。投影规则与 `@tsv` 转义（只转 `\` `\t` `\n` `\r`）写在 `rowToForward` 的注释里。
+
+受限于冻结字段的零值语义，下列**手改/损坏记录**才可能触及的形态仍有差异（W1/W2 已登记，
+difftest 用 schema 完整夹具规避）：远端主机缺失/null → bash `:9443` vs Go `127.0.0.1:9443`；
+`remote_port` 缺失 → bash `:null` vs Go `:0`；`status` 为 null → bash 空 vs Go `-`；
+bridge 行 `machine` 为 null → bash `(桥接)` vs Go `-(桥接)`。
+
+### 13.7 桥接只读合并落在 cli 层（Phase 3 会取代）
+
+`list` 需要 client 的实时状态与 A 侧 bridge 行（契约 C5/C6），否则切换瞬间 tab bar / 面板
+会丢状态。W4 在 `go/internal/cli/view.go` 复刻了 `lib/bridge.sh` 的只读半边
+（`bridge_sessions_json` / `bridge_live_status_json` / `bridge_merge_live` /
+`bridge_clients_json` / `bridge_client_forwards_json`），含以下刻意复刻的细节：
+`kill -0` 的 EPERM 也算「死」并**顺手删除**会话文件、`sort_by(.last_seen_unix) | reverse` 的
+等值倒序、`group_by(.id)` 的「up 优先否则取首条」、`BRIDGE_LIVE_WINDOW_S` 环境变量可覆盖。
+Phase 3 迁移 bridge 写侧时，本文件退化为薄包装。
+
+### 13.8 `FORWARD_STATE_VERSION` 的 jq 宽松数字（部分偏离）
+
+jq 的 `--argjson` 接受 `01` / `1.` / `.5` / `+1`（规范化成 `1` / `1` / `0.5` / `1`），
+而 Go 的 `encoding/json` 拒绝这四种。W4 在 cli 层做了**宽容解析**（`lenientNumberLiteral`），
+四种形态的产物与 jq 逐字节一致（difftest 组 6 + 单测钉住）。非法的输入（如 `abc`）：
+bash 是 jq 报错 rc **2**、stdout 空；Go 打印一条自己的可诊断 error 后**同样 rc 2**、stdout 空
+——退出码与 stdout 一致，stderr 文案不同（difftest 该用例只比 rc/stdout，不比文案）。
+
+### 13.9 CI / E2E 接线实测
+
+* `scripts/ci.sh` 新增 `0b/6 difftest`：go/go.mod 或 `tests/difftest/run.sh` 缺失 → SKIP；
+  go 缺失且非 LAX → FAIL、LAX → WARN（**两条分支都不打印 `CI FAIL`**，因为
+  `tests/unit/test_ci_script.sh` 断言 LAX 输出里不得出现该字串）。
+* shellcheck/shfmt 目标列表纳入 `tests/difftest/*.sh`（`[[ -f ]]` 守卫）；
+  `run-inside.sh` 的 `lint_targets` 同步。
+* E2E：`run-inside.sh` 启动时构建/恢复 `/work/bin/forward-go`；A/A2 段跑切换后的路径
+  （含 staged shim 的切换探针 + 回退逐字节对位）；**B 段前暂停 Go CLI** 以跑纯 bash 基线；
+  新增 **B2 段**跑切换后对位（list 三形态、ports 端口/地址列、回滚等价性、oneline 延迟、
+  容器内 difftest）。`run-bwrap.sh` 在宿主预构建并拷进沙箱（沙箱内无 go 工具链）。
+* 两机 E2E 在 W4 仍是**纯 bash 判定**（tar 排除 `.git`/`.pi-subagents`/`test-results`/
+  `node_modules`，不含 `bin/forward-go`）：B 上 `forward list --json` 的状态断言与 tab bar
+  断言因此走 bash。Go 的桥接合并由 difftest 组 6 + E2E B2 覆盖；Phase 3 切 machines/bridge
+  时把 Go CLI 一并注入两机 tar。
+
+### 13.10 验证结果（W4）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| Go 门 | `make check` | gofmt/vet/test/vendor-check 全绿 |
+| 差分 | `bash tests/difftest/run.sh` | `1..123` / `PASS: 123 FAIL: 0` / `RESULT: PASS` |
+| 基线 | `bash scripts/ci.sh` | `CI OK: 6/6 全部通过`（含 docker E2E `130 PASS / 0 FAIL`、两机 E2E `62 PASS / 0 FAIL`） |
+| E2E 切后 | `run-inside.sh` B2 段 | 回滚等价性 3 条逐字节 + ports 端口/地址列一致 + oneline 65ms |
