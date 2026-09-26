@@ -801,11 +801,9 @@ func startupActivation() (active, root, stateDir string, remote bool) {
 	if os.Getenv("HERDR_FORWARD_SKIP_MACHINE_ACTIVATION") == "1" {
 		return "", pluginRootOfSelf(), "", false
 	}
-	if root := pluginRootOfSelf(); root != "" {
-		if _, err := os.Stat(filepath.Join(root, "lib", "machines.sh")); err != nil {
-			return "", root, "", false
-		}
-	}
+	// Phase 5: the Bash machine module no longer exists.  The activation record
+	// is the Go-owned source of truth, so do not gate startup recovery on a
+	// retired lib/machines.sh path.
 	active = machine.ActiveID()
 	root = pluginRootOfSelf()
 	if active == "" {

@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=/dev/null
-source "${ROOT}/tests/lib/assertions.sh"
+source "${ROOT}/tests/assertions.sh"
 
 for tool in sshd ssh-keygen python3 jq ssh; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
@@ -36,7 +36,16 @@ SSH_USER="$(id -un)"
 A_STATE="${T}/A/herdr/plugins/zzjcool%3Aforward"
 B_STATE="${T}/B/herdr/plugins/zzjcool%3Aforward"
 mkdir -p "${A_STATE}" "${B_STATE}"
-FWD="${ROOT}/bin/forward"
+PLUGIN_ROOT="${T}/plugin"
+mkdir -p "${PLUGIN_ROOT}/bin"
+cp "${ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward"
+if [[ -x "${ROOT}/bin/forward-go" ]]; then
+  cp "${ROOT}/bin/forward-go" "${PLUGIN_ROOT}/bin/forward-go"
+else
+  (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${PLUGIN_ROOT}/bin/forward-go" ./cmd/forward)
+fi
+chmod 0755 "${PLUGIN_ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward-go"
+FWD="${PLUGIN_ROOT}/bin/forward"
 
 # 测试用更短的间隔（supervisor 在 A 侧，继承本进程环境）
 export BRIDGE_BACKOFF_MIN_S=1 BRIDGE_PING_S=1 BRIDGE_SERVER_ALIVE_S=5
@@ -213,7 +222,7 @@ SVC_PID=$!
 disown "${SVC_PID}" 2>/dev/null || true
 
 # A 的激活记录：B 已探测到插件（插件根 = 本检出，state = B_STATE）
-jq -n --arg root "${ROOT}" --arg sd "${B_STATE}" '
+jq -n --arg root "${PLUGIN_ROOT}" --arg sd "${B_STATE}" '
   {version: 1, active: "mB",
    machines: {mB: {label: "b-box", ssh_target: "b-box", server_root: $root,
                    state_dir: $sd, local: false, activated_unix: 1790000000}}}

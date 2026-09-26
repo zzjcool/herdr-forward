@@ -47,7 +47,7 @@ A_SERVER_ENV=(
 log() { printf '[two-machines] %s\n' "$*"; }
 
 # shellcheck source=/dev/null
-source "${PROJ}/tests/lib/assertions.sh"
+source "${PROJ}/tests/assertions.sh"
 out=""
 rc=0
 WAITED_RC=1
@@ -337,9 +337,9 @@ sleep 1
 t_describe "A：往正在运行的 herdr 里装插件 → 不重启、不手动重载，prefix+f 就能用"
 # herdr plugin install = 注册插件 + 运行 manifest 的 [[build]]；容器不出网，用 link 注册，
 # 再像 herdr 那样在插件根目录下跑同一个 build 命令（herdr 不给 build 注入任何 HERDR_* 变量）。
-run ax "herdr plugin link ${A_HOME}/plugin >/dev/null && cd ${A_HOME}/plugin && env -u HERDR_SOCKET_PATH bash scripts/postinstall.sh"
+run ax "herdr plugin link ${A_HOME}/plugin >/dev/null && cd ${A_HOME}/plugin && env -u HERDR_SOCKET_PATH HERDR_FORWARD_SKIP_DOWNLOAD=1 bash scripts/postinstall.sh"
 t_exit_ok 0 "${rc}" "安装（build 步骤）退出 0"
-t_contains "已装好键位" "${out}" "build 步骤装好了键位"
+t_match '已装好键位|键位：已写入|install-keys: 已写入' "${out}" "build 步骤装好了键位"
 t_contains "现在就可以按 prefix+f" "${out}" "build 步骤重载了正在运行的 herdr"
 ui_prefix f
 wait_for 10 ui_shows 'herdr-forward · Port Forward'

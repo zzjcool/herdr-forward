@@ -21,9 +21,9 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -f "${ROOT}/tests/lib/assertions.sh" ]]; then
+if [[ -f "${ROOT}/tests/assertions.sh" ]]; then
   # shellcheck source=/dev/null
-  source "${ROOT}/tests/lib/assertions.sh"
+  source "${ROOT}/tests/assertions.sh"
 fi
 if ! declare -F t_fail_note >/dev/null 2>&1; then
   t_fail_note() { t_fail "$@"; }
@@ -35,16 +35,24 @@ if ! declare -F t_skip >/dev/null 2>&1; then
 fi
 
 INSTALLER="${ROOT}/scripts/install-tabbar.sh"
-CLI="${ROOT}/bin/forward"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+PLUGIN_ROOT="${WORK}/plugin"
+mkdir -p "${PLUGIN_ROOT}/bin"
+cp "${ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward"
+if [[ -x "${ROOT}/bin/forward-go" ]]; then
+  cp "${ROOT}/bin/forward-go" "${PLUGIN_ROOT}/bin/forward-go"
+else
+  (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${PLUGIN_ROOT}/bin/forward-go" ./cmd/forward)
+fi
+chmod 0755 "${PLUGIN_ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward-go"
+CLI="${PLUGIN_ROOT}/bin/forward"
 for f in "${INSTALLER}" "${CLI}"; do
   if [[ ! -f "${f}" ]]; then
     echo "RED: 缺少 ${f}" >&2
     exit 1
   fi
 done
-
-WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
 
 # 与 herdr 真实布局同构：state 目录名 = <XDG_STATE_HOME>/herdr/plugins/<id 的 URL 编码>
 PLUGIN_STATE_DIR="${WORK}/xdg-state/herdr/plugins/zzjcool%3Aforward"
@@ -119,7 +127,7 @@ t_eq "" "${bare_view}" "无 env 时输出为空（读的是回退目录 ~/.local
 t_it "安装器写出的 command 带 state env 前缀，且指向插件 state 目录"
 rc=0
 env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
-  bash "${INSTALLER}" --config "${CONFIG}" --state-dir "${PLUGIN_STATE_DIR}" >/dev/null 2>"${WORK}/stderr" || rc=$?
+  bash "${INSTALLER}" --config "${CONFIG}" --plugin-root "${PLUGIN_ROOT}" --state-dir "${PLUGIN_STATE_DIR}" >/dev/null 2>"${WORK}/stderr" || rc=$?
 t_exit_ok 0 "${rc}" "install-tabbar.sh 退出 0"
 cmd="$(command_of "${CONFIG}")"
 if [[ "${cmd}" == *"HERDR_PLUGIN_STATE_DIR='${PLUGIN_STATE_DIR}'"* ]]; then
@@ -157,7 +165,7 @@ t_it "幂等：重跑安装器不重复插入、不改文件"
 before="$(md5sum "${CONFIG}" | awk '{print $1}')"
 rc=0
 env -u HERDR_PLUGIN_STATE_DIR XDG_STATE_HOME="${WORK}/xdg-state" \
-  bash "${INSTALLER}" --config "${CONFIG}" --state-dir "${PLUGIN_STATE_DIR}" >/dev/null 2>&1 || rc=$?
+  bash "${INSTALLER}" --config "${CONFIG}" --plugin-root "${PLUGIN_ROOT}" --state-dir "${PLUGIN_STATE_DIR}" >/dev/null 2>&1 || rc=$?
 t_exit_ok 0 "${rc}" "重跑退出 0"
 after="$(md5sum "${CONFIG}" | awk '{print $1}')"
 t_eq "${before}" "${after}" "文件未变（幂等）"

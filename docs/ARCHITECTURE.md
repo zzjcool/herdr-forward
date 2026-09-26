@@ -1,5 +1,9 @@
 # ARCHITECTURE — herdr-forward 冻结版架构与开发规范
 
+> **Phase 5 已完成**：自 `go-mig/phase5` 起，产品 Bash 模块与 Bash CLI 已退役；
+> `bin/forward` 是 POSIX shim，Release/离线安装由 `scripts/postinstall.sh` 完成。
+> 终态行为以 `go/internal/*`、`tests/difftest/golden.tsv` 与 Go E2E 为准。
+
 > 本文是开工前冻结的架构契约与开发规范。v1 实现期任何偏离必须先改本文（PR 里说明）再改代码。
 > 依据：PLAN.md（路线图）、RESEARCH.md（herdr 0.9.1 实测能力）。
 > 实现语言：bash（bin/forward），稳定后才考虑 Rust 重写；本文冻结的模块接口按
@@ -22,17 +26,17 @@ Port Forward pane + localhost 链接处理，全部 TDD、CI 基线拦截、E2E 
 
 ### A.1 目录树
 
+> 终态目录树以 Go 实现为准：`go/internal/{cli,state,tunnel,bridge,...}`；仓库不再包含产品 `lib/`。
+> `tests/assertions.sh` 只属于 Bash 测试 harness，不承载产品逻辑。
+
 ```
 herdr-forward/
 ├── herdr-plugin.toml          # manifest（开工时填 actions/panes/link_handlers）
 ├── bin/
 │   └── forward                # CLI 入口：唯一可执行文件，set -Eeuo pipefail，纯 dispatch
-├── lib/
-│   ├── common.sh              # 日志、错误、依赖检查、原子写、探活原语
-│   ├── state.sh               # forwards.json 读写（唯一状态权威）
-│   ├── machine.sh             # LABEL → ssh_target 解析（EndpointCatalog / machines.toml）
-│   ├── tunnel.sh              # ssh -L 隧道生命周期（ControlMaster 自建）
-│   └── notify.sh              # herdr socket API / notification 封装（可降级为 no-op）
+├── go/
+│   ├── cmd/forward/            # Release binary entrypoint
+│   └── internal/                # state/render/ports/machine/tunnel/bridge/panel/cli
 ├── scripts/
 │   ├── ci.sh                  # 基线拦截：lint + 全部测试，任一红即 exit 1
 │   ├── install-tabbar.sh      # 帮用户往 config.toml 加 tab_bar_right 条目
@@ -42,8 +46,7 @@ herdr-forward/
 │       ├── run-inside.sh      # 容器内测试主体（entrypoint 调用）
 │       └── run-bwrap.sh       # 降级备选：无 docker 环境用 bwrap（见 §C.5）
 ├── tests/
-│   ├── lib/
-│   │   └── assertions.sh      # 纯 bash 断言库（见 §B.1，零外部依赖）
+│   ├── assertions.sh          # 纯 bash 测试断言库（产品不依赖）
 │   ├── fixtures/
 │   │   └── forwards.*.json    # 状态文件 fixture（合法/损坏/空/多记录）
 │   ├── unit/                  # 每命令/每函数级，秒级，无网络无进程
@@ -53,7 +56,7 @@ herdr-forward/
 ```
 
 **归属规则（防写冲突）**：每个文件同时只有一个 writer（见 §D）；
-`tests/lib/assertions.sh`、`tests/run.sh`、`scripts/ci.sh` 归 T0。
+`tests/assertions.sh`、`tests/run.sh`、`scripts/ci.sh` 归测试基础设施 writer。
 
 ### A.2 数据契约（state.sh 冻结，一期就含 publish 字段占位）
 
@@ -86,7 +89,7 @@ CI/沙箱里始终显式设 env）：
 - `ssh_target` 冒号带端口（解析结果落盘，remove/doctor 不再二次解析）
 - `publish` 为二期占位，一期恒为 null
 
-### A.3 函数签名冻结（lib/*.sh）
+### A.3 函数签名冻结（retired Bash modules）
 
 ```bash
 # common.sh
@@ -190,12 +193,12 @@ notify_toast <title> <body>                    # herdr socket API / notification
 用户新 UX：A 装插件 → 面板列出 saved machines（置灰）→ 主动激活 → SSH 只读探测 B
 → 已装则自动写 A 的 client config（tab bar 指向 B + 键位），未装则递安装命令。
 接口（详细签名见 /tmp 计划归档与对应测试）：
-- `lib/ssh-probe.sh`：ssh_probe_parse_target / ssh_probe_run（timeout 15 外层 +
+- `retired Bash SSH probe module`：ssh_probe_parse_target / ssh_probe_run（timeout 15 外层 +
   ssh -n BatchMode）/ ssh_probe_plugin（HF_STATUS 四态 + HF_ROOT/HF_STATE_DIR）/ kv_get
-- `lib/machines.sh`：machines_herdr_list_json（HERDR_BIN_PATH 透传，缺/败/非 JSON →
+- `retired Bash machines module`：machines_herdr_list_json（HERDR_BIN_PATH 透传，缺/败/非 JSON →
   "[]"+warn 不 die）/ activated-machines.json CRUD（{version,active,machines} schema，
   损坏容错）/ machines_view_json（合并视图单一权威）/ machines_is_local_target
-- `bin/forward machines list|activate|deactivate|doctor`；面板（lib/panel.sh）只是
+- `bin/forward machines list|activate|deactivate|doctor`；面板（retired Bash panel module）只是
   CLI 包装，CLI 直调等价；startup-hook 按 active 记录智能写 tab bar（同机本机路径 /
   远端 B 路径），恒 exit 0
 - 退出码补充：64 用法错误 / 1 激活半成品（记录已写但安装器失败）
@@ -315,11 +318,11 @@ action = "noop"                                                 # 占位：一�
 
 ### B.1 测试框架：自写纯 bash 断言库（不引入 bats）
 
-`tests/lib/assertions.sh`（约 80 行，TDD 第 0 步先写它 + 自测）：
+`tests/assertions.sh`（约 80 行，TDD 第 0 步先写它 + 自测）：
 
 ```bash
 #!/usr/bin/env bash
-# 零依赖断言库。每个测试文件 source 本库 + 被测 lib/*.sh。
+# 零依赖断言库。每个测试文件 source 本库 + 被测 retired Bash modules。
 set -Eeuo pipefail
 PASS=0; FAIL=0
 t_describe <name>          # 分组（纯标签）
@@ -343,7 +346,7 @@ run <func> [args...]                # set +e 包裹，捕获 $out/$err/$rc
 
 | 层 | 目录 | 特征 | 允许的副作用 |
 |---|---|---|---|
-| 单测 | tests/unit | source lib/*.sh 直接调函数；状态用 `TMPDIR=$(mktemp -d)` + fixture；**零网络零进程**（tunnel.sh 只测参数拼装） | 仅 TMPDIR |
+| 单测 | tests/unit | source retired Bash modules 直接调函数；状态用 `TMPDIR=$(mktemp -d)` + fixture；**零网络零进程**（tunnel.sh 只测参数拼装） | 仅 TMPDIR |
 | 集成 | tests/integration | 本机用户态 sshd（高端口 22022+，host key 在 TMPDIR）+ 真 ssh -L + nc 回环；随机端口段防冲突；trap 清理 + `t_no_zombie_ssh` 收尾 | TMPDIR + 临时高端口 |
 | E2E | tests/e2e | 只在 docker 容器（主）/bwrap（降级）里跑完整用户流 | 仅沙箱内 |
 
@@ -370,13 +373,9 @@ for c in shellcheck shfmt jq; do
   command -v "$c" >/dev/null || fail "$c 未安装"
 done
 
-echo "== 1/6 shellcheck（严格） =="
-shellcheck -x -S style -o all bin/forward lib/*.sh tests/lib/*.sh tests/**/*.sh scripts/*.sh \
-  || fail "shellcheck"
-
-echo "== 2/6 shfmt =="
-shfmt -d -ln bash -i 2 bin/forward lib/*.sh tests/lib/*.sh scripts/*.sh \
-  || fail "shfmt 格式不一致（跑 shfmt -w）"
+echo "== Phase 5 final gate =="
+# 终态目标由 scripts/ci.sh 动态收集（shim、postinstall、wrapper、测试 runner）。
+bash scripts/ci.sh
 
 echo "== 3/6 unit =="
 bash tests/run.sh unit        || fail "unit"
@@ -478,7 +477,7 @@ docker run --rm \
 ```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
-source /plugin-src/tests/lib/assertions.sh
+source /plugin-src/tests/assertions.sh
 
 # 0) 准备：源码复制到可写区 + 假 HOME
 cp -r /plugin-src /work
@@ -573,23 +572,23 @@ env（HOME/XDG_*/HERDR_PLUGIN_*）→ 执行同构测试脚本。红线：绝不
 
 ## D. 任务拆解（TDD 顺序，3 worker 并行）
 
-写冲突规则：每文件唯一 writer；`tests/lib/assertions.sh`、`tests/run.sh`、
+写冲突规则：每文件唯一 writer；`tests/assertions.sh`、`tests/run.sh`、
 `scripts/ci.sh`、`scripts/e2e/*` 归 T0。**每个任务的第一步都是先写失败测试（红），
 实现让测试变绿后才算交付。**
 
 ```
 T0 (串行, 1 worker, ~半天)
  └─ T1 状态层+CLI 核心  ──┬─ 可并行
- └─ T2 隧道管理+doctor ──┤   (T2 硬依赖 = T1 首交付的 lib/state.sh 骨架, <2h)
+ └─ T2 隧道管理+doctor ──┤   (T2 硬依赖 = T1 首交付的 retired Bash state module 骨架, <2h)
  └─ T3 展示层+herdr 集成 ──┘
 T4 (串行收尾, 主 agent 或任一 worker)
 ```
 
 | 任务 | 归属文件（唯一 writer） | 依赖 | TDD 顺序 | 验收标准 |
 |---|---|---|---|---|
-| **T0 测试地基 + E2E 容器** | tests/lib/assertions.sh、tests/run.sh、scripts/ci.sh、scripts/e2e/{Dockerfile,run-docker.sh,run-inside.sh,run-bwrap.sh} | 无 | ①断言库自测（红：空实现→绿：实现）②ci.sh 骨架对空 lib 报红、对空测试绿 ③build E2E 镜像 + 容器内 sshd/nc 回环空转探通（C.4 模式 A/B 探测定型） | `bash tests/run.sh unit` 自测绿；`bash scripts/e2e/run-docker.sh` 容器内 sshd 起来 + `nc 127.0.0.1 22022` TCP 握手 + 回显断言绿；docker 不可用路径跑 run-bwrap.sh 绿；§G 假设#6/#7 打勾或标注降级 |
-| **T1 状态层 + CLI 核心** | lib/common.sh、lib/state.sh、bin/forward、tests/unit/{test_common,test_state,test_cli}.sh、tests/fixtures/* | T0 | fixture 先行 → state_load/save（原子写、损坏容错）→ forward_add/remove/get/list_json → bin/forward dispatch + `add --ssh-target` + `list --json` | unit 全绿；损坏 JSON 容错用例绿；重复端口 die 2 用例绿；shellcheck/shfmt 干净；**首交付物 lib/state.sh 骨架（A.3 签名）解锁 T2** |
-| **T2 隧道管理 + doctor + machine 解析** | lib/tunnel.sh、lib/machine.sh、lib/notify.sh、tests/unit/{test_tunnel_args,test_machine}.sh、tests/integration/{test_sshd_roundtrip,test_doctor}.sh | T0 + T1 的 state.sh 骨架 | tunnel 参数拼装单测（红→绿）→ machine.toml 解析单测 → 集成：本机用户态 sshd（TMPDIR host key、22022+随机端口）→ tunnel_start/stop/alive/probe → doctor --fix/--prune；EndpointCatalog socket 路径单测 mock，真调用留宿主 smoke | integration：nc 回环经隧道数据验证绿；kill sshd 后 doctor --fix 修 down 绿；`t_no_zombie_ssh` 绿；machine 解析/失败 die 4 用例绿 |
+| **T0 测试地基 + E2E 容器** | tests/assertions.sh、tests/run.sh、scripts/ci.sh、scripts/e2e/{Dockerfile,run-docker.sh,run-inside.sh,run-bwrap.sh} | 无 | ①断言库自测（红：空实现→绿：实现）②ci.sh 骨架对空 lib 报红、对空测试绿 ③build E2E 镜像 + 容器内 sshd/nc 回环空转探通（C.4 模式 A/B 探测定型） | `bash tests/run.sh unit` 自测绿；`bash scripts/e2e/run-docker.sh` 容器内 sshd 起来 + `nc 127.0.0.1 22022` TCP 握手 + 回显断言绿；docker 不可用路径跑 run-bwrap.sh 绿；§G 假设#6/#7 打勾或标注降级 |
+| **T1 状态层 + CLI 核心** | retired Bash common module、retired Bash state module、bin/forward、tests/unit/{test_common,test_state,test_cli}.sh、tests/fixtures/* | T0 | fixture 先行 → state_load/save（原子写、损坏容错）→ forward_add/remove/get/list_json → bin/forward dispatch + `add --ssh-target` + `list --json` | unit 全绿；损坏 JSON 容错用例绿；重复端口 die 2 用例绿；shellcheck/shfmt 干净；**首交付物 retired Bash state module 骨架（A.3 签名）解锁 T2** |
+| **T2 隧道管理 + doctor + machine 解析** | retired Bash tunnel module、retired Bash machine module、retired Bash notify module、tests/unit/{test_tunnel_args,test_machine}.sh、tests/integration/{test_sshd_roundtrip,test_doctor}.sh | T0 + T1 的 state.sh 骨架 | tunnel 参数拼装单测（红→绿）→ machine.toml 解析单测 → 集成：本机用户态 sshd（TMPDIR host key、22022+随机端口）→ tunnel_start/stop/alive/probe → doctor --fix/--prune；EndpointCatalog socket 路径单测 mock，真调用留宿主 smoke | integration：nc 回环经隧道数据验证绿；kill sshd 后 doctor --fix 修 down 绿；`t_no_zombie_ssh` 绿；machine 解析/失败 die 4 用例绿 |
 | **T3 展示层 + herdr 集成** | herdr-plugin.toml、scripts/install-tabbar.sh、tests/unit/{test_oneline,test_install_tabbar,test_link_pattern}.sh、README 安装章节 | T0 + T1 的 `list --oneline` 签名（实现可后交，按契约 stub） | oneline 四场景单测（空/单/多/>6 截断）→ link pattern bash regex 同构单测 → installer 对临时 config.toml 副本的幂等插入断言 → 填 manifest | oneline 全场景单测绿；installer 幂等（重复跑不重复插入）；manifest 宿主 `herdr plugin link` 一次性 smoke 被接受 |
 | **T4 收尾：全链路 E2E + 发布检查** | docs/、tests/e2e/（补全断言）、PLAN.md 勾验收 | T1+T2+T3 全交付 | 补全 C.3 步骤 4–5 断言到 run-inside.sh → 模式 A/B 各跑一轮 → 对抗式 review（fresh-context pi ×2）→ PLAN 一期验收逐条勾 | `scripts/ci.sh` 一次全绿；§G 清单逐条标注已验证/降级/待宿主 smoke；无僵尸进程残留 |
 
@@ -637,3 +636,18 @@ T4 (串行收尾, 主 agent 或任一 worker)
 | 6 | docker 容器内挂载宿主 herdr 可跑（glibc 兼容）+ 假 HOME 隔离成立 | **T0 E2E spike（C.4 模式 A/B 探测）**：`docker run -v /usr/bin/herdr:ro ... herdr --version` + 容器内断言 herdr 状态落点在假 HOME |
 | 7 | 容器内用户态 sshd + 公钥登录可行 | **T0 E2E spike**：run-inside.sh 步骤 1–2 空转探通（sshd 起来 + nc 握手 + 回显） |
 | 8 | herdr `plugin link` 是否要求 TTY | 宿主 smoke（F-1 关联）：`herdr plugin link < /dev/null` 观察行为 |
+
+## H. Phase 5 终态（Go + Releases）
+
+Phase 5 已完成（本地 tag `go-mig/phase5`）：产品逻辑由 `go/internal/*` 与
+`cmd/forward` 承载；仓库不再包含 `retired Bash modules`，`bin/forward` 仅保留 POSIX
+shim。Release 安装由 `scripts/postinstall.sh` 在二进制存在前完成，下载平台包后
+校验 `checksums.txt`，再调用 `forward internal install-keys` 与
+`herdr server reload-config`。离线/local build 使用
+`HERDR_FORWARD_SKIP_DOWNLOAD=1`，镜像使用 `HERDR_FORWARD_BIN_BASE`。
+
+Phase 5 测试裁决：旧 Bash 内部函数单测与 Bash 差分侧退役；`tests/difftest/run.sh`
+固定 438 个 Go-only golden case，`tests/difftest/golden.tsv` 以 base64 保存 stdout
+和退出码，防止后续 Go 重构改变逐字节契约。端口列表测试只把 PROCESS 当作平台相关
+附加信息，端口/地址 JSON 列是稳定断言；docker/bwrap E2E 继续保留真实 sshd、隧道、
+桥接、面板断言。

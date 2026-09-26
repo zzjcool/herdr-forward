@@ -106,160 +106,23 @@ view a saved machine B, `prefix+f` is resolved from **B's** config. Activating B
 from the panel sets up B's keys for you — see
 [Remote development](#remote-development-bs-ports-on-as-localhost).)
 
-**B. What still takes one step (cross-machine).** `tab_bar_right` is
-*presentation* config owned by the client, even though the `command` inside it
-runs on the *server*. When you attach from machine A to a server on machine B,
-the plugin process on B cannot reach A's filesystem — a physical boundary, not
-an oversight. In that case:
+**B. Cross-machine activation.**  The final Go binary owns the remote-machine
+workflow.  On A, activate a saved machine from the Port Forward panel or run
+`forward machines activate <id>`.  The command performs a bounded read-only SSH
+probe, records the remote plugin/state paths, installs the remote UI when
+consented, and starts the HF1 bridge.  If the remote plugin is absent, use the
+printed command on B and retry; activation never silently installs software.
 
-- On B (the server), the startup hook writes **B's own** config only; nothing is
-  written to A. Since keybindings are client config too, A does not inherit B's
-  either — A needs its own copy of both.
-- On **A**, run the client setup — the remote-session / special-case fallback. A
-  attaches to B *over SSH*, so the installer can use that same channel to probe
-  B for real — you do not even need to look up B's paths:
-
-  ```sh
-  curl -fsSL https://raw.githubusercontent.com/zzjcool/herdr-forward/main/scripts/setup-client.sh \
-    | bash -s -- --server-host <B 的 ssh target>
-  ```
-
-  `<B 的 ssh target>` is what you would pass to `ssh`, e.g. `me@b-host` or
-  `me@b-host:2222`. That is the whole command — the plugin root and the state
-  directory are derived from B over SSH. The probe is read-only
-  (`timeout 15 ssh -n -o BatchMode=yes -o ConnectTimeout=8` — `-n` matters because
-  in the `curl … | bash -s` form the script itself arrives on stdin and `ssh` would
-  otherwise swallow the rest of it), and:
-
-  - **B has the plugin** → ✅ plus B's real `plugin_root` and state dir, which
-    are then used for A's config automatically (`--server-root` /
-    `--server-state-dir` are not needed). B's state dir is taken from B (its
-    `$XDG_STATE_HOME`/`$HOME`), *not* derived from A's home — that is what keeps
-    the tab bar reading the same `forwards.json` your panel writes.
-  - **B does not have the plugin** → prints the command to run, and does not run
-    it for you (we will not install software on your server behind your back):
-    `ssh <B 的 ssh target> 'herdr plugin install zzjcool/herdr-forward --yes'`.
-    Install it there, then re-run this command. If tab-bar setup cannot continue
-    without the root, the installer exits 2 *after* printing that command.
-  - **Cannot reach B** (no passwordless SSH, wrong host/port, `herdr` not on the
-    non-interactive `PATH`) → degrades to the local best-effort probe plus the
-    hand checklist below, prints the reason, and still installs whatever it can
-    from the arguments you did pass. A failed probe never blocks the install.
-
-  Prefer a local copy? `git clone` the repo and run the same script from the
-  checkout — it then uses the installers sitting next to it and needs no network:
-
-  ```sh
-  git clone https://github.com/zzjcool/herdr-forward
-  ./herdr-forward/scripts/setup-client.sh --server-host <B 的 ssh target>
-  ```
-
-  Omitting `--server-host` keeps the old behaviour: no SSH probing, you pass
-  `--server-root` yourself and the script prints the checklist to confirm by hand:
-
-  ```sh
-  ./herdr-forward/scripts/setup-client.sh --server-root <B 的插件根>
-  ```
-
-  `<B 的插件根>` is the path to this plugin's checkout on the **server (B)** —
-  find it with `herdr plugin list` on B, or read `plugin_root` in B's
-  `~/.config/herdr/plugins.json`. Either way the script:
-
-  - validates the arguments, then calls `install-tabbar.sh` (writing B's plugin
-    root + B's state dir into A's `tab_bar_right` command) and `install-keys.sh`
-    (the three `[[keys.command]]` plugin-action bindings); both are idempotent and
-    back up A's config first,
-  - derives B's state dir from the `id` in B's `herdr-plugin.toml` when it cannot
-    probe B and you omit `--server-state-dir` (override with
-    `--server-state-dir <B 的 state 目录>`; it defaults to
-    `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward`
-    *on B*),
-  - prints the reload hint plus a **B-side checklist** — whether B has `jq`/`ssh`
-    and whether A→B is passwordless. Without `--server-host` nothing can be probed
-    from A (herdr's socket API exposes no machine/plugin enumeration and plugins
-    never run cross-machine), so it is a checklist to confirm by hand; with
-    `--server-host` the plugin question is answered for real over SSH.
-
-  Options: `--config PATH` (A's config, default
-  `$XDG_CONFIG_HOME/herdr/config.toml` → `~/.config/herdr/config.toml`),
-  `--server-host TARGET` (`user@host[:port]`), `--server-root PATH`,
-  `--server-state-dir PATH`, `--no-keys`, `--no-tabbar`, `--dry-run`.
-
-  Press `prefix+q` (or `herdr server reload-config`) on A afterwards to apply it.
-
-<details>
-<summary>Manual fallback — paste the TOML by hand</summary>
-
-The blocks below are byte-for-byte what the installers write (a drift test keeps
-it that way). `<server-plugin-root>` is the path to this plugin's checkout on the
-*server* (B) — not on A. The tab-bar `command` is executed by herdr *on the
-server*, under `/bin/sh -lc`, in an environment that does **not** contain
-`HERDR_PLUGIN_ROOT` (that variable is only injected for plugin actions, panes
-and startup commands) **nor `HERDR_PLUGIN_STATE_DIR`** (same reason). So the
-command must be a literal absolute path that exists on B, plus an explicit
-`env HERDR_PLUGIN_STATE_DIR=…` prefix pointing at **B's** plugin state directory
-— `<XDG_STATE_HOME>/herdr/plugins/zzjcool%3Aforward`
-(`~/.local/state/herdr/plugins/zzjcool%3Aforward` by default, on B). Without that
-prefix `bin/forward` falls back to `~/.local/state/herdr-forward`, so the tab bar
-reads a different `forwards.json` than the one your panel writes — the status bar
-would always be blank.
-
-A's `~/.config/herdr/config.toml`:
-
-```toml
-[ui]
-tab_bar_right = [
-  # herdr-forward: tab bar status entry (managed by scripts/install-tabbar.sh)
-  { type = "command", command = "env HERDR_PLUGIN_STATE_DIR='<server-state-dir>' \"<server-plugin-root>/bin/forward\" list --oneline", interval_seconds = 5, timeout_seconds = 2 },
-]
-```
-
-and, for the keybindings:
-
-```toml
-# herdr-forward: keybindings (managed by scripts/install-keys.sh)
-[[keys.command]]
-key = "prefix+f"
-type = "plugin_action"
-command = "zzjcool:forward.add"
-description = "Port Forward: Add / open panel"
-
-[[keys.command]]
-key = "prefix+shift+f"
-type = "plugin_action"
-command = "zzjcool:forward.list"
-description = "Port Forward: List forwards"
-
-[[keys.command]]
-key = "prefix+alt+f"
-type = "plugin_action"
-command = "zzjcool:forward.doctor"
-description = "Port Forward: Doctor (probe tunnels)"
-```
-
-Or, equivalently, call the installer from a checkout on A (it accepts the same
-cross-machine flags):
+For a local checkout, build the binary first:
 
 ```sh
-# on A, pointing at B's plugin checkout and B's state dir
-<plugin-root>/scripts/bootstrap.sh --config ~/.config/herdr/config.toml \
-  --plugin-root <server-plugin-root> \
-  --state-dir <server-state-dir>
+make build
+HERDR_FORWARD_SKIP_DOWNLOAD=1 ./bin/forward internal install-keys
 ```
 
-If it is already installed with the old `$HERDR_PLUGIN_ROOT` form, or with the
-absolute-path form that predates the state-env fix, just re-run the command
-above: the installer detects the stale entry and rewrites it in
-place (keeping your `interval_seconds`/`timeout_seconds`).
-
-</details>
-
-If you are already in a herdr session on the server, the same one-shot install is
-available as a plugin action (useful right after `herdr plugin link`):
-
-```sh
-herdr plugin action invoke bootstrap --plugin zzjcool:forward
-```
+The skip flag is intended for offline E2E and local development only.  A normal
+release installation downloads the matching static binary from GitHub Releases
+and verifies `checksums.txt` before any keybinding is changed.
 
 #### The installers
 
@@ -268,7 +131,6 @@ herdr plugin action invoke bootstrap --plugin zzjcool:forward
 | `scripts/install-tabbar.sh` | `[ui].tab_bar_right` command entry showing `⇅3000⇅5173` | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--command CMD`, `--dry-run` |
 | `scripts/install-keys.sh` | 3 `[[keys.command]]` plugin-action bindings | `--config PATH`, `--add-key/--list-key/--doctor-key`, `--dry-run` |
 | `scripts/bootstrap.sh` | both of the above + next steps | `--config PATH`, `--plugin-root PATH`, `--state-dir PATH`, `--dry-run`, `--no-tabbar`, `--no-keys`, key overrides |
-| `scripts/setup-client.sh` | both of the above, for a **client A** attaching to a **server B** — no plugin install on A. The remote-session / special-case fallback (the same-machine startup hook covers the common case) | `--config PATH`, `--server-host TARGET` (SSH probe of B: auto-derives B's root/state dir), `--server-root PATH`, `--server-state-dir PATH`, `--no-tabbar`, `--no-keys`, `--dry-run`; also runs via `curl … \| bash` |
 | `scripts/startup-hook.sh` | the `[[startup]]` hook: calls `install-tabbar.sh` **and** `install-keys.sh` (the automatic tab bar + keybindings; notifies what it installed, skips on key conflict) | never fails the server; degrades to a log line cross-machine; points the tab bar at the **active machine** when one is activated (see below) |
 
 All of them are idempotent (a marker comment identifies our entries) and back up
@@ -323,8 +185,39 @@ exactly what a plain terminal lacks, and that difference is the usual cause.
 Saved-machine targets **may be `ssh://user@host:port` URIs** (what `herdr machine
 add` stores), not bare `user@host`. Older builds passed the scheme straight to
 `ssh`, which then failed to resolve the host; the A-machine fixture for that
-shape lives in `tests/unit/test_machines_uri_targets.sh` and the container-side
+shape lives in `tests/difftest/run.sh` and the container-side
 `A3` stage of `scripts/e2e/run-inside.sh`.
+
+## Release installation and offline development
+
+`herdr plugin install zzjcool/herdr-forward` runs `scripts/postinstall.sh` before
+`forward-go` exists.  The POSIX installer maps `uname -s`/`uname -m` to one of
+`linux_amd64`, `linux_arm64`, `darwin_amd64`, or `darwin_arm64`, downloads
+`herdr-forward_<version>_<os>_<arch>.tar.gz` and `checksums.txt`, verifies the
+SHA-256 with `sha256sum` or `shasum -a 256`, and atomically installs
+`bin/forward-go`.  It then runs `forward internal install-keys` and attempts
+`herdr server reload-config`.
+
+Useful controls:
+
+- `HERDR_FORWARD_BIN_BASE=<mirror>/...` overrides the Release download base;
+- `HERDR_FORWARD_SKIP_DOWNLOAD=1` skips the network for offline E2E/local builds
+  (an existing executable `bin/forward-go` is still required);
+- missing fetch tools, unsupported platforms, bad checksums, and malformed
+  archives fail with exit 1 and print the `git clone … && make build` recovery.
+
+For local development:
+
+```sh
+make build
+HERDR_FORWARD_SKIP_DOWNLOAD=1 ./scripts/postinstall.sh
+./bin/forward list
+```
+
+Release smoke is intentionally separate from CI: after publishing a tagged
+release, run `HERDR_E2E_ONLINE=1 bash scripts/e2e/run-real-install.sh` and follow
+the [release checklist](docs/RELEASE-CHECKLIST.md), including the macOS smoke
+checklist from PLAN-GO-MIGRATION §11.
 
 ## Usage
 
@@ -338,15 +231,10 @@ bin/forward watch                             # the Port Forward panel (see belo
 bin/forward bootstrap                         # (re)install the UI / print next steps
 ```
 
-Run it from the plugin checkout (or as `"$HERDR_PLUGIN_ROOT/bin/forward"` in a
-herdr plugin context — note that this env var is **not** set for tab-bar
-commands, which is why the installer writes an absolute path there; the same
-goes for `HERDR_PLUGIN_STATE_DIR`, which is why the installer also writes an
-explicit `env HERDR_PLUGIN_STATE_DIR=…` prefix). A bare `bin/forward` invoked
-outside a herdr plugin context has no `HERDR_PLUGIN_STATE_DIR`, so it falls back
-to `~/.local/state/herdr-forward` and will look empty even while the panel shows
-active forwards — pass the variable explicitly if you want to inspect the
-plugin's real state:
+The `bin/forward` path is a small POSIX shim; all commands execute in the
+release Go binary next to it. A normal install supplies the plugin state directory
+through herdr. For a manual invocation, set `HERDR_PLUGIN_STATE_DIR` explicitly
+if you want to inspect a non-default state directory:
 
 ```sh
 HERDR_PLUGIN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/zzjcool%3Aforward" \
@@ -415,7 +303,7 @@ reads `activated-machines.json` and, if the active machine is a *remote* one,
 points the tab bar at that machine's plugin root and state dir (no SSH probe on
 the startup path: it must be instant, so it trusts what activation recorded).
 Anything unexpected — no active machine, an active one that is this host,
-a truncated record, a corrupt JSON file, a missing `lib/machines.sh` — degrades
+a truncated record, a corrupt JSON file, a missing machine record — degrades
 to the plain local behaviour, and the hook always exits 0.
 
 ## Remote development: B's ports on A's localhost

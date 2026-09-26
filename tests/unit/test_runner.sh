@@ -13,8 +13,8 @@ if [[ ! -f "${RUNNER}" ]]; then
   exit 1
 fi
 
-# shellcheck source=tests/lib/assertions.sh
-source "${REPO_ROOT}/tests/lib/assertions.sh"
+# shellcheck source=tests/assertions.sh
+source "${REPO_ROOT}/tests/assertions.sh"
 
 TMPDIR_T0="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR_T0}"' EXIT
@@ -23,9 +23,9 @@ trap 'rm -rf "${TMPDIR_T0}"' EXIT
 fake_repo() {
   local root="${TMPDIR_T0}/repo-$1"
   rm -rf "${root}"
-  mkdir -p "${root}/tests/lib" "${root}/tests/unit" "${root}/tests/integration" "${root}/tests/e2e"
+  mkdir -p "${root}/tests/unit" "${root}/tests/integration"
   cp "${RUNNER}" "${root}/tests/run.sh"
-  cp "${REPO_ROOT}/tests/lib/assertions.sh" "${root}/tests/lib/assertions.sh"
+  cp "${REPO_ROOT}/tests/assertions.sh" "${root}/tests/assertions.sh"
   printf '%s\n' "${root}"
 }
 
@@ -70,16 +70,16 @@ t_is 1 "${rc}" "有失败文件时必须 rc=1"
 t_contains "a-ran" "${out}" "失败文件被执行"
 t_contains "b-ran" "${out}" "失败后仍继续执行后续文件"
 
-t_it "缺失层：显式 SKIP 输出，不静默、不改 rc（T0 无 integration/e2e 测试）"
+t_it "缺失层：显式 SKIP 输出，不静默、不改 rc"
 root="$(fake_repo empty)"
-rmdir "${root}/tests/integration" "${root}/tests/e2e"
+rmdir "${root}/tests/integration"
 run bash "${root}/tests/run.sh" all
 t_is 0 "${rc}" "无测试文件时 rc=0（否则 T0 阶段 ci 无法绿）"
 t_contains "SKIP" "${out}" "缺失层必须显式 SKIP 提示"
 
-t_it "all 层：按 unit/integration/e2e 顺序执行"
+t_it "all 层：按 unit/integration 顺序执行"
 root="$(fake_repo all)"
-for layer in unit integration e2e; do
+for layer in unit integration; do
   cat >"${root}/tests/${layer}/test_${layer}.sh" <<EOS
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -93,19 +93,7 @@ run bash "${root}/tests/run.sh" all
 t_is 0 "${rc}" "all 全绿 rc=0"
 order_file="$(tr '\n' ' ' <"${TMPDIR_T0}/order.txt" || true)"
 order_trimmed="${order_file% }"
-t_is "unit integration e2e" "${order_trimmed}" "执行顺序 unit→integration→e2e"
-
-t_it "e2e 层单独指定"
-root="$(fake_repo e2eonly)"
-cat >"${root}/tests/e2e/test_only.sh" <<'EOS'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-echo "e2e-only-ran"
-exit 0
-EOS
-run bash "${root}/tests/run.sh" e2e
-t_is 0 "${rc}" "e2e 单层 rc=0"
-t_contains "e2e-only-ran" "${out}" "e2e 文件被执行"
+t_is "unit integration" "${order_trimmed}" "执行顺序 unit→integration"
 
 t_it "未知层参数：必须报错非零退出"
 run bash "${root}/tests/run.sh" nonsense

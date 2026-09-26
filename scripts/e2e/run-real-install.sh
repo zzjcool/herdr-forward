@@ -41,7 +41,7 @@ done
 }
 
 # shellcheck source=/dev/null
-source "${PROJ}/tests/lib/assertions.sh"
+source "${PROJ}/tests/assertions.sh"
 rc=0
 WAITED_RC=1
 
@@ -127,9 +127,32 @@ installed_sha() {
   jq -r '.[] | select(.plugin_id == "zzjcool:forward") | .source.resolved_commit // empty' \
     "${ROOT}/home/.config/herdr/plugins.json" 2>/dev/null || true
 }
-# postinstall_log -> stdout: build 步骤自己的日志（herdr 成功时不回显 build 的输出）
-postinstall_log() {
-  cat "${ROOT}/home/.local/state/herdr/plugins/zzjcool%3Aforward/logs/postinstall.log" 2>/dev/null || true
+installed_plugin_root() {
+  jq -r '.[] | select(.plugin_id == "zzjcool:forward") | .plugin_root // empty' \
+    "${ROOT}/home/.config/herdr/plugins.json" 2>/dev/null || true
+}
+keys_installed() {
+  local count=""
+  count="$(
+    python3 - "${ROOT}/home/.config/herdr/config.toml" <<'PY' 2>/dev/null || true
+import sys, tomllib
+try:
+    doc = tomllib.load(open(sys.argv[1], "rb"))
+except Exception:
+    print(0)
+else:
+    print(sum(1 for e in (doc.get("keys", {}).get("command", []) or [])
+              if str(e.get("command", "")).startswith("zzjcool:forward.")))
+PY
+  )"
+  [[ "${count}" == 3 ]] && printf 'yes\n'
+  return 0
+}
+release_binary_installed() {
+  local root=""
+  root="$(installed_plugin_root)"
+  [[ -x "${root}/bin/forward-go" ]] && printf 'yes\n'
+  return 0
 }
 startup_hook_done() {
   local logs="" n=""
@@ -204,8 +227,10 @@ t_exit_ok 0 "${rc}" "herdr plugin install 升级（server 保持运行）"
 sha="$(installed_sha)"
 t_match '^[0-9a-f]{40}$' "${sha}" "registry 记录了新的 resolved_commit"
 t_isnt "${OLD_SHA}" "${sha}" "已不是旧版（现在 @${sha:0:7}）"
-log_text="$(postinstall_log)"
-t_contains "keys already installed" "${log_text}" "升级时 build 步骤发现键位已在，不重复写"
+wait_for 10 keys_installed
+t_exit_ok 0 "${WAITED_RC}" "升级后仍保留 3 条键位（build 幂等）"
+wait_for 10 release_binary_installed
+t_exit_ok 0 "${WAITED_RC}" "升级后 Release forward-go 已安装"
 check_new_panel
 
 # --- 场景 2：全新用户 -------------------------------------------------------------
@@ -219,9 +244,10 @@ ui_prefix q
 sleep 1
 install_new
 t_exit_ok 0 "${rc}" "herdr plugin install 退出 0"
-log_text="$(postinstall_log)"
-t_contains "keys installed" "${log_text}" "安装的 build 步骤写入了键位"
-t_contains "reloaded" "${log_text}" "并重载了正在运行的 herdr"
+wait_for 10 keys_installed
+t_exit_ok 0 "${WAITED_RC}" "安装的 build 步骤写入了 3 条键位"
+wait_for 10 release_binary_installed
+t_exit_ok 0 "${WAITED_RC}" "安装的 build 步骤下载了 Release binary"
 check_new_panel
 
 t_done

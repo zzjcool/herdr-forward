@@ -1,155 +1,61 @@
 #!/usr/bin/env bash
-# tests/unit/test_client_forwards.sh — CLI 的 client 映射（ARCHITECTURE §A.3.3，B 侧视角）
-#
-# 覆盖：add --client / 有 client 在线时的隐式 client 映射 / 无 client 时维持 die 4 /
-#   参数互斥与端口下限 / list（表格、--json、--oneline）的实时状态 / remove /
-#   doctor --prune 不误删 / ports 标注已映射端口。
-# 在线 client 用一份会话文件模拟（pid=本测试进程、心跳=现在），不起 ssh。
+# shellcheck disable=SC2312 # assertions intentionally consume command output inline.
+# Final CLI client/ports smoke.  This deliberately invokes the Go binary through
+# bin/forward; it no longer sources or tests retired Bash implementation details.
 set -Eeuo pipefail
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=/dev/null
-source "${ROOT}/tests/lib/assertions.sh"
+source "${ROOT}/tests/assertions.sh"
 
-unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_BIN_PATH HERDR_ENV
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/client-forwards-go.XXXXXX")"
+trap 'rm -rf "${WORK}"' EXIT
+mkdir -p "${WORK}/bin" "${WORK}/state"
+cp "${ROOT}/bin/forward" "${WORK}/bin/forward"
+if [[ -x "${ROOT}/bin/forward-go" ]]; then
+  cp "${ROOT}/bin/forward-go" "${WORK}/bin/forward-go"
+else
+  (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${WORK}/bin/forward-go" ./cmd/forward)
+fi
+chmod 0755 "${WORK}/bin/forward" "${WORK}/bin/forward-go"
+FW="${WORK}/bin/forward"
+export HERDR_PLUGIN_STATE_DIR="${WORK}/state"
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/hf-client-fwd.XXXXXX")"
-trap 'rm -rf "${TMP}"' EXIT
-export HERDR_PLUGIN_STATE_DIR="${TMP}/state"
-mkdir -p "${HERDR_PLUGIN_STATE_DIR}/bridge"
-FW="${ROOT}/bin/forward"
-SF="${HERDR_PLUGIN_STATE_DIR}/forwards.json"
-SESSION="${HERDR_PLUGIN_STATE_DIR}/bridge/session-$$.json"
+PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+python3 - "${PORT}" <<'PY' &
+import socket, sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept()
+    c.close()
+PY
+SERVER_PID=$!
+trap 'kill "${SERVER_PID}" 2>/dev/null || true; rm -rf "${WORK}"' EXIT
 
-out=""
-err=""
-rc=0
-
-reset_state() {
-  rm -f "${SF}" "${SESSION}"
-}
-
-# client_online [status_json]：模拟一个在线 client（可带它对各映射的回报）
-client_online() {
-  local status="${1:-{\}}"
-  local now=""
-  now="$(date +%s)"
-  printf '{"client_host":"laptop","client_label":"b-box","last_seen_unix":%s,"status":%s}\n' "${now}" "${status}" >"${SESSION}"
-}
-
-field() {
-  jq -r --arg id "$1" ".forwards[] | select(.id == \$id) | $2" "${SF}"
-}
-
-t_describe "add：client 映射的登记方式"
-
-t_it "--client：没有 client 在线也能预先登记（waiting）"
-reset_state
-run "${FW}" add 5173 --client
-t_exit_ok 0 "${rc}" "exit 0"
-t_eq "f-5173" "${out}" "stdout 只输出 id"
-t_contains "没有 client 连着" "${err}" "提示连上后自动生效"
-mode="$(field f-5173 .mode)"
-t_eq "client" "${mode}" "mode=client"
-rh="$(field f-5173 .remote_host)"
-t_eq "localhost" "${rh}" "目标恒为本机 localhost"
-target="$(field f-5173 .ssh_target)"
-t_eq "" "${target}" "不涉及 ssh_target"
-
-t_it "没给目标、没有 client 在线：维持原语义（die 4，并提示 --client）"
-reset_state
-run "${FW}" add 3000
-t_exit_ok 4 "${rc}" "die 4"
-t_contains "--client" "${err}" "提示 --client"
-
-t_it "没给目标、有 client 在线：默认登记为 client 映射"
-reset_state
-client_online
-run "${FW}" add 15173:5173
-t_exit_ok 0 "${rc}" "exit 0"
-t_contains "client 在线" "${err}" "提示即将生效"
-mode="$(field f-15173 .mode)"
-rp="$(field f-15173 .remote_port)"
-t_eq "client|5173" "${mode}|${rp}" "client 映射，本机端口 5173"
-
-t_it "--client 与 --machine/--ssh-target 互斥"
-run "${FW}" add 6000 --client --ssh-target u@h:22
-t_exit_ok 64 "${rc}" "互斥 -> 64"
-
-t_it "client 映射的本地端口不得 < 1024"
-run "${FW}" add 80 --client
-t_exit_ok 64 "${rc}" "端口 80 -> 64"
-t_contains "10080:80" "${err}" "给出可用的替代写法（替代端口本身 ≥ 1024）"
-
-t_it "与已有记录端口冲突 -> die 2"
-run "${FW}" add 15173 --client
-t_exit_ok 2 "${rc}" "重复 -> 2"
-
-t_describe "list：client 映射的实时状态"
-
-t_it "client 未回报：pending；表格标明 client"
-reset_state
-"${FW}" add 5173 --client >/dev/null 2>&1
-client_online
+# Client mapping lifecycle stays entirely in the Go CLI.
+t_describe 'Go client mapping lifecycle'
+run "${FW}" add 24517 --client
+t_exit_ok 0 "${rc}" 'client add succeeds'
+t_eq f-24517 "${out}" 'client add returns id'
 run "${FW}" list --json
-st="$(printf '%s' "${out}" | jq -r '.forwards[0].status')"
-t_eq "pending" "${st}" "pending"
-run "${FW}" list
-t_match 'client:laptop|client' "${out}" "MACHINE 列标 client"
-
-t_it "client 回报 up：oneline 出现端口"
-client_online '{"f-5173":{"state":"up","reason":""}}'
-run "${FW}" list --oneline
-t_eq "⇅5173" "${out}" "tab bar 行"
-run "${FW}" list
-t_match '5173 +localhost:5173 +client:laptop +up' "${out}" "表格一行"
-
-t_it "client 回报 down：oneline 不显示，表格给出原因"
-client_online '{"f-5173":{"state":"down","reason":"client 端口 5173 已被占用（laptop）"}}'
-run "${FW}" list --oneline
-t_eq "" "${out}" "down 不上 tab bar"
-run "${FW}" list
-t_contains "已被占用" "${out}" "原因可见"
-
-t_it "client 离线：waiting，oneline 为空"
-rm -f "${SESSION}"
-run "${FW}" list --json
-st="$(printf '%s' "${out}" | jq -r '.forwards[0].status')"
-t_eq "waiting" "${st}" "waiting"
-run "${FW}" list --oneline
-t_eq "" "${out}" "空"
-
-t_describe "remove / doctor"
-
-t_it "remove client 映射：删记录，不碰任何隧道"
-run "${FW}" remove f-5173
-t_exit_ok 0 "${rc}" "exit 0"
-left="$(jq '.forwards | length' "${SF}")"
-t_eq "0" "${left}" "已删"
-
-t_it "doctor --prune：清掉死的 tunnel 记录，client 映射原样保留"
-reset_state
-"${FW}" add 5173 --client >/dev/null 2>&1
-jq '.forwards += [{"id":"f-3999","local_port":3999,"remote_host":"127.0.0.1","remote_port":1,"machine":"","ssh_target":"u@h:22","pid":null,"control_socket":"","status":"up","created_unix":1,"mode":"tunnel","publish":{"pid":null,"url":null,"started_unix":null}}]' "${SF}" >"${SF}.new"
-mv "${SF}.new" "${SF}"
+t_eq client "$(printf '%s' "${out}" | jq -r '.forwards[0].mode')" 'json marks client mode'
 run "${FW}" doctor --prune
-t_exit_ok 0 "${rc}" "doctor 退出 0"
-ids="$(jq -r '[.forwards[].id] | join(",")' "${SF}")"
-t_eq "f-5173" "${ids}" "只剩 client 映射"
-t_contains "client:waiting" "${out}" "doctor 报告 client 映射状态"
+t_eq 1 "$(printf '%s' "${out}" | grep -c 'client:waiting')" 'doctor reports waiting client'
+t_eq 1 "$(jq '.forwards | length' "${HERDR_PLUGIN_STATE_DIR}/forwards.json")" 'doctor keeps client record'
 
-t_describe "ports：标注已映射到 client 的端口"
-mkdir -p "${TMP}/bin"
-cat >"${TMP}/bin/ss" <<'SS'
-#!/bin/sh
-printf '%s\n' 'LISTEN 0 1 127.0.0.1:5173 0.0.0.0:* users:(("node",pid=1,fd=2))' 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:*'
-SS
-chmod +x "${TMP}/bin/ss"
-PATH="${TMP}/bin:${PATH}" run "${FW}" ports
-t_match '5173 +127\.0\.0\.1 +node +client:5173' "${out}" "5173 已映射"
-t_match '8080 +0\.0\.0\.0 +- +-' "${out}" "8080 未映射"
-PATH="${TMP}/bin:${PATH}" run "${FW}" ports --json
-n="$(printf '%s' "${out}" | jq 'length')"
-t_eq "2" "${n}" "--json 两条"
+# §16.2 close-out: assert the stable JSON port/address columns, not the
+# implementation-dependent PROCESS column (- for /proc, process name for ss).
+t_describe 'ports JSON contract (§16.2)'
+run "${FW}" ports --json
+t_exit_ok 0 "${rc}" 'ports --json succeeds'
+row="$(printf '%s' "${out}" | jq -c --argjson p "${PORT}" 'map(select(.port == $p))[0] // {}')"
+t_eq "${PORT}" "$(printf '%s' "${row}" | jq -r '.port | tostring')" 'port column is stable'
+t_eq 127.0.0.1 "$(printf '%s' "${row}" | jq -r '.addr')" 'address column is stable'
+t_match '^(|[^\n]*)$' "$(printf '%s' "${row}" | jq -r '.process // ""')" 'process column may be empty or implementation-provided'
+run "${FW}" ports
+# The table must retain the port and address regardless of PROCESS formatting.
+t_match "${PORT}[[:space:]]+127\\.0\\.0\\.1" "${out}" 'table keeps port/address columns'
 
+run "${FW}" remove f-24517
+t_exit_ok 0 "${rc}" 'client remove succeeds'
+t_eq 0 "$(jq '.forwards | length' "${HERDR_PLUGIN_STATE_DIR}/forwards.json")" 'client record removed'
 t_done

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 断言库自测（T0 交付物 1 的红→绿驱动）。先跑红（tests/lib/assertions.sh 不存在
+# 断言库自测（T0 交付物 1 的红→绿驱动）。先跑红（tests/assertions.sh 不存在
 # 时 source 失败 / 接口缺失），实现后转绿。
 #
 # 手法：把「待验证的断言调用片段」用 quoted heredoc 写进临时脚本，在子进程里执行，
@@ -10,14 +10,14 @@
 set -Eeuo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_FILE="${TESTS_DIR}/../lib/assertions.sh"
+LIB_FILE="${TESTS_DIR}/../assertions.sh"
 
 if [[ ! -f "${LIB_FILE}" ]]; then
   echo "RED: 断言库不存在：${LIB_FILE}（TDD 第一步先红）" >&2
   exit 1
 fi
 
-# shellcheck source=tests/lib/assertions.sh
+# shellcheck source=tests/assertions.sh
 source "${LIB_FILE}"
 
 TMPDIR_T0="$(mktemp -d)"

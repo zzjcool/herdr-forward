@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# tests/lib/assertions.sh — 零依赖 bash 断言库（T0 交付物 1）
+# tests/assertions.sh — 零依赖 bash 断言库（T0 交付物 1）
 #
 # 归属：T0（唯一 writer）。接口按 ARCHITECTURE.md §B.1 冻结，T0 追加若干便利断言
 # （t_pass/t_is/t_isnt/t_contains/t_matches/t_dies_with/t_run/t_summary/t_file_absent），
 # 冻结集一个不少、语义不移。
 #
 # 用法：
-#   source tests/lib/assertions.sh
+#   source tests/assertions.sh
 #   t_describe "组名"
 #   t_it "用例"
 #   run myfunc arg            # 捕获 $out/$err/$rc（run 恒返回 0，不打断 set -e）
