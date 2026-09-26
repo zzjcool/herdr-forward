@@ -52,7 +52,8 @@ EOF
 if id -u | grep -qx 0; then
   sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${TMP}/sshd_config"
 fi
-/usr/bin/sshd -f "${TMP}/sshd_config" -E "${TMP}/sshd.log"
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+"${SSHD_BIN}" -f "${TMP}/sshd_config" -E "${TMP}/sshd.log"
 SSHD_PID="$(cat "${TMP}/sshd.pid")"
 cat >"${TMP}/echo.py" <<'PY'
 import socket, sys

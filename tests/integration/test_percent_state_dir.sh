@@ -246,11 +246,12 @@ AuthorizedKeysFile ${T2_TMP}/authorized_keys
 LogLevel ERROR
 PerSourcePenalties no
 CFG
-if ! /usr/bin/sshd -t -f "${T2_TMP}/sshd_config" 2>"${T2_TMP}/sshd_t.err"; then
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+if ! "${SSHD_BIN}" -t -f "${T2_TMP}/sshd_config" 2>"${T2_TMP}/sshd_t.err"; then
   # 老 sshd 无 PerSourcePenalties：去掉该指令重试
   grep -v '^PerSourcePenalties' "${T2_TMP}/sshd_config" >"${T2_TMP}/sshd_config.2"
   mv "${T2_TMP}/sshd_config.2" "${T2_TMP}/sshd_config"
-  /usr/bin/sshd -t -f "${T2_TMP}/sshd_config" 2>>"${T2_TMP}/sshd_t.err" || {
+  "${SSHD_BIN}" -t -f "${T2_TMP}/sshd_config" 2>>"${T2_TMP}/sshd_t.err" || {
     printf 'sshd -t rejected config:\n' >&2
     cat "${T2_TMP}/sshd_t.err" >&2
     exit 1
@@ -304,7 +305,7 @@ t_eq "present" "${t_if_pct}" "state dir 名确实含 %"
 if id -u | grep -qx 0; then
   sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${T2_TMP}/sshd_config"
 fi
-/usr/bin/sshd -f "${T2_TMP}/sshd_config" -E "${T2_TMP}/sshd.log"
+"${SSHD_BIN}" -f "${T2_TMP}/sshd_config" -E "${T2_TMP}/sshd.log"
 SSHD_PID="$(cat "${T2_TMP}/sshd.pid")"
 t2_wait_port "${SSHD_PORT}"
 t_eq "0" "$?" "sshd listening"

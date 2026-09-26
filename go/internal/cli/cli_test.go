@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"github.com/zzjcool/herdr-forward/internal/jqjson"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -642,12 +643,27 @@ func TestPortsExtraArgs(t *testing.T) {
 
 func TestPortsJSONKeyOrder(t *testing.T) {
 	useStateDir(t)
+	// 自建监听：不依赖环境（GitHub runner 无监听端口时也能验证键序）。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("无法自建监听：%v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
 	rc, out, _ := runCLI(t, "ports", "--json")
 	if rc != exitOK {
 		t.Fatalf("rc = %d", rc)
 	}
 	// bash 侧没有 -S，键序必须是 port,addr,process（插入顺序）
-	if len(strings.TrimSpace(out)) == 0 {
+	if len(strings.TrimSpace(out)) == 0 || strings.TrimSpace(out) == "[]" {
 		t.Skip("环境中没有可枚举的监听端口")
 	}
 	if !strings.HasPrefix(strings.TrimSpace(out), `[{"port":`) {

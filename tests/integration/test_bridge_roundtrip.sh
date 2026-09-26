@@ -178,7 +178,8 @@ AllowTcpForwarding yes
 LogLevel ERROR
 PerSourcePenalties no
 CFG
-if ! /usr/bin/sshd -t -f "${T}/sshd_config" 2>/dev/null; then
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+if ! "${SSHD_BIN}" -t -f "${T}/sshd_config" 2>/dev/null; then
   grep -v '^PerSourcePenalties' "${T}/sshd_config" >"${T}/sshd_config.2"
   mv "${T}/sshd_config.2" "${T}/sshd_config"
 fi
@@ -186,7 +187,7 @@ fi
 if id -u | grep -qx 0; then
   sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${T}/sshd_config"
 fi
-/usr/bin/sshd -f "${T}/sshd_config" -E "${T}/sshd.log"
+"${SSHD_BIN}" -f "${T}/sshd_config" -E "${T}/sshd.log"
 sleep 0.3
 SSHD_PID="$(cat "${T}/sshd.pid")"
 

@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq xz-utils curl
+          sudo apt-get install -y jq xz-utils curl python3 openssh-client
           curl -fsSL -o /tmp/shfmt \
             "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
           sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
