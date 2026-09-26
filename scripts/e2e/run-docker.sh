@@ -16,6 +16,10 @@ PROJ="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${HERDR_FORWARD_E2E_IMAGE:-herdr-forward-e2e:local}"
 DOCKERFILE="${PROJ}/scripts/e2e/Dockerfile"
 RESULTS_DIR="${PROJ}/test-results"
+# 全新 checkout（如 GitHub runner）里该目录可能不存在：容器内非 root 用户
+# 需要对它可写（go 构建日志/探测结论落盘）。幂等。
+mkdir -p "${RESULTS_DIR}"
+chmod u+rwx "${RESULTS_DIR}" 2>/dev/null || true
 
 log() { printf '[e2e-docker] %s\n' "$*"; }
 
