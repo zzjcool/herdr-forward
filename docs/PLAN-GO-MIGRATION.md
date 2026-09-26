@@ -6,7 +6,7 @@
 
 ## 1. 目标与不做的事
 
-**目标**：全部核心功能由单一 Go 静态二进制（`bin/forward-go`，linux/macos × amd64/arm64）承载；`lib/*.sh` 与 `bin/forward` 的 bash 代码全部删除；`bin/forward` 退化为 ≤5 行 POSIX sh exec shim（保持 manifest/E2E/文档引用路径不变）；GitHub Releases 分发 + postinstall 下载校验；`scripts/e2e` 五套全绿。
+**目标**：全部核心功能由单一 Go 静态二进制（`bin/forward-go`，linux/macos × amd64/arm64）承载；`retired Bash modules` 与 `bin/forward` 的 bash 代码全部删除；`bin/forward` 退化为 ≤5 行 POSIX sh exec shim（保持 manifest/E2E/文档引用路径不变）；GitHub Releases 分发 + postinstall 下载校验；`scripts/e2e` 五套全绿。
 
 **Non-goals**：
 - 不换 ssh 库：`ssh -L` 桥接/隧道继续 exec 系统 `ssh` 子进程（保 ~/.ssh/config、agent、known_hosts）
@@ -56,16 +56,16 @@ go/
 ├── go.mod / go.sum / vendor/          # 模块 github.com/zzjcool/herdr-forward
 ├── cmd/forward/main.go                # 入口：os.Exit(cli.Main(os.Args[1:]))
 └── internal/
-    ├── hfcommon/   # ← lib/common.sh：env 解析、log（轮转 1MB/512KB）、atomic write、exitcode、probe_payload
-    ├── state/      # ← lib/state.sh（forwards.json）+ machines/bridge 的状态文件
-    ├── render/     # ← lib/render.sh：oneline / 表格
-    ├── ports/      # ← lib/ports.sh：/proc/net/tcp{,6}（Linux）；exec lsof（macOS）
-    ├── machine/    # ← lib/machine.sh + lib/machines.sh：machines.toml 解析、herdr machine list、激活记录
-    ├── tunnel/    # ← lib/tunnel.sh：exec ssh ControlMaster 生命周期、doctor
-    ├── notify/     # ← lib/notify.sh：herdr socket toast（1s watchdog）
-    ├── bridge/     # ← lib/bridge.sh：HF1 协议编解码 + serve/run 监督者 + 退避重连
-    ├── sshprobe/   # ← lib/ssh-probe.sh：parse_target / run / plugin 探测
-    ├── panel/      # ← lib/panel.sh：watch TUI（备用屏、双缓冲、read 超时刷新）
+    ├── hfcommon/   # ← retired Bash common module：env 解析、log（轮转 1MB/512KB）、atomic write、exitcode、probe_payload
+    ├── state/      # ← retired Bash state module（forwards.json）+ machines/bridge 的状态文件
+    ├── render/     # ← retired Bash render module：oneline / 表格
+    ├── ports/      # ← retired Bash ports module：/proc/net/tcp{,6}（Linux）；exec lsof（macOS）
+    ├── machine/    # ← retired Bash machine module + retired Bash machines module：machines.toml 解析、herdr machine list、激活记录
+    ├── tunnel/    # ← retired Bash tunnel module：exec ssh ControlMaster 生命周期、doctor
+    ├── notify/     # ← retired Bash notify module：herdr socket toast（1s watchdog）
+    ├── bridge/     # ← retired Bash bridge module：HF1 协议编解码 + serve/run 监督者 + 退避重连
+    ├── sshprobe/   # ← retired Bash SSH probe module：parse_target / run / plugin 探测
+    ├── panel/      # ← retired Bash panel module：watch TUI（备用屏、双缓冲、read 超时刷新）
     └── cli/        # ← bin/forward cmd_* 层：子命令 dispatch、usage、参数校验
 ```
 
@@ -187,7 +187,7 @@ func Main(args []string) int                    // 返回值即进程退出码�
 - **风险点**：panel 883 行 read 循环的按键语义回归（Enter 不关面板、Ctrl+click SGR 序列走 herdr link_handler 不受影响）。
 
 ### Phase 5 — Bash 退役 + Releases 真实安装验证
-- **文件**：删除 `lib/*.sh` 全部 10 个、`bin/forward` 替换为 shim：
+- **文件**：删除产品 Bash modules 全部 11 个（main 实际 lib/ 目录含 11 个文件；原文的「10」是计数笔误）、`bin/forward` 替换为 shim：
   ```sh
   #!/bin/sh
   # herdr-forward CLI — exec Go binary（下载失败时给出明确指引）
@@ -328,7 +328,7 @@ esac
 未知键要保留、缺失键要缺失、数字字面量要逐字节保留（`2.50` 不能变 `2.5`）、
 `forwards` 里出现非对象元素时 jq 会**报错**而不是补零。因此 `list --json` 另走一条
 「顺序保留对象 + 保留数字字面量」的原始视图（`go/internal/cli/jsonjq.go` + `view.go`），
-并在其中逐字复刻 `lib/state.sh` 的三条 warn 文案。实测比对 60+ 组 golden 全绿。
+并在其中逐字复刻 `retired Bash state module` 的三条 warn 文案。实测比对 60+ 组 golden 全绿。
 
 配套的 jq 兼容规则（全部由本机 jq 1.8.2 实测反推，单测钉住）：
 字符串转义（`"` `\` `\b` `\t` `\n` `\f` `\r`、其余 <0x20 与 **0x7f** 转 `\u00xx` 小写；
@@ -376,7 +376,7 @@ bridge 行 `machine` 为 null → bash `(桥接)` vs Go `-(桥接)`。
 ### 13.7 桥接只读合并落在 cli 层（Phase 3 会取代）
 
 `list` 需要 client 的实时状态与 A 侧 bridge 行（契约 C5/C6），否则切换瞬间 tab bar / 面板
-会丢状态。W4 在 `go/internal/cli/view.go` 复刻了 `lib/bridge.sh` 的只读半边
+会丢状态。W4 在 `go/internal/cli/view.go` 复刻了 `retired Bash bridge module` 的只读半边
 （`bridge_sessions_json` / `bridge_live_status_json` / `bridge_merge_live` /
 `bridge_clients_json` / `bridge_client_forwards_json`），含以下刻意复刻的细节：
 `kill -0` 的 EPERM 也算「死」并**顺手删除**会话文件、`sort_by(.last_seen_unix) | reverse` 的
@@ -442,10 +442,10 @@ add)
 * 否则出现 `--ssh-target` / `--ssh-target=*` / `--machine` / `--machine=*` → 切 Go；
 * 其余（无目标、只有位置参数）→ 归 bash。
 
-理由：**client 映射的写侧（lib/bridge.sh）属 Phase 3**，而 `add --client` 与「没给目标但
+理由：**client 映射的写侧（retired Bash bridge module）属 Phase 3**，而 `add --client` 与「没给目标但
 有 client 在线 → 隐式 client 映射」这两种形态都要写 client 记录 + 影响桥接。Phase 3 之前
 把它们留在 bash 是唯一能保证「双实现不打架」的切法；`panel.sh` 与 `machines activate` 走的
-正是这条路径（`lib/panel.sh:797` 的 `"${bin}" add "${item}" --client`）。
+正是这条路径（`retired panel implementation (former line 797)` 的 `"${bin}" add "${item}" --client`）。
 
 Go 侧的 `cmd_add` **完整实现**了 client 分支（含 `bridge_any_live` 的只读判定与
 `_hf_add_client` 的两行 stderr 文案），因此 Phase 3 把 bridge 写侧迁完后不需要再补语义；
@@ -499,7 +499,7 @@ bash 的 `tunnel_doctor` 第一行 `require_cmd jq`（缺失 → die 127）。Go
 
 ### 14.8 `notify` 尚无调用方（Phase 2 只交付库）
 
-Phase 2 的任务范围是「mirror lib/notify.sh」；`bin/forward` 里没有任何 `notify_toast` 调用
+Phase 2 的任务范围是「mirror retired Bash notify module」；`bin/forward` 里没有任何 `notify_toast` 调用
 （既有的调用点都在 panel/桥接，属 Phase 3/4）。因此本 phase 交付的是**库 + 单测**，
 difftest 无 notify 组（bash 侧也没有可对位的 CLI 入口）。
 
@@ -544,7 +544,7 @@ esac
 与 Phase 2 的两点差异：
 
 1. **`--client` 不再被排除**：Phase 2 的谓词把 `--client` 精确匹配留给 bash（client 映射的
-   写侧依赖 lib/bridge.sh）。Phase 3 把桥接写侧迁到 Go 后，这条排除不再需要 ——
+   写侧依赖 retired Bash bridge module）。Phase 3 把桥接写侧迁到 Go 后，这条排除不再需要 ——
    `tests/difftest/phase2-go-path.sh` 第 7 段由「marker 无新增」翻转为「marker 有新增」，
    由脚本本身钉住这次翻转（不放松断言，只换判据方向）。
 2. **「无目标」的 add 仍留 bash**：那条路径要按「有没有 client 在线」在**运行时**决定走
@@ -552,7 +552,7 @@ esac
    只看 argv、看不到在线状态。留 bash 是行为零变化的选择；Phase 5 删 dispatch 后自然统一。
 
 `watch` / `bootstrap` 两子命令的**函数体一字未改**（用 git show 逐字节比对确认），
-且 `lib/panel.sh`、`scripts/startup-hook.sh`、`scripts/postinstall.sh`、`herdr-plugin.toml`
+且 `retired Bash panel module`、`scripts/startup-hook.sh`、`scripts/postinstall.sh`、`herdr-plugin.toml`
 在本 phase 零改动。
 
 ### 15.2 `internal/jqjson`：jq 兼容 JSON 模型抽出为公共包（重构，无行为变化）
@@ -669,3 +669,29 @@ Phase 3 验收（独立复跑：difftest 426/426、ci.sh 6/6、phase2/phase3-go-
 3. **activated-machines.json 双读取点**（machine 写侧 / bridge 只读）：接受当前策略（与 bash 同构）。约束：Phase 4/5 若新增字段，两处必须同步改，difftest 的 schema 对照用例负责抓漂移。
 4. **两机 E2E tar 未含 forward-go**：**Phase 4 处理**——把 Go CLI 注入两机 tar，让两机 E2E 直接裁判 Go 路径（62 断言是最接近真实用户的验收）。归入 Phase 4 任务书。
 5. **watch/bootstrap 仍在 bash**：Phase 4 主任务，无异议。
+
+## 17. Phase 5 完成记录（go-mig/phase5）
+
+Phase 5 终态收口：
+
+- 删除产品 Bash modules 11 个（main 实际 lib/ 目录含 11 个；原文计数已在本记录纠正）；`bin/forward` 变为 9 行 POSIX shim，缺少
+  `forward-go` 明确提示并返回 127；其余 Bash 测试中直接覆盖内部函数的用例退役。
+- `scripts/postinstall.sh` 变为纯 POSIX Release bootstrap：uname 平台映射、manifest
+  version、curl/wget 双兜底、sha256sum/shasum 校验、临时目录解包、`HERDR_FORWARD_BIN_BASE`
+  镜像和 `HERDR_FORWARD_SKIP_DOWNLOAD=1` 离线开关；下载失败/校验失败统一 exit 1 并给出
+  `git clone` + `make build` 恢复指引，成功后安装键位并 reload-config。
+- `tests/difftest/run.sh` 保留 438 个逐字节用例，但改为 Go-only golden：
+  `tests/difftest/golden.tsv` 记录 exit code 与 base64(stdout)。旧 Bash 对照器、
+  `phase2-go-path.sh`、`phase3-go-path.sh` 随 Bash 退役；真 ssh/HF1 护栏由 Go 集成/E2E
+  覆盖。`GOLDEN_UPDATE=1` 仅供审阅后的维护者刷新，不在 CI 中写 golden。
+- §16.2 的 ports 断言改为验证 JSON 的端口/地址列，PROCESS 列明确允许空或平台进程名，
+  不削弱 E2E 的监听/回环断言。
+- `scripts/ci.sh` 删除迁移期二进制暂存适配器，lint 目标收缩到 shim、postinstall、
+  wrappers、E2E/difftest runner，并保留 golden 作为终态契约门（相对 Phase 5 原始草案
+  「删除 difftest 段」的有意裁决：永久护栏优先于移除校验）。
+- 同步清除 Go startup-hook 中对已删除 `retired Bash machines module` 的存在性探针；startup hook
+  继续从 Go 的 `activated-machines.json` 读取 active 记录并拉起 bridge，避免 server
+  重启后桥接不自愈。这是 Bash 退役后的必要 Go 适配，不改变用户契约。
+
+终态验收清单与 release smoke 见 §11；真实 GitHub Release 的在线安装由主 agent 在发布
+决策后执行，worker 只负责本地 Release 下载/失败路径测试。

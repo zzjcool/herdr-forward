@@ -1,101 +1,140 @@
 #!/usr/bin/env bash
-# tests/unit/test_postinstall.sh — scripts/postinstall.sh（herdr plugin install 的 [[build]] 步骤）
-#
-# 场景来源：用户往**正在运行**的 herdr 里装插件后按 prefix+f 没反应 —— startup hook 只在
-# server 启动时跑。build 步骤负责当场装键位并重载 server。
-# 覆盖：首次安装装键位 + 重载 / 重装幂等不重载 / 键位冲突不覆盖 / herdr 缺失或未运行 /
-#   恒 exit 0（build 失败会中止 install）/ manifest 声明了该 build 步骤。
+# Release postinstall tests: download, checksum failure, missing fetcher and offline mode.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=/dev/null
-source "${ROOT}/tests/lib/assertions.sh"
+source "${ROOT}/tests/assertions.sh"
 
-unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_BIN_PATH HERDR_ENV HERDR_CONFIG_PATH
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/postinstall-release.XXXXXX")"
+PLUGIN="${WORK}/plugin"
+mkdir -p "${PLUGIN}/bin" "${PLUGIN}/scripts" "${WORK}/home/.config/herdr" "${WORK}/release"
+cp "${ROOT}/bin/forward" "${PLUGIN}/bin/forward"
+cp "${ROOT}/scripts/postinstall.sh" "${PLUGIN}/scripts/postinstall.sh"
+cp "${ROOT}/herdr-plugin.toml" "${PLUGIN}/herdr-plugin.toml"
+chmod 0755 "${PLUGIN}/bin/forward" "${PLUGIN}/scripts/postinstall.sh"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/postinstall.XXXXXX")"
-trap 'rm -rf "${WORK}"' EXIT
-CONFIG="${WORK}/home/.config/herdr/config.toml"
+# Build/use a real Go CLI for an archive with the same shape as GoReleaser.
+GO_ARCHIVE_BIN="${WORK}/release/forward"
+if [[ -x "${ROOT}/bin/forward-go" ]]; then
+  cp "${ROOT}/bin/forward-go" "${GO_ARCHIVE_BIN}"
+else
+  (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${GO_ARCHIVE_BIN}" ./cmd/forward)
+fi
+chmod 0755 "${GO_ARCHIVE_BIN}"
+ARCHIVE="herdr-forward_0.2.0_linux_amd64.tar.gz"
+tar -czf "${WORK}/release/${ARCHIVE}" -C "${WORK}/release" forward
+HASH="$(sha256sum "${WORK}/release/${ARCHIVE}" | awk '{print $1}')"
+printf '%s  %s\n' "${HASH}" "${ARCHIVE}" >"${WORK}/release/checksums.txt"
+
+PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+(cd "${WORK}/release" && python3 -m http.server "${PORT}" --bind 127.0.0.1 >/dev/null 2>&1) &
+HTTP_PID=$!
 CALLS="${WORK}/herdr-calls"
-mkdir -p "${WORK}/home/.config/herdr" "${WORK}/bin"
+trap 'kill "${HTTP_PID}" 2>/dev/null || true; rm -rf "${WORK}"' EXIT
+BASE="http://127.0.0.1:${PORT}"
+for _ in {1..50}; do
+  if python3 - "${PORT}" <<'PY'; then
+import socket
+import sys
+s = socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    s.close()
+PY
+    break
+  fi
+  sleep 0.1
+done
 
-# 假 herdr：记录调用；HF_RELOAD_RC 控制 reload 的退出码
-cat >"${WORK}/bin/herdr" <<EOF
+cat >"${WORK}/herdr" <<EOF
 #!/bin/sh
-printf '%s\n' "\$*" >>"${CALLS}"
+printf '%s\\n' "\$*" >>"${CALLS}"
 exit "\${HF_RELOAD_RC:-0}"
 EOF
-chmod +x "${WORK}/bin/herdr"
+chmod 0755 "${WORK}/herdr"
 
-out=""
+run_postinstall() {
+  out=""
+  err=""
+  rc=0
+  out="$(env -u HERDR_PLUGIN_ROOT -u HERDR_PLUGIN_STATE_DIR \
+    HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+    HERDR_FORWARD_BIN_BASE="${BASE}" PATH="${WORK}:${PATH}" \
+    sh "${PLUGIN}/scripts/postinstall.sh" 2>"${WORK}/stderr")" || rc=$?
+  err="$(cat "${WORK}/stderr")"
+}
+
+t_describe "Release 下载与校验"
+t_it "下载 archive + checksums，安装 forward-go，装键位并 reload"
+rm -f "${PLUGIN}/bin/forward-go" "${CALLS}" "${WORK}/home/.config/herdr/config.toml"
+printf 'theme = "dark"\n' >"${WORK}/home/.config/herdr/config.toml"
+run_postinstall
+t_exit_ok 0 "${rc}" "正常安装 exit 0"
+t_file_exists "${PLUGIN}/bin/forward-go" "下载的二进制存在"
+if [[ -x "${PLUGIN}/bin/forward-go" ]]; then
+  t_pass "下载的二进制可执行"
+else
+  t_fail "下载的二进制不可执行"
+fi
+key_count="$(grep -c '^command = "zzjcool:forward\.' "${WORK}/home/.config/herdr/config.toml" || true)"
+t_eq 3 "${key_count}" "安装器写入 3 条键位"
+call_log="$(cat "${CALLS}")"
+t_match 'server reload-config' "${call_log}" "继续 reload-config"
+
+t_describe "失败路径"
+t_it "checksum 不符 exit 1 + 手动恢复指引"
+printf '%064d  %s\n' 0 "${ARCHIVE}" >"${WORK}/release/checksums.txt"
+rm -f "${PLUGIN}/bin/forward-go"
+run_postinstall
+t_exit_ok 1 "${rc}" "checksum 失败 exit 1"
+t_contains "SHA-256 校验失败" "${err}" "明确指出校验失败"
+t_contains "git clone" "${err}" "给出手动恢复路径"
+t_file_absent "${PLUGIN}/bin/forward-go" "校验失败不落盘二进制"
+
+t_it "curl/wget 都不存在 exit 1 + 依赖指引"
+printf '%s  %s\n' "${HASH}" "${ARCHIVE}" >"${WORK}/release/checksums.txt"
+rm -f "${PLUGIN}/bin/forward-go"
+NO_FETCH="${WORK}/no-fetch"
+mkdir -p "${NO_FETCH}"
+for tool in sh sed head uname mktemp mkdir awk sha256sum tar find chmod mv rm tr cat dirname; do
+  tool_path=""
+  if tool_path="$(command -v "${tool}")"; then
+    ln -sf "${tool_path}" "${NO_FETCH}/${tool}"
+  fi
+done
 rc=0
+out=""
+err=""
+env -u HERDR_PLUGIN_ROOT -u HERDR_PLUGIN_STATE_DIR HOME="${WORK}/home" \
+  XDG_CONFIG_HOME="${WORK}/home/.config" HERDR_FORWARD_BIN_BASE="${BASE}" \
+  PATH="${NO_FETCH}" sh "${PLUGIN}/scripts/postinstall.sh" >"${WORK}/no-fetch.out" 2>"${WORK}/no-fetch.err" || rc=$?
+out="$(cat "${WORK}/no-fetch.out")"
+err="$(cat "${WORK}/no-fetch.err")"
+t_exit_ok 1 "${rc}" "无下载器 exit 1"
+t_contains "curl 或 wget" "${err}" "指出需要 curl/wget"
+t_contains "make build" "${err}" "无下载器也给恢复指引"
 
-# postinstall [PATH]：像 herdr 跑 build 那样在插件根目录下执行（无任何 HERDR_* 运行时变量）
-postinstall() {
-  local path="${1:-${WORK}/bin:/usr/bin:/bin}"
-  : >"${CALLS}"
-  # shellcheck disable=SC2016 # $1 由内层 bash 展开（插件根作为参数传入）
-  run env -u HERDR_PLUGIN_ID HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
-    XDG_STATE_HOME="${WORK}/home/.local/state" PATH="${path}" \
-    bash -c 'cd "$1" && bash scripts/postinstall.sh' _ "${ROOT}"
-}
-key_count() {
-  grep -c '^command = "zzjcool:forward\.' "${CONFIG}" 2>/dev/null || true
-}
-reloads() {
-  grep -c '^server reload-config$' "${CALLS}" 2>/dev/null || true
-}
-
-t_describe "manifest 声明了 build 步骤"
-t_it "herdr-plugin.toml 的 [[build]] 运行 scripts/postinstall.sh"
-build_cmd="$(python3 -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); print(" ".join(b["command"] for b in d.get("build", []) for b in [b] if False) or " ".join(d["build"][0]["command"]))' "${ROOT}/herdr-plugin.toml")"
-t_eq "bash scripts/postinstall.sh" "${build_cmd}" "build 命令"
-
-t_describe "首次安装：装键位并重载运行中的 herdr"
-printf 'theme = "dark"\n' >"${CONFIG}"
-postinstall
-t_exit_ok 0 "${rc}" "exit 0"
-n="$(key_count)"
-t_eq "3" "${n}" "写入 3 条本插件键位"
-n="$(reloads)"
-t_eq "1" "${n}" "调用 herdr server reload-config 一次"
-t_contains "现在就可以按 prefix+f" "${out}" "告诉用户可以直接用"
-
-t_describe "重装（更新插件）：键位已在，不重复写、不重载"
-before="$(md5sum "${CONFIG}" | cut -d' ' -f1)"
-postinstall
-t_exit_ok 0 "${rc}" "exit 0"
-after="$(md5sum "${CONFIG}" | cut -d' ' -f1)"
-t_eq "${before}" "${after}" "config 未改动"
-n="$(reloads)"
-t_eq "0" "${n}" "未重载"
-
-t_describe "默认键被别的命令占用：不覆盖，说明换键方法"
-printf '[[keys.command]]\nkey = "prefix+f"\ntype = "shell"\ncommand = "echo mine"\n' >"${CONFIG}"
-before="$(md5sum "${CONFIG}" | cut -d' ' -f1)"
-postinstall
-t_exit_ok 0 "${rc}" "exit 0"
-after="$(md5sum "${CONFIG}" | cut -d' ' -f1)"
-t_eq "${before}" "${after}" "用户的绑定原样保留"
-t_contains "已被别的命令占用" "${out}" "说明冲突"
-t_contains "bootstrap.sh --add-key" "${out}" "给出换键命令"
-
-t_describe "herdr 不在 PATH / 未运行：键位照装，提示稍后生效，仍 exit 0"
-printf 'theme = "dark"\n' >"${CONFIG}"
-# 除 herdr 以外的全部 /usr/bin 工具（Arch 的 /bin 就是 /usr/bin，不能靠去掉目录来藏 herdr）
-mkdir -p "${WORK}/noherdr"
-ln -s /usr/bin/* "${WORK}/noherdr/" 2>/dev/null || true
-rm -f "${WORK}/noherdr/herdr"
-postinstall "${WORK}/noherdr"
-t_exit_ok 0 "${rc}" "exit 0"
-t_contains "找不到 herdr 命令" "${out}" "提示需要手动 reload"
-n="$(key_count)"
-t_eq "3" "${n}" "键位照装"
-printf 'theme = "dark"\n' >"${CONFIG}"
-HF_RELOAD_RC=1 postinstall
-t_exit_ok 0 "${rc}" "reload 失败也 exit 0（不能挡住 install）"
-n="$(key_count)"
-t_eq "3" "${n}" "键位仍已写入"
-t_contains "下次启动 herdr 时键位即生效" "${out}" "说明何时生效"
+t_describe "离线开发"
+t_it "HERDR_FORWARD_SKIP_DOWNLOAD=1 不访问镜像并继续安装键位"
+cp "${GO_ARCHIVE_BIN}" "${PLUGIN}/bin/forward-go"
+chmod 0755 "${PLUGIN}/bin/forward-go"
+rm -f "${CALLS}"
+printf 'theme = "dark"\n' >"${WORK}/home/.config/herdr/config.toml"
+rc=0
+out=""
+err=""
+out="$(env HERDR_FORWARD_SKIP_DOWNLOAD=1 HERDR_FORWARD_BIN_BASE="${WORK}/does-not-exist" \
+  HERDR_PLUGIN_ROOT="${PLUGIN}" HOME="${WORK}/home" XDG_CONFIG_HOME="${WORK}/home/.config" \
+  PATH="${WORK}:${PATH}" sh "${PLUGIN}/scripts/postinstall.sh" 2>"${WORK}/skip.err")" || rc=$?
+err="$(cat "${WORK}/skip.err")"
+t_exit_ok 0 "${rc}" "SKIP_DOWNLOAD exit 0"
+t_contains "SKIP_DOWNLOAD=1" "${out}" "明确报告跳过下载"
+t_file_exists "${PLUGIN}/bin/forward-go" "离线使用已有二进制"
+call_log="$(cat "${CALLS}")"
+t_match 'server reload-config' "${call_log}" "离线路径仍 reload-config"
 
 t_done

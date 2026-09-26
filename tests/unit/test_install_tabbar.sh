@@ -6,12 +6,12 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALLER="${ROOT}/scripts/install-tabbar.sh"
 
-# --- 断言库：B.1 契约接口；T0 的 tests/lib/assertions.sh 合并前用最小占位子集 ---
-if [[ -f "${ROOT}/tests/lib/assertions.sh" ]]; then
+# --- 断言库：B.1 契约接口；T0 的 tests/assertions.sh 合并前用最小占位子集 ---
+if [[ -f "${ROOT}/tests/assertions.sh" ]]; then
   # shellcheck source=/dev/null
-  source "${ROOT}/tests/lib/assertions.sh"
+  source "${ROOT}/tests/assertions.sh"
 else
-  echo "WARN: tests/lib/assertions.sh 未就绪（T0 未合并），使用 B.1 契约最小占位子集" >&2
+  echo "WARN: tests/assertions.sh 未就绪（T0 未合并），使用 B.1 契约最小占位子集" >&2
   PASS=0
   FAIL=0
   t_describe() { printf '\n== %s\n' "$*"; }

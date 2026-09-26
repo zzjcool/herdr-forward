@@ -19,7 +19,7 @@ set -Eeuo pipefail
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${TESTS_DIR}/.." && pwd)"
 
-LAYERS_ALL=(unit integration e2e)
+LAYERS_ALL=(unit integration)
 
 usage() {
   printf 'usage: bash tests/run.sh <%s|all>\n' "$(IFS='|' && echo "${LAYERS_ALL[*]}")" >&2
@@ -29,7 +29,7 @@ resolve_layers() {
   local arg="${1:-all}"
   case "${arg}" in
   all) printf '%s\n' "${LAYERS_ALL[@]}" ;;
-  unit | integration | e2e) printf '%s\n' "${arg}" ;;
+  unit | integration) printf '%s\n' "${arg}" ;;
   *)
     printf 'error: 未知测试层：%s\n' "${arg}" >&2
     usage

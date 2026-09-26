@@ -18,9 +18,9 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -f "${ROOT}/tests/lib/assertions.sh" ]]; then
+if [[ -f "${ROOT}/tests/assertions.sh" ]]; then
   # shellcheck source=/dev/null
-  source "${ROOT}/tests/lib/assertions.sh"
+  source "${ROOT}/tests/assertions.sh"
 fi
 
 # --- B.1 契约最小占位（语义与 T0 断言库一致） ---
@@ -95,14 +95,6 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
-FORWARD_BIN="${ROOT}/bin/forward"
-for need in "${FORWARD_BIN}" "${ROOT}/lib/tunnel.sh"; do
-  if [[ ! -e "${need}" ]]; then
-    printf 'RED: %s 不存在（被测代码尚未交付）\n' "${need}" >&2
-    exit 1
-  fi
-done
-
 # t2_run <cmd...>：捕获 stdout/stderr/rc，不打断 set -e
 T2_OUT=""
 T2_ERR=""
@@ -130,6 +122,16 @@ export HERDR_PLUGIN_CONFIG_DIR="${T2_TMP}/config"
 export HOME="${T2_TMP}/home"
 mkdir -p "${HERDR_PLUGIN_CONFIG_DIR}" "${HERDR_PLUGIN_STATE_DIR}" "${HOME}/.ssh"
 chmod 700 "${HOME}/.ssh"
+PLUGIN_ROOT="${T2_TMP}/plugin"
+mkdir -p "${PLUGIN_ROOT}/bin"
+cp "${ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward"
+if [[ -x "${ROOT}/bin/forward-go" ]]; then
+  cp "${ROOT}/bin/forward-go" "${PLUGIN_ROOT}/bin/forward-go"
+else
+  (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${PLUGIN_ROOT}/bin/forward-go" ./cmd/forward)
+fi
+chmod 0755 "${PLUGIN_ROOT}/bin/forward" "${PLUGIN_ROOT}/bin/forward-go"
+FORWARD_BIN="${PLUGIN_ROOT}/bin/forward"
 
 SSHD_PID=""
 ECHO_PID=""

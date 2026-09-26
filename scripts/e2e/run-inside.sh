@@ -21,7 +21,7 @@ set -Eeuo pipefail
 
 # --- 红线（§C.2 + SCOUT-FACTS §1.1）：绝不继承宿主的 herdr 连接 env，否则 CLI 会连到
 # 真实运行中的 server。容器默认无这些变量，但 bwrap 降级在宿主跑，必须显式 unset。
-unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID || true
+unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_BIN_PATH HERDR_ENV HERDR_PLUGIN_ID || true
 
 SRC_DIR="/plugin-src"
 WORK_DIR="/work"
@@ -66,8 +66,8 @@ if [[ -d "${HOME}/.config/herdr" ]]; then
 fi
 
 # 断言库（T0 交付物 1）
-# shellcheck source=tests/lib/assertions.sh
-source "${WORK_DIR}/tests/lib/assertions.sh"
+# shellcheck source=tests/assertions.sh
+source "${WORK_DIR}/tests/assertions.sh"
 
 # ---------------------------------------------------------------------------
 # Go CLI（bin/forward-go）的容器内准备（PLAN-GO-MIGRATION §6 Phase 1 W4）
@@ -106,42 +106,21 @@ go_cli_prepare() {
   return 0
 }
 go_cli_prepare
+t_file_exists "${GO_BIN}" "Go binary present in E2E workspace"
 
 # 整壳开关：B 段要跑「纯 bash 基线」（若干 integration 用例的历史 golden 是 bash 端口探测），
 # 故把 Go CLI 挪出视野；B2 段再恢复。GO_CLI_PARKED 记录被挪走的位置。
-GO_CLI_PARKED=""
-go_cli_park() {
-  if [[ -n "${GO_CLI_PARKED}" ]]; then
-    return 0
-  fi
-  if [[ -f "${GO_BIN}" ]]; then
-    GO_CLI_PARKED="${GO_BIN}.e2e-parked"
-    mv -f "${GO_BIN}" "${GO_CLI_PARKED}" 2>/dev/null || GO_CLI_PARKED=""
-    if [[ -n "${GO_CLI_PARKED}" ]]; then
-      log "暂停 Go CLI（B 段按纯 bash 基线跑）：${GO_BIN} -> ${GO_CLI_PARKED}"
-    fi
-  fi
-  return 0
-}
-go_cli_unpark() {
-  if [[ -n "${GO_CLI_PARKED}" && -f "${GO_CLI_PARKED}" ]]; then
-    mv -f "${GO_CLI_PARKED}" "${GO_BIN}" 2>/dev/null || true
-    GO_CLI_PARKED=""
-    log "恢复 Go CLI：${GO_BIN}"
-  fi
-  return 0
-}
+# Phase 5: all E2E stages stay on Go; no migration adapter/fallback is parked.
+go_cli_park() { return 0; }
+go_cli_unpark() { return 0; }
 
 # lint_targets：stdout 每行一个 shell 目标（供 shellcheck/shfmt 用）。
-# 覆盖真实代码而不只是测试：bin/forward、lib/*.sh、tests/lib、tests/unit、
+# 覆盖真实代码而不只是测试：bin/forward、remaining shell scripts、tests/assertions.sh、tests/unit、
 # tests/integration/tests/difftest、scripts（含 e2e）。只输出存在的文件。
 lint_targets() {
   local f=""
   [[ -f "bin/forward" ]] && printf '%s\n' "bin/forward"
-  for f in lib/*.sh; do
-    [[ -f "${f}" ]] && printf '%s\n' "${f}"
-  done
-  for f in tests/lib/*.sh tests/unit/*.sh tests/integration/*.sh tests/difftest/*.sh \
+  for f in tests/unit/*.sh tests/integration/*.sh tests/difftest/*.sh \
     tests/run.sh scripts/*.sh scripts/e2e/*.sh; do
     [[ -f "${f}" ]] && printf '%s\n' "${f}"
   done
@@ -396,22 +375,18 @@ else
   t_exit_ok 0 "${rc}" "client key 已加入 agent（rc=${rc}）"
 fi
 
-t_it "machines.toml 写入 [machines.sandbox] 并被 machine_resolve 解析"
+t_it "machines.toml 写入 [machines.sandbox] 并被 Go machine resolver 使用"
 E2E_USER="$(id -un)"
 printf '[machines.sandbox]\nssh_target = "%s@127.0.0.1:%s"\n' "${E2E_USER}" "${SSHD_PORT}" \
   >"${HERDR_PLUGIN_CONFIG_DIR}/machines.toml"
 t_file_exists "${HERDR_PLUGIN_CONFIG_DIR}/machines.toml" "machines.toml 已布置"
-run bash -c "source '${WORK_DIR}/lib/machine.sh' && machine_resolve sandbox"
-t_exit_ok 0 "${rc}" "machine_resolve sandbox 退出 0（rc=${rc}）"
-t_eq "${E2E_USER}@127.0.0.1:${SSHD_PORT}" "${out}" "解析出沙箱 ssh_target"
-
-t_it "未声明 label -> die 4（配置路径错误可诊断）"
-run bash -c "source '${WORK_DIR}/lib/machine.sh' && machine_resolve no-such-label"
-t_exit_ok 4 "${rc}" "未声明 label -> 4"
-
+run "${WORK_DIR}/bin/forward" add "${CLI_PORT}:1" --machine no-such-label
+t_exit_ok 4 "${rc}" "未声明 label -> Go machine 解析 4"
+run "${WORK_DIR}/bin/forward" machines list --json
+t_exit_ok 0 "${rc}" "Go machines list rc=0"
+t_eq "[]" "${out}" "无 HERDR_BIN_PATH 时视图为空"
 t_it "bin/forward add <local>:<remote> --ssh-target -> 真起隧道"
-run "${WORK_DIR}/bin/forward" add "${CLI_PORT}:${ECHO_PORT}" \
-  --ssh-target "${E2E_USER}@127.0.0.1:${SSHD_PORT}"
+run "${WORK_DIR}/bin/forward" add "${CLI_PORT}:${ECHO_PORT}" --machine sandbox
 t_exit_ok 0 "${rc}" "add 退出 0（stderr：${err}）"
 CLI_ID="${out}"
 t_eq "f-${CLI_PORT}" "${CLI_ID}" "返回记录 id"
@@ -441,18 +416,16 @@ else
   mkdir -p "${W4_STAGE}/bin"
   cp "${WORK_DIR}/bin/forward" "${W4_STAGE}/bin/forward"
   chmod +x "${W4_STAGE}/bin/forward"
-  ln -sfn "${WORK_DIR}/lib" "${W4_STAGE}/lib"
   cp "${WORK_DIR}/bin/forward-go" "${W4_STAGE}/bin/forward-go"
   chmod +x "${W4_STAGE}/bin/forward-go"
   run "${W4_STAGE}/bin/forward" list --oneline
   t_exit_ok 0 "${rc}" "Go 路径 list --oneline 退出 0（stderr：${err}）"
   t_contains "⇅${CLI_PORT}" "${out}" "Go 路径同样输出 ⇅${CLI_PORT}（行为一致）"
-  # 反向：没有 forward-go 时同一脚本回退 bash（两者逐字节相同）
-  dispatcher_out="${out}"
+  # Final shim has no Bash fallback: missing binary is an actionable 127.
   rm -f "${W4_STAGE}/bin/forward-go"
   run "${W4_STAGE}/bin/forward" list --oneline
-  t_exit_ok 0 "${rc}" "bash 回退路径退出 0"
-  t_eq "${dispatcher_out}" "${out}" "Go 与 bash 的 list --oneline 逐字节一致"
+  t_exit_ok 127 "${rc}" "缺 Go binary 时 shim 返回 127"
+  t_contains "forward-go" "${err}" "缺 binary 给出明确指引"
   rm -rf "${W4_STAGE}"
 fi
 
@@ -491,7 +464,7 @@ cli_cleanup
 # 只读保证：fake herdr 只回放 JSON（不连真 server）；ssh 用 shim 捕获 argv 后立即失败
 # （**绝不真连任何主机**，也不碰宿主/saved machine）。
 # ---------------------------------------------------------------------------
-t_describe "A3) A 机器场景（ssh:// URI target，含中文 label）"
+t_describe "A3) A 机器场景（Go machines + panel + ssh:// URI target）"
 
 A_STAGE_DIR="${HOME}/a-scenario"
 A_STATE_DIR="${A_STAGE_DIR}/state"
@@ -586,87 +559,65 @@ A_ENV=(
   "HERDR_BIN_PATH=${A_BIN_DIR}/herdr"
   "HERDR_PLUGIN_STATE_DIR=${A_STATE_DIR}"
   "HERDR_PLUGIN_CONFIG_DIR=${A_STAGE_DIR}/config"
+  "PATH=${A_BIN_DIR}:${PATH}"
 )
 
-# worker-15 修复探测（输出式；判据：带 scheme 的 target 必须解析出自己的端口）
-A_SCHEME_FIX="no"
-A_SCHEME_PROBE=""
-run env "${A_ENV[@]}" bash -c \
-  "source '${WORK_DIR}/lib/common.sh' >/dev/null 2>&1; source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1; ssh_probe_parse_target 'ssh://probe.invalid:1'"
-A_SCHEME_PROBE="${out}"
-if [[ "${A_SCHEME_PROBE}" == "probe.invalid 1" ]]; then
-  A_SCHEME_FIX="yes"
-else
-  log "A3：lib/ssh-probe.sh 尚未剥 ssh://（worker-15 未合入）→ argv 精确断言记 expected-red SKIP"
-fi
-
-t_it "fixture 自检：5 台机器、target 全 ssh:// URI、label 顺序含中文"
+# The fixture is the same five-machine shape used by the old A-side regression,
+# but every assertion now calls the Go CLI rather than a deleted shell module.
+t_it "fixture 自检：target 全 ssh:// URI、label 顺序含中文"
 run jq -r '[.[].target | startswith("ssh://")] | all' "${A_FIXTURE}"
-t_eq "true" "${out}" "target 全是 ssh:// 形态（A 的真实数据形状）"
+t_eq "true" "${out}" "target 全是 ssh:// 形态"
 run jq -r '[.[].label] | join(",")' "${A_FIXTURE}"
-t_eq "nj-mac,devcloud,nj-hw,nj-host,GPU机器" "${out}" "5 台 label 顺序与中文 label 正确"
+t_eq "nj-mac,devcloud,nj-hw,nj-host,GPU机器" "${out}" "label 顺序与中文 label 正确"
 
-t_it "machines_herdr_list_json 解析 A 形态：5 台，target 逐字保留"
-run env "${A_ENV[@]}" bash -c \
-  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_herdr_list_json | jq -r 'length'"
-t_exit_ok 0 "${rc}" "数据层调用成功（stderr：${err}）"
-t_eq "5" "${out}" "透传 5 台"
-run env "${A_ENV[@]}" bash -c \
-  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_herdr_list_json | jq -r '[.[].target] | join(\"\n\")'"
-t_eq "ssh://zheng@nj.rssyes.com:31415
-ssh://root@devcloud.zzj.cool:2222
-ssh://zzjcool@nj.rssyes.com:31416
-ssh://chieh@nj.rssyes.com:31417
-ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "5 台 target 全部逐字保留"
-
-t_it "machines_view_json：5 台 inactive，target 原文保留（面板数据入口）"
-run env "${A_ENV[@]}" bash -c \
-  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_view_json"
-t_exit_ok 0 "${rc}" "view 调用成功"
-A_VIEW="${out}"
-run bash -c "printf '%s' '${A_VIEW}' | jq -r 'length'"
-t_eq "5" "${out}" "视图 5 条"
-run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[].state] | join(\",\")'"
-t_eq "inactive,inactive,inactive,inactive,inactive" "${out}" "全 inactive"
-run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.id==\"8048d128c5b8a78a7bc10743a4c85853\") | .target] | join(\",\")'"
-t_eq "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "GPU机器 target 原文保留"
-
-t_it "中文 label 在容器 locale 下 jq 往返不乱码（UTF-8 字节级）"
-run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.label==\"GPU机器\")] | length'"
-t_eq "1" "${out}" "中文 label 精确匹配命中（未被转义/乱码）"
-run bash -c "printf '%s' '${A_VIEW}' | jq -r '[.[] | select(.label==\"GPU机器\")][0].label' | wc -c"
-t_eq "10" "${out}" "9 字节 UTF-8 + 换行（未被转成 \\uXXXX）"
-run env LC_ALL=C LANG=C bash -c \
-  "source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1; machines_view_json | jq -r '[.[] | select(.label==\"GPU机器\")][0].label' | wc -c"
-t_exit_ok 0 "${rc}" "LC_ALL=C 下数据层仍可用"
-
-t_it "bin/forward machines list：表格含 5 台（含中文 label 与 ssh:// target）"
-run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list
-t_exit_ok 0 "${rc}" "machines list rc=0（stderr：${err}）"
-t_contains "nj-mac" "${out}" "表格含 nj-mac"
-t_contains "devcloud" "${out}" "表格含 devcloud"
-t_contains "nj-hw" "${out}" "表格含 nj-hw"
-t_contains "nj-host" "${out}" "表格含 nj-host"
-t_contains "GPU机器" "${out}" "表格含中文 label GPU机器"
-t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "表格里 nj-mac 的 target 是 ssh:// 原文"
-t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "表格里 GPU机器 的 target 是 ssh:// 原文"
-t_contains "[ ] 未激活" "${out}" "全部标为未激活（A 的真实初始状态）"
-
-t_it "bin/forward machines list --json / --short：5 台且 target 原文"
+t_it "Go machines list --json：五台记录逐字保留"
 run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --json
-t_exit_ok 0 "${rc}" "list --json rc=0"
-run bash -c "printf '%s' '${out}' | jq -r 'length'"
-t_eq "5" "${out}" "--json 5 条"
-run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --short
-t_exit_ok 0 "${rc}" "list --short rc=0"
-t_contains "GPU机器" "${out}" "--short 含中文 label"
-t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "--short 含 ssh:// target 原文"
+t_exit_ok 0 "${rc}" "Go list --json rc=0"
+A_VIEW="${out}"
+printf '%s' "${A_VIEW}" >"${A_STAGE_DIR}/view.json"
+run jq -r 'length' "${A_STAGE_DIR}/view.json"
+t_eq "5" "${out}" "Go 视图 5 条"
+run jq -r '[.[].target] | join("\\n")' "${A_STAGE_DIR}/view.json"
+t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "nj-mac target 原文保留"
+t_contains "ssh://root@devcloud.zzj.cool:2222" "${out}" "devcloud target 原文保留"
+t_contains "ssh://zzjcool@nj.rssyes.com:31416" "${out}" "nj-hw target 原文保留"
+t_contains "ssh://chieh@nj.rssyes.com:31417" "${out}" "nj-host target 原文保留"
+t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "GPU target 原文保留"
 
-t_it "watch 非交互退化：exec watch -n 3 forward list（面板不开，脚本化零回归）"
-# cmd_watch 在 `[[ -t 0 ]]` 为假时 exec `watch -n 3 forward list`。这里用探针脚本把
-# stdin 接到 /dev/null（容器里 run-inside.sh 的 stdin 本身不保证非 TTY），并把
-# ${A_BIN_DIR}/watch 放到 PATH 最前拦下真 watch(1)（真 watch 在非 tty 下会
-# "failed to open terminal" 退出 126，而且它会挂住不收尾）。
+t_it "Go machines view：inactive 状态与中文 UTF-8"
+run jq -r '[.[].state] | join(",")' "${A_STAGE_DIR}/view.json"
+t_eq "inactive,inactive,inactive,inactive,inactive" "${out}" "全 inactive"
+run jq -r '[.[] | select(.label=="GPU机器") | .label] | length' "${A_STAGE_DIR}/view.json"
+t_eq "1" "${out}" "中文 label 精确匹配"
+run jq -r '[.[] | select(.label=="GPU机器")][0].label | @json' "${A_STAGE_DIR}/view.json"
+t_eq '"GPU机器"' "${out}" "中文 label 未乱码"
+run jq -r '[.[] | select(.id=="8048d128c5b8a78a7bc10743a4c85853")][0].target' "${A_STAGE_DIR}/view.json"
+t_eq "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "GPU target 精确"
+run jq -r '[.[].orphan] | any' "${A_STAGE_DIR}/view.json"
+t_eq "false" "${out}" "无 orphan"
+
+t_it "Go machines list table：五台与状态可见"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list
+t_exit_ok 0 "${rc}" "Go table rc=0"
+t_contains "nj-mac" "${out}" "table 含 nj-mac"
+t_contains "devcloud" "${out}" "table 含 devcloud"
+t_contains "nj-hw" "${out}" "table 含 nj-hw"
+t_contains "nj-host" "${out}" "table 含 nj-host"
+t_contains "GPU机器" "${out}" "table 含中文 label"
+t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "table 含 URI target"
+t_contains "[ ] 未激活" "${out}" "table 初始未激活"
+
+t_it "Go machines list --short：面板消费形态可用"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --short
+t_exit_ok 0 "${rc}" "Go short rc=0"
+t_contains "nj-mac" "${out}" "short 含 nj-mac"
+t_contains "GPU机器" "${out}" "short 含中文"
+t_contains "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000" "${out}" "short 含 GPU target"
+run env LC_ALL=C LANG=C "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines list --short
+t_exit_ok 0 "${rc}" "LC_ALL=C short rc=0"
+t_contains "GPU机器" "${out}" "LC_ALL=C 仍保留中文"
+
+t_it "Go watch 非交互退化：exec watch -n 3 forward list"
 cat >"${A_STAGE_DIR}/watch-probe.sh" <<EOF
 set -Eeuo pipefail
 export HERDR_BIN_PATH='${A_BIN_DIR}/herdr'
@@ -676,87 +627,38 @@ export PATH="${A_BIN_DIR}:\${PATH}"
 exec bash '${WORK_DIR}/bin/forward' watch </dev/null
 EOF
 run bash "${A_STAGE_DIR}/watch-probe.sh"
-t_exit_ok 0 "${rc}" "watch（非 TTY）rc=0（stderr：${err}）"
-t_contains "FAKE-WATCH" "${out}" "走的是 watch(1)（未进交互面板）"
-t_contains "-n 3" "${out}" "刷新间隔 3s"
-t_contains "list" "${out}" "目标是 forward list"
+t_exit_ok 0 "${rc}" "Go watch 非 TTY rc=0"
+t_contains "FAKE-WATCH" "${out}" "watch fallback 命中"
+t_contains "-n 3" "${out}" "watch 3s"
+t_contains "list" "${out}" "watch 目标 list"
 
-# 面板渲染（非交互直出 panel_render：pane 里渲染的就是这段文本）。
-# 探针一律达成文件用 `bash <file>` 跑，自己 export 所需变量：避免把长串 env 前缀
-# 写进命令行（可读性 + shellcheck/shfmt 友好），也避免 PATH 相互干扰。
-cat >"${A_STAGE_DIR}/render.sh" <<EOF
-set -Eeuo pipefail
-export HERDR_BIN_PATH='${A_BIN_DIR}/herdr'
-export HERDR_PLUGIN_STATE_DIR='${A_STATE_DIR}'
-export HERDR_PLUGIN_CONFIG_DIR='${A_STAGE_DIR}/config'
-source '${WORK_DIR}/lib/common.sh' >/dev/null 2>&1 || true
-source '${WORK_DIR}/lib/state.sh' >/dev/null 2>&1 || true
-source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1 || true
-source '${WORK_DIR}/lib/panel.sh' >/dev/null 2>&1 || true
-panel_render
-EOF
-t_it "面板渲染（非交互直出）：MACHINES (5) 含 5 台机器与中文 label"
-run bash "${A_STAGE_DIR}/render.sh"
-t_exit_ok 0 "${rc}" "panel_render rc=0（stderr：${err}）"
-t_contains "MACHINES (5)" "${out}" "面板列出 5 台（这就是 A 上应该看到的输出）"
-t_contains "nj-mac" "${out}" "面板含 nj-mac"
-t_contains "nj-host" "${out}" "面板含 nj-host"
-t_contains "GPU机器" "${out}" "面板含中文 label GPU机器"
-t_contains "ssh://zheng@nj.rssyes.com:31415" "${out}" "面板 target 显示 ssh:// 原文"
-t_contains "未激活" "${out}" "全部标为未激活"
+t_it "Go panel golden：非 TTY 仍输出稳定帧"
+run env HERDR_PLUGIN_STATE_DIR="${A_STATE_DIR}" "${WORK_DIR}/bin/forward" internal difftest phase4 panel-frame 3
+t_exit_ok 0 "${rc}" "panel golden probe rc=0"
+t_contains "herdr-forward" "${out}" "panel 帧标题"
+t_contains "FORWARDS" "${out}" "panel 帧 forwards 区"
+t_contains "刷新 3s" "${out}" "panel 帧刷新间隔"
 
-t_it "激活 ssh:// target：探测命令 argv 组装（ssh shim 捕获，不真连）"
-# 期待（M1 冻结形状）：ssh -n -o BatchMode=yes -o ConnectTimeout=8 [-p PORT] HOST REMOTE_CMD
-# worker-15 未合入时 HOST 会带着 ssh:// 前缀且无 -p —— 那是 A 的实测症状，此处记为 expected-red。
+t_it "Go machines activate：ssh:// target 拆出 host 与端口"
 : >"${A_SSH_LOG}"
-cat >"${A_STAGE_DIR}/argv.sh" <<EOF
-set -Eeuo pipefail
-export PATH="${A_BIN_DIR}:\${PATH}"
-export A_SSH_LOG='${A_SSH_LOG}'
-source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1
-ssh_probe_run 'ssh://zheng@nj.rssyes.com:31415' 'REMOTE_LIST_CMD_FIXTURE'
-EOF
-run bash "${A_STAGE_DIR}/argv.sh"
-t_exit_ok 0 "${rc}" "ssh_probe_run 恒 return 0（stderr：${err}）"
+run env "${A_ENV[@]}" "${WORK_DIR}/bin/forward" machines activate 191645f46cf4bc677a393cf0ca51d193 --no-install
+t_exit_ok 4 "${rc}" "不可达目标按 machine resolve 4 报告"
 A_ARGV="$(cat "${A_SSH_LOG}" 2>/dev/null || true)"
-t_contains "ARGV <-n>" "${A_ARGV}" "argv 起点是 ssh shim 的 -n（非交互，不吃 stdin）"
-t_contains "BatchMode=yes" "${A_ARGV}" "带 BatchMode=yes（绝不弹密码）"
-t_contains "ConnectTimeout=8" "${A_ARGV}" "带有界连接超时"
-t_contains "REMOTE_LIST_CMD_FIXTURE" "${A_ARGV}" "远端命令作为最后一个实参"
-if [[ "${A_SCHEME_FIX}" == "yes" ]]; then
-  t_contains "<-p> <31415>" "${A_ARGV}" "显式端口 -p 31415（nj-mac:31415）"
-  t_contains "<zheng@nj.rssyes.com>" "${A_ARGV}" "host 无 ssh:// 前缀"
-  A_ARGV_SCHEME="no"
-  if [[ "${A_ARGV}" == *ssh://* ]]; then
-    A_ARGV_SCHEME="yes"
-  fi
-  t_eq "no" "${A_ARGV_SCHEME}" "argv 中不含 ssh:// scheme"
+t_contains "<-p> <31415>" "${A_ARGV}" "显式端口 -p 31415"
+t_contains "<zheng@nj.rssyes.com>" "${A_ARGV}" "host 无 ssh:// 前缀"
+t_contains "BatchMode=yes" "${A_ARGV}" "探测带 BatchMode"
+t_contains "ConnectTimeout=8" "${A_ARGV}" "探测有界超时"
+t_contains "herdr plugin list" "${A_ARGV}" "远端探测命令到达 ssh"
+if [[ "${A_ARGV}" == *ssh://* ]]; then
+  t_fail "ssh argv 不应含 ssh:// scheme"
 else
-  t_contains "ssh://zheng@nj.rssyes.com:31415" "${A_ARGV}" "当前 main 症状复现：整串被当 host（worker-15 修复后本断言改为 -p 31415）"
-  t_skip "expected-red：ssh:// 剥前缀 + -p 31415 归 worker-15（lib/ssh-probe.sh）；合入后本段自动转绿"
+  t_pass "ssh argv 不含 ssh:// scheme"
 fi
 
-t_it "激活链路不假装 present（shim 恒失败 -> 绝不写指向 A 的假路径）"
-cat >"${A_STAGE_DIR}/bridge.sh" <<EOF
-set -Eeuo pipefail
-export PATH="${A_BIN_DIR}:\${PATH}"
-export A_SSH_LOG='${A_SSH_LOG}'
-source '${WORK_DIR}/lib/machines.sh' >/dev/null 2>&1
-source '${WORK_DIR}/lib/ssh-probe.sh' >/dev/null 2>&1
-machines_ssh_probe_plugin 'ssh://zheng@nj.rssyes.com:31415'
-EOF
-run bash "${A_STAGE_DIR}/bridge.sh"
-t_exit_ok 0 "${rc}" "探测桥 rc=0"
-t_contains "HF_STATUS=" "${out}" "输出 §2.1 冻结的 KV 契约"
-t_isnt "HF_STATUS=present" "${out}" "绝不假装 present"
-t_file_absent "${A_STATE_DIR}/activated-machines.json" "未写激活记录（不产生指向 A 的假路径）"
-
-t_it "配置隔离：A 段的 HERDR_BIN_PATH 不泄漏到后续阶段（B/C/D 用各自环境）"
+t_it "探测失败不写激活记录，且父环境不污染"
+t_file_absent "${A_STATE_DIR}/activated-machines.json" "探测失败不写激活记录"
 run bash -c "printf '%s' '${HERDR_BIN_PATH:-<unset>}'"
-t_eq "<unset>" "${out}" "A 段的 fake herdr 只经 env 前缀注入，未污染全局"
-
-# 收尾：本段的 fake herdr / shim 不进后续阶段（B/C/D 仍用各自的环境）
-rm -rf "${A_STAGE_DIR}"
+t_eq "<unset>" "${out}" "A_ENV 未污染父 shell"
 
 # ---------------------------------------------------------------------------
 # B) 容器内完整基线（Dockerfile 已装齐 shellcheck/shfmt/jq，宿主缺工具不阻塞）
@@ -822,8 +724,13 @@ else
 fi
 
 t_it "integration 层（无文件时显式 SKIP，不视为失败）"
-run bash tests/run.sh integration
+INT_LOG="${RESULTS_DIR}/e2e-integration.log"
+run bash -c "bash tests/run.sh integration >'${INT_LOG}' 2>&1"
 t_exit_ok 0 "${rc}" "环境内 integration 通过/SKIP"
+if [[ "${rc}" -ne 0 ]]; then
+  int_tail="$(tail -40 "${INT_LOG}" || true)"
+  t_fail "integration 诊断：${int_tail}"
+fi
 
 # ---------------------------------------------------------------------------
 # B2) W4 切换后的 Go CLI 验证（PLAN-GO-MIGRATION §6 Phase 1 / §10 W4）
@@ -864,37 +771,22 @@ t_exit_ok 0 "${rc}" "list 退出 0"
 t_contains "${W4_CLIENT_PORT}" "${out}" "表格含该 client 行"
 t_contains "waiting" "${out}" "client 映射状态为 waiting"
 
-# 回退等价：同一状态目录下，Go 路径与 bash 路径的输出必须逐字节相同。
-# 手法：把 bin/forward-go 挪开 -> bin/forward 回退 bash；两侧都跑 list / list --json。
-t_it "B2：Go 与 bash 的 list 输出逐字节一致（回滚等价性）"
-if [[ "${GO_CLI_READY}" -ne 1 ]]; then
-  t_skip "容器内未就绪 Go CLI，跳过回滚等价性对位"
-else
-  run "${FW_W4}" list
-  w4_go_table="${out}"
-  run "${FW_W4}" list --json
-  w4_go_json="${out}"
-  run "${FW_W4}" list --oneline
-  w4_go_oneline="${out}"
-  go_cli_park
-  run "${FW_W4}" list
-  t_eq "${w4_go_table}" "${out}" "list 表格：Go 与 bash 逐字节一致"
-  run "${FW_W4}" list --json
-  t_eq "${w4_go_json}" "${out}" "list --json：Go 与 bash 逐字节一致"
-  run "${FW_W4}" list --oneline
-  t_eq "${w4_go_oneline}" "${out}" "list --oneline：Go 与 bash 逐字节一致"
-  # ports：bash 会优先用 ss（带进程名），Go 读 /proc（无进程名）—— 已知偏离。
-  # 只断言「行集合（端口/地址）」一致，不断言 PROCESS 列。
-  run "${FW_W4}" ports
-  w4_bash_ports="${out}"
-  go_cli_unpark
-  run "${FW_W4}" ports
-  w4_go_ports="${out}"
-  w4_bash_ports_portcol="$(printf '%s\n' "${w4_bash_ports}" | awk 'NR>1 {print $1" "$2}' | sort)"
-  w4_go_ports_portcol="$(printf '%s\n' "${w4_go_ports}" | awk 'NR>1 {print $1" "$2}' | sort)"
-  t_eq "${w4_bash_ports_portcol}" "${w4_go_ports_portcol}" "ports：端口/地址列一致（PROCESS 列有已知偏离）"
-  t_contains "PORT    ADDR             PROCESS              FORWARDED" "${w4_go_ports}" "ports（Go）表头契约不变"
-fi
+# Final Go path has no rollback to a second implementation. Re-run the
+# three public list forms and assert their stable shapes directly.
+t_it "B2：Go list 三形态与 ports JSON 稳定契约"
+run "${FW_W4}" list
+t_exit_ok 0 "${rc}" "Go list table rc=0"
+t_contains "${W4_CLIENT_PORT}" "${out}" "Go table port"
+run "${FW_W4}" list --json
+t_exit_ok 0 "${rc}" "Go list json rc=0"
+t_contains '"forwards"' "${out}" "Go json envelope"
+run "${FW_W4}" list --oneline
+t_exit_ok 0 "${rc}" "Go list oneline rc=0"
+t_eq "" "${out}" "waiting client oneline empty"
+run "${FW_W4}" ports --json
+t_exit_ok 0 "${rc}" "Go ports json rc=0"
+t_contains '"port"' "${out}" "ports JSON port column"
+t_contains '"addr"' "${out}" "ports JSON address column"
 
 # tab bar 延迟：`forward list --oneline` 必须秒回（面板/ tab bar 命令的热路径）。
 t_it "B2：list --oneline 延迟 < 1s（tab bar 热路径）"

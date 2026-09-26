@@ -8,7 +8,7 @@
 # TOML 注意：payload 里含双引号，故用 literal string（单引号）避免二次转义。
 id = "zzjcool:forward"
 name = "forward"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
 description = "Forward a saved SSH machine's TCP port to localhost, and optionally publish a localhost port to the public internet via a Cloudflare quick tunnel."
 platforms = ["linux", "macos"]
@@ -20,7 +20,7 @@ platforms = ["linux", "macos"]
 # ---------------------------------------------------------------------------
 
 [[build]]
-command = ["bash", "scripts/postinstall.sh"]
+command = ["sh", "scripts/postinstall.sh"]
 
 # ---------------------------------------------------------------------------
 # startup hook —— OOTB：装好插件后自动补上 tab bar 状态条
