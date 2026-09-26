@@ -300,6 +300,10 @@ t_describe "fixture：用户态 sshd + echo 服务（state dir 名含 %）"
 t_if_pct="absent"
 [[ ${HERDR_PLUGIN_STATE_DIR} == *%* ]] && t_if_pct="present"
 t_eq "present" "${t_if_pct}" "state dir 名确实含 %"
+# root 环境下（容器/CI）PermitRootLogin no 会拒掉同用户测试登录，降级为仅密钥
+if id -u | grep -qx 0; then
+  sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${T2_TMP}/sshd_config"
+fi
 /usr/bin/sshd -f "${T2_TMP}/sshd_config" -E "${T2_TMP}/sshd.log"
 SSHD_PID="$(cat "${T2_TMP}/sshd.pid")"
 t2_wait_port "${SSHD_PORT}"

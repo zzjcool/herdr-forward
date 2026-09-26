@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2312,SC2317 # cleanup and fixture assertions are best-effort.
+# shellcheck disable=SC1091,SC2312,SC2317,SC2329 # cleanup and fixture assertions are best-effort.
 # Go CLI integration: real sshd + ControlMaster + payload round-trip.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,6 +47,11 @@ UsePAM no
 AllowTcpForwarding yes
 LogLevel ERROR
 EOF
+# 容器/CI 常以 root 跑测试：PermitRootLogin no 会把同用户的测试 ssh 全拒掉
+#（本机非 root 不受影响）。仅测试 sshd，按实际运行用户设置。
+if id -u | grep -qx 0; then
+  sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${TMP}/sshd_config"
+fi
 /usr/bin/sshd -f "${TMP}/sshd_config" -E "${TMP}/sshd.log"
 SSHD_PID="$(cat "${TMP}/sshd.pid")"
 cat >"${TMP}/echo.py" <<'PY'

@@ -7,6 +7,7 @@ package tunnel
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -420,6 +421,12 @@ func TestReapIsIdempotent(t *testing.T) {
 // --- 5. Start 失败路径 --------------------------------------------------------
 
 func TestStartFailurePath(t *testing.T) {
+	// 本用例的「失败」来自 ssh 连接被拒路径；裸环境（GitHub runner / 最小容器）
+	// 没有 ssh 时走的是 ErrSSHMissing（die 127）分支，那是另一条路径（由
+	// TestStartSSSMissingPath 覆盖）。此处跳过，避免环境依赖误报。
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("环境无 ssh：连接被拒路径不可测（ErrSSHMissing 分支另测）")
+	}
 	useStateDir(t)
 	// 缩短重试旋钮：默认 50×0.1s = 5s；测试只跑 3×1ms。
 	oldAttempts, oldInterval, oldTimeout := checkAttempts, checkInterval, ctlSSHTimeout
@@ -451,6 +458,28 @@ func TestStartFailurePath(t *testing.T) {
 	// 失败路径不写 pid 文件（只有拿到 master 才写）
 	if _, err := os.Stat(filepath.Join(ctlDir, "pid-f-45999")); err == nil {
 		t.Errorf("失败时不该有 pid-<id>")
+	}
+}
+
+// TestStartSSHMissingPath：环境无 ssh（PATH 隔离）时 Start 返回 ErrSSHMissing
+// （bash 的 require_cmd ssh / die 127 同形），且不写 target/pid 文件。
+func TestStartSSHMissingPath(t *testing.T) {
+	useStateDir(t)
+	// PATH 隔离：只保留测试沙箱必需的系统路径，剥离一切含 ssh 的目录。
+	t.Setenv("PATH", "/nonexistent-bin")
+	_, err := NewManager().Start("f-45998", 45998, "127.0.0.1", 45998, "nobody@127.0.0.1:45998")
+	if !errors.Is(err, ErrSSHMissing) {
+		t.Fatalf("无 ssh 环境应返回 ErrSSHMissing，得到：%v", err)
+	}
+	ctlDir, derr := ControlDir()
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if _, serr := os.Stat(filepath.Join(ctlDir, "target-f-45998")); serr == nil {
+		t.Errorf("无 ssh 时不应写 target-<id>")
+	}
+	if _, serr := os.Stat(filepath.Join(ctlDir, "pid-f-45998")); serr == nil {
+		t.Errorf("无 ssh 时不应写 pid-<id>")
 	}
 }
 

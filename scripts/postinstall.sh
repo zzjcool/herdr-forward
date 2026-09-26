@@ -24,7 +24,7 @@ fail_install() {
   exit 1
 }
 
-# shellcheck disable=SC2317 # cleanup is invoked by the EXIT/signal trap.
+# shellcheck disable=SC2317,SC2329 # cleanup is invoked by the EXIT/signal trap.
 cleanup() {
   if [ -n "${tmpdir}" ]; then
     if [ -d "${tmpdir}" ]; then

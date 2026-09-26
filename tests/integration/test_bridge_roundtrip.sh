@@ -182,6 +182,10 @@ if ! /usr/bin/sshd -t -f "${T}/sshd_config" 2>/dev/null; then
   grep -v '^PerSourcePenalties' "${T}/sshd_config" >"${T}/sshd_config.2"
   mv "${T}/sshd_config.2" "${T}/sshd_config"
 fi
+# root 环境下（容器/CI）PermitRootLogin no 会拒掉同用户测试登录，降级为仅密钥
+if id -u | grep -qx 0; then
+  sed -i "s/^PermitRootLogin no$/PermitRootLogin prohibit-password/" "${T}/sshd_config"
+fi
 /usr/bin/sshd -f "${T}/sshd_config" -E "${T}/sshd.log"
 sleep 0.3
 SSHD_PID="$(cat "${T}/sshd.pid")"
