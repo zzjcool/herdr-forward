@@ -449,7 +449,7 @@ else
 fi
 
 t_it "add 与 remove 复用同一 pane open 路径（--plugin/--entrypoint/--placement 一致）"
-pane_substr='plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup'
+pane_substr='plugin pane open --plugin zzjcool:forward --entrypoint ports --placement overlay'
 if [[ "${manifest_add_cmd}" == *"${pane_substr}"* && "${manifest_remove_cmd}" == *"${pane_substr}"* ]]; then
   t_pass "add/remove 的 pane open 片段一致"
 else

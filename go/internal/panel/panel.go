@@ -159,50 +159,18 @@ func RenderFrameFromState(fw []state.Forward, machines []MachineRow, listening [
 func RenderFrameData(data FrameData) string {
 	refresh := refreshSeconds(data.Refresh)
 	var b strings.Builder
-	fmt.Fprintf(&b, "herdr-forward · Port Forward   刷新 %ds · r 立即刷新 · x 退出\n", refresh)
+	fmt.Fprintf(&b, "herdr-forward | Port Forward   refresh %ds - r now - x quit\n", refresh)
 	b.WriteString("──────────────────────────────────────────────────────────────\n")
 	if data.Flash != "" {
 		b.WriteString(data.Flash)
 		b.WriteByte('\n')
 	}
-	// Keep compact, single-line affordances near the top as well as the
-	// detailed tables below.  This is useful in narrow popup terminals where
-	// a long explanatory row may wrap before its selectable prefix is visible.
-	for i, m := range data.Machines {
-		if i >= 9 {
-			break
-		}
-		label := m.Label
-		if label == "" {
-			label = m.ID
-		}
-		mark := "[ ]"
-		if m.State == "active" || m.State == "local" {
-			mark = "[✓]"
-		}
-		if m.Note != "" {
-			fmt.Fprintf(&b, "MACHINE %s %d. %s · %s\n", mark, i+1, label, m.Note)
-		} else {
-			fmt.Fprintf(&b, "MACHINE %s %d. %s\n", mark, i+1, label)
-		}
-	}
-	if data.ClientLive {
-		for i, listener := range data.Listening {
-			if i >= 9 {
-				break
-			}
-			proc := listener.Process
-			if proc == "" {
-				proc = "-"
-			}
-			fmt.Fprintf(&b, "PORT f%d  %d %s\n", i+1, listener.Port, proc)
-		}
-	}
-
+	// CLIENT 行（A.3.3）：本机被 client 经桥接 attach 时显示是谁连着。
+	// bash 版帧里没有「顶部单行 MACHINE/PORT 候选区」——Go 重写时自创的，已删。
 	if data.ClientLive && len(data.ClientHosts) > 0 {
 		b.WriteString("CLIENT  ")
 		b.WriteString(strings.Join(data.ClientHosts, ", "))
-		b.WriteString(" 已连接 · 本机端口可映射到它的 localhost（远程开发）\n")
+		b.WriteString(" connected - map local ports to its localhost (remote dev)\n")
 	}
 
 	rows := append([]ForwardRow(nil), data.Forwards...)
@@ -216,9 +184,9 @@ func RenderFrameData(data FrameData) string {
 	fmt.Fprintf(&b, "FORWARDS (%d)\n", len(rows))
 	if len(rows) == 0 {
 		if data.ClientLive {
-			b.WriteString("  （无映射）按 f+序号 把下面的监听端口映射到 client，或运行 forward add <端口>。\n")
+			b.WriteString("  (no forwards) press f+<n> to map a listening port to the client, or run forward add <port>.\n")
 		} else {
-			b.WriteString("  （无映射）终端里运行 forward add 3000:3000 --machine <label> 添加。\n")
+			b.WriteString("  (no forwards) run 'forward add 3000:3000 --machine <label>' in a terminal.\n")
 		}
 	} else {
 		fmt.Fprintf(&b, "  %-2s %-13s %-22s %-9s %s\n", "#", "LOCAL", "REMOTE", "STATUS", "NOTE")
@@ -237,27 +205,27 @@ func RenderFrameData(data FrameData) string {
 			if row.Mode == string(state.ModeClient) && note == "" {
 				switch row.Status {
 				case "waiting":
-					note = "等待 client 连上"
+					note = "waiting for client"
 				case "pending":
-					note = "等待 client 回报"
+					note = "awaiting client report"
 				}
 			}
 			if row.Mode == "bridge" {
-				note = "经桥接（在 " + row.Remote + " 上登记）"
+				note = "via bridge (registered on " + row.Remote + ")"
 			}
 			fmt.Fprintf(&b, "  %-2s %-13s %-22s %-9s %s\n", number, local, row.Remote, dash(row.Status), note)
 		}
 		if removable > 0 {
-			b.WriteString(dim + "  d+序号 删除映射" + reset + "\n")
+			b.WriteString(dim + "  d+<n> remove forward" + reset + "\n")
 		}
 	}
 
 	if data.ClientLive {
 		b.WriteString("──────────────────────────────────────────────────────────────\n")
 		if len(data.Listening) == 0 {
-			b.WriteString("LISTENING  （本机没有其它监听端口；起个 dev server 后这里会出现）\n")
+			b.WriteString("LISTENING  (no other listening ports; start a dev server and it shows up here)\n")
 		} else {
-			b.WriteString("LISTENING  本机监听端口 · f+序号 映射到 client 的 localhost\n")
+			b.WriteString("LISTENING  local ports - f+<n> maps to the client's localhost\n")
 			for i, l := range data.Listening {
 				if i >= 9 {
 					break
@@ -273,7 +241,7 @@ func RenderFrameData(data FrameData) string {
 
 	if len(data.Machines) > 0 {
 		b.WriteString("──────────────────────────────────────────────────────────────\n")
-		fmt.Fprintf(&b, "MACHINES (%d)  数字键 = 激活 / 停用\n", len(data.Machines))
+		fmt.Fprintf(&b, "MACHINES (%d)  number keys = activate / deactivate\n", len(data.Machines))
 		for i, m := range data.Machines {
 			if i >= 9 {
 				break
@@ -286,22 +254,22 @@ func RenderFrameData(data FrameData) string {
 			if target == "" {
 				target = "-"
 			}
-			mark, desc := "[ ]", "（未激活 · 按 "+strconv.Itoa(i+1)+" 探测并激活）"
+			mark, desc := "[ ]", "(inactive - press "+strconv.Itoa(i+1)+" to probe & activate)"
 			switch m.State {
 			case "active":
-				mark = "[✓]"
-				desc = "（当前活动 · tab bar 指向该机）"
+				mark = "[x]"
+				desc = "(active - tab bar points here)"
 			case "local":
-				mark = "[✓]"
-				desc = "（本机 · 无需远程探测）"
+				mark = "[x]"
+				desc = "(local - no probe needed)"
 			case "activated":
-				mark = "[·]"
-				desc = "（已激活, 非当前 · 按 " + strconv.Itoa(i+1) + " 切回）"
+				mark = "[-]"
+				desc = "(activated - press " + strconv.Itoa(i+1) + " to switch back)"
 			}
 			if m.State == "active" && m.Note != "" {
-				desc = "（当前活动 · " + m.Note + "）"
+				desc = "(active - " + m.Note + ")"
 			}
-			line := fmt.Sprintf("  %s %d. %-8s %-10s %s", mark, i+1, label, target, desc)
+			line := fmt.Sprintf("  %s %d. %-16s %-20s %s", mark, i+1, label, target, desc)
 			if m.State != "active" && m.State != "local" {
 				b.WriteString(dim)
 			}
@@ -313,19 +281,19 @@ func RenderFrameData(data FrameData) string {
 		}
 	} else if data.MachinesKnown && !data.ClientLive {
 		b.WriteString("──────────────────────────────────────────────────────────────\n")
-		b.WriteString("MACHINES (0)  还没有 saved machine\n")
-		b.WriteString("  远程开发：先在终端运行 herdr machine add <ssh 目标> --label <名字>，回到这里按序号激活。\n")
+		b.WriteString("MACHINES (0)  no saved machines yet\n")
+		b.WriteString("  remote dev: run 'herdr machine add <ssh target> --label <name>' in a terminal, then activate it here.\n")
 	}
 
 	b.WriteString("──────────────────────────────────────────────────────────────\n")
-	keys := "按键: 1-9 选择机器（激活前会确认）"
+	keys := "keys: 1-9 pick machine (confirm before activate)"
 	if data.ClientLive && len(data.Listening) > 0 {
-		keys += " · f+序号 映射端口"
+		keys += " - f+<n> map port"
 	}
 	if removable > 0 {
-		keys += " · d+序号 删除映射"
+		keys += " - d+<n> remove forward"
 	}
-	b.WriteString(keys + " · r 刷新 · a 添加转发用法 · x 退出\n")
+	b.WriteString(keys + " - r refresh - a add help - x quit\n")
 	return b.String()
 }
 
@@ -475,7 +443,7 @@ func Run(ctx context.Context, opts Options) error {
 					if err := runAction(out, opts.OnAction, Action{Kind: ActionAddClient, Value: port}); err != nil {
 						flash = fmt.Sprintf("  ⚠ 映射失败：%v", err)
 					} else {
-						flash = fmt.Sprintf("  ✓ 已映射本机 %s", port)
+						flash = fmt.Sprintf("  [ok] mapped local port %s", port)
 					}
 				}
 				removeArmed, forwardArmed = false, false
@@ -501,7 +469,7 @@ func Run(ctx context.Context, opts Options) error {
 		case ActionRefresh:
 			continue
 		case ActionHint:
-			fmt.Fprintln(out, "panel: 添加转发：终端里运行 'forward add <port>'（有 client 连着时映射到它的 localhost）。")
+			fmt.Fprintln(out, "panel: add forward: run 'forward add <port>' in a terminal (maps to its localhost when a client is attached).")
 		case ActionActivate, ActionDeactivate:
 			pending = doMachineAction(ctx, in, out, opts.OnAction, action, data)
 		case ActionPickForward:
@@ -572,24 +540,24 @@ func doMachineAction(ctx context.Context, in *os.File, out io.Writer, fn func(Ac
 		}
 	}
 	if action.Kind == ActionActivate {
-		fmt.Fprintf(out, "将通过 SSH 只读探测 %s，继续? [y/N]\n", label)
-		fmt.Fprintf(out, "确认：将通过 SSH 只读探测 %s\n", label)
+		fmt.Fprintf(out, "probe %s read-only over SSH, continue? [y/N]\n", label)
+		fmt.Fprintf(out, "confirm: probing %s read-only over SSH\n", label)
 		key, err := readByte(int(in.Fd()), -1)
 		fmt.Fprintln(out)
 		if err != nil || (key != 'y' && key != 'Y') {
-			fmt.Fprintln(out, "  （已取消，未发起任何连接）")
+			fmt.Fprintln(out, "  (cancelled, no connection attempted)")
 			return nil
 		}
-		fmt.Fprintln(out, "  ⏳ 探测中…（只读 SSH，最长约 15 秒）")
+		fmt.Fprintln(out, "  probing... (read-only SSH, up to ~15s)")
 	} else {
-		fmt.Fprintf(out, "停用 %s，继续? [y/N]\n", label)
+		fmt.Fprintf(out, "deactivate %s, continue? [y/N]\n", label)
 		key, err := readByte(int(in.Fd()), -1)
 		fmt.Fprintln(out)
 		if err != nil || (key != 'y' && key != 'Y') {
-			fmt.Fprintln(out, "  （已取消）")
+			fmt.Fprintln(out, "  (cancelled)")
 			return nil
 		}
-		fmt.Fprintln(out, "  ⏳ 停用中…")
+		fmt.Fprintln(out, "  deactivating...")
 	}
 	if ctx.Err() != nil {
 		return nil
@@ -597,7 +565,7 @@ func doMachineAction(ctx context.Context, in *os.File, out io.Writer, fn func(Ac
 	if err := runAction(out, fn, action); err != nil {
 		fmt.Fprintf(out, "  ⚠ 命令失败：%v\n", err)
 	}
-	fmt.Fprintln(out, "  （按任意键返回面板）")
+	fmt.Fprintln(out, "  (press any key to return to the panel)")
 	key, err := readByte(int(in.Fd()), 120*time.Second)
 	if err == nil {
 		return &key
@@ -611,13 +579,13 @@ func doPickAction(in *os.File, out io.Writer, fn func(Action) error, data FrameD
 		return nil
 	}
 	if !remove && len(data.Listening) == 0 {
-		fmt.Fprintln(out, "  没有可映射的监听端口（需要有 client 经桥接连着本机）。")
+		fmt.Fprintln(out, "  no listening ports to map (requires a client attached via bridge).")
 		return nil
 	}
-	fmt.Fprintln(out, "  输入序号 1-9（其它键取消）")
+	fmt.Fprintln(out, "  enter 1-9 (any other key cancels)")
 	key, err := readByte(int(in.Fd()), 10*time.Second)
 	if err != nil || key < '1' || key > '9' {
-		fmt.Fprintln(out, "  （已取消）")
+		fmt.Fprintln(out, "  (cancelled)")
 		return nil
 	}
 	idx := int(key - '1')
@@ -638,9 +606,9 @@ func doPickAction(in *os.File, out io.Writer, fn func(Action) error, data FrameD
 	if err := runAction(out, fn, Action{Kind: kind, Value: value}); err != nil {
 		fmt.Fprintf(out, "  ⚠ 失败：%v\n", err)
 	} else if remove {
-		fmt.Fprintf(out, "  ✓ 已删除 %s\n", value)
+		fmt.Fprintf(out, "  [ok] removed %s\n", value)
 	} else {
-		fmt.Fprintf(out, "  ✓ 已映射本机 %s\n", value)
+		fmt.Fprintf(out, "  [ok] mapped local port %s\n", value)
 	}
 	return nil
 }
@@ -769,13 +737,13 @@ func bridgeMachineNotes() map[string]string {
 		state := jqjson.Str(objectValue(obj, "state"))
 		switch {
 		case running && state == "connected":
-			out[id] = "桥接已连接"
+			out[id] = "bridge connected"
 		case state == "retrying":
-			out[id] = "桥接重连中"
+			out[id] = "bridge reconnecting"
 		case running:
-			out[id] = "桥接连接中"
+			out[id] = "bridge connecting"
 		default:
-			out[id] = "桥接未运行"
+			out[id] = "bridge not running"
 		}
 	}
 	return out
@@ -804,7 +772,7 @@ func forwardRow(obj *jqjson.Object) ForwardRow {
 	if mode == string(state.ModeClient) {
 		note = jqjson.Str(objectValue(obj, "status_reason"))
 	} else if mode == "bridge" {
-		note = "经桥接（在 " + jqjson.Str(objectValue(obj, "machine")) + " 上登记）"
+		note = "via bridge (registered on " + jqjson.Str(objectValue(obj, "machine")) + ")"
 	} else if pid := objectValue(obj, "pid"); pid != nil {
 		note = "pid " + jqjson.ToString(pid)
 	}

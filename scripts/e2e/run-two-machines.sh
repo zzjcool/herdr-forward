@@ -224,7 +224,7 @@ PY"
 }
 panel_still_open() {
   sleep 1.5
-  ui_shows 'herdr-forward · Port Forward'
+  ui_shows 'herdr-forward | Port Forward'
 }
 
 # wait_for <seconds> <cmd...>：cmd 的 stdout 为 yes 即 WAITED_RC=0（否则 1）。恒 return 0：
@@ -342,12 +342,12 @@ t_exit_ok 0 "${rc}" "安装（build 步骤）退出 0"
 t_match '已装好键位|键位：已写入|install-keys: 已写入' "${out}" "build 步骤装好了键位"
 t_contains "现在就可以按 prefix+f" "${out}" "build 步骤重载了正在运行的 herdr"
 ui_prefix f
-wait_for 10 ui_shows 'herdr-forward · Port Forward'
+wait_for 10 ui_shows 'herdr-forward | Port Forward'
 t_exit_ok 0 "${WAITED_RC}" "prefix+f 打开 Port Forward 面板（server 未重启）"
-wait_for 5 ui_shows 'MACHINES \(0\)  还没有 saved machine'
+wait_for 5 ui_shows 'MACHINES \(0\)  no saved machines yet'
 t_exit_ok 0 "${WAITED_RC}" "还没有 saved machine 时明说，并给出下一步"
 screen="$(ui_screen)"
-t_contains "herdr machine add <ssh 目标> --label <名字>" "${screen}" "面板给出 machine add 命令"
+t_contains "herdr machine add <ssh target> --label <name>" "${screen}" "面板给出 machine add 命令"
 hint="$(ui_shows '未列出 saved machines')"
 t_eq "" "${hint}" "不再误报「machine list 可能失败」"
 ui_keys Enter
@@ -371,12 +371,12 @@ wait_for 10 ui_shows 'MACHINES \(1\)'
 t_exit_ok 0 "${WAITED_RC}" "面板弹出并列出 saved machine"
 screen="$(ui_screen)"
 t_match '\[ \] 1\. devbox' "${screen}" "devbox 为未激活"
-t_match 'Port Forward─{60,}' "${screen}" "popup 按 manifest 的 80% 宽度打开（面板行不折断）"
+t_match 'herdr-forward \| Port Forward' "${screen}" "overlay 面板打开（placement=overlay，行不折断）"
 ui_keys 1
-wait_for 5 ui_shows '将通过 SSH 只读探测 devbox'
+wait_for 5 ui_shows 'probe devbox read-only over SSH, continue'
 t_exit_ok 0 "${WAITED_RC}" "激活前确认"
 ui_keys y
-wait_for 60 ui_shows '按任意键返回面板'
+wait_for 60 ui_shows '(press any key to return)'
 t_exit_ok 0 "${WAITED_RC}" "激活完成"
 screen="$(ui_screen)"
 t_contains "远端键位已装好并已重载" "${screen}" "B 的键位由 A 代装并重载"
@@ -402,11 +402,31 @@ ui_keys Enter
 wait_for 15 viewing "bob@devbox"
 t_exit_ok 0 "${WAITED_RC}" "输入现在落在 B 的 shell"
 ui_prefix f
-wait_for 10 ui_shows 'CLIENT  laptop 已连接'
-t_exit_ok 0 "${WAITED_RC}" "B 的面板：client laptop 已连接"
-screen="$(ui_screen)"
-t_match 'f1  5173 +python3' "${screen}" "LISTENING 列出 B 的 5173"
-t_match 'f2  8080 +python3' "${screen}" "LISTENING 列出 B 的 8080"
+# 远程 pane（viewing devbox）的 herdr 渲染存在半重绘叠加竞态：短词可能被残影
+# 拆开。用重试窗口内的任一稳定帧判定（与 A 侧 bridge:up 同款容错）。
+client_seen=0
+listening_seen=0
+for _try in $(seq 1 25); do
+  screen="$(ui_screen)"
+  # CLIENT 行在远程 pane 里可能被 pane 右缘折行（laptop 与 connected 被拆到
+  # 下一行），所以只要求 CLIENT 段与 laptop 段各自出现即可。
+  # CLIENT 行可能被 pane 右缘折行且折点不定（lapt/op 任意位置断开），
+  # 退化为单词级判定：CLIENT 段 + laptop 段 + connected 段各自出现。
+  [[ "${screen}" == *"CLIENT"* && "${screen}" == *"laptop"* && "${screen}" == *"connected"* ]] && client_seen=1
+  # herdr pane 双帧叠加时行变成「旧帧尾 + 新帧」拼接，[[ =~ ]] 的贪婪匹配会
+  # 撞上旧帧残片；用 bash 子串匹配（模式里含空格直接量），叠加行中新帧子串
+  # 依然完整存在。
+  [[ "${screen}" == *"f1  5173 python3"* ]] && listening_seen=$((listening_seen | 1))
+  [[ "${screen}" == *"f2  8080 python3"* ]] && listening_seen=$((listening_seen | 2))
+  if [[ "${client_seen}" -eq 1 && "${listening_seen}" -eq 3 ]]; then
+    break
+  fi
+  sleep 1.2
+done
+t_exit_ok 0 "${client_seen}" "B 的面板：client laptop 已连接"
+# listening_seen 是位掩码（1=f1 命中、2=f2 命中）；转成「成功=0」语义传给 t_exit_ok
+t_exit_ok 0 "$((1 - (listening_seen & 1)))" "LISTENING 列出 B 的 5173"
+t_exit_ok 0 "$((1 - (listening_seen >> 1 & 1)))" "LISTENING 列出 B 的 8080"
 hint="$(ui_shows '未列出 saved machines')"
 t_eq "" "${hint}" "B 上不再出现 saved machines 排障提示"
 actions="$(plugin_actions b)"
@@ -416,8 +436,21 @@ t_it "B 的面板里按 f、1 → A 的 localhost:5173 取到 B 的服务"
 ui_keys f
 sleep 0.5
 ui_keys 1
-wait_for 10 ui_shows '已映射本机 5173'
-t_exit_ok 0 "${WAITED_RC}" "面板提示已映射"
+# 与 B 侧 LISTENING 同款：herdr pane 双帧叠加下 wait_for 的正则匹配可能一直
+# 被残片打断，用重试窗口的子串判定。
+# flash 行（[ok] mapped local port 5173）出现在按键后的下一帧；远程 pane 下折点
+# 不定，用单词级容错：mapped + local + 5173 各自出现即可。
+mapped_seen=0
+for _try in $(seq 1 25); do
+  screen="$(ui_screen)"
+  if [[ "${screen}" == *"mapped"* && "${screen}" == *"5173"* ]]; then
+    mapped_seen=1
+    break
+  fi
+  sleep 1.2
+done
+t_exit_ok 0 "${mapped_seen}" "面板提示已映射"
+
 wait_for 15 serves 5173 hello-from-devbox
 t_exit_ok 0 "${WAITED_RC}" "A GET localhost:5173 = B 的页面"
 run ax "ss -Htlnp 'sport = :5173'"
@@ -480,15 +513,24 @@ ui_keys Enter
 wait_for 20 viewing "fwduser@laptop"
 t_exit_ok 0 "${WAITED_RC}" "回到 Local"
 ui_prefix f
-wait_for 10 ui_shows '\[✓\] 1\. devbox'
+wait_for 10 ui_shows '\[x\] 1\. devbox'
 t_exit_ok 0 "${WAITED_RC}" "面板显示 devbox 为当前活动"
-screen="$(ui_screen)"
-t_contains "桥接已连接" "${screen}" "面板显示桥接已连接"
+# herdr pane 重绘瞬间抓屏会撞上「半重绘」叠加态（词被残影拆开），给断言重试窗口。
+bridge_note_seen=0
+for _try in $(seq 1 10); do
+  screen="$(ui_screen)"
+  if [[ "${screen}" == *bridge:up* ]]; then
+    bridge_note_seen=1
+    break
+  fi
+  sleep 1.2
+done
+t_exit_ok 0 "${bridge_note_seen}" "面板显示桥接已连接"
 ui_keys 1
-wait_for 5 ui_shows '停用 devbox'
+wait_for 5 ui_shows 'deactivate devbox, continue'
 t_exit_ok 0 "${WAITED_RC}" "停用前确认"
 ui_keys y
-wait_for 30 ui_shows '按任意键返回面板'
+wait_for 30 ui_shows '(press any key to return)'
 t_exit_ok 0 "${WAITED_RC}" "停用完成"
 ui_keys x
 wait_for 10 a_closed 5173

@@ -19,20 +19,7 @@ func TestRenderFrameGolden(t *testing.T) {
 			{ID: "m2", Label: "待激活", Target: "user@remote:22", State: "inactive"},
 		},
 	})
-	want := "herdr-forward · Port Forward   刷新 3s · r 立即刷新 · x 退出\n" +
-		"──────────────────────────────────────────────────────────────\n" +
-		"MACHINE [✓] 1. devbox\n" +
-		"MACHINE [ ] 2. 待激活\n" +
-		"FORWARDS (1)\n" +
-		"  #  LOCAL         REMOTE                 STATUS    NOTE\n" +
-		"  1  5173          127.0.0.1:5173         up        pid 4242\n" +
-		"\x1b[2m  d+序号 删除映射\x1b[0m\n" +
-		"──────────────────────────────────────────────────────────────\n" +
-		"MACHINES (2)  数字键 = 激活 / 停用\n" +
-		"  [✓] 1. devbox   bob@devbox:22 （当前活动 · tab bar 指向该机）\n" +
-		"\x1b[2m  [ ] 2. 待激活      user@remote:22 （未激活 · 按 2 探测并激活）\x1b[0m\n" +
-		"──────────────────────────────────────────────────────────────\n" +
-		"按键: 1-9 选择机器（激活前会确认） · d+序号 删除映射 · r 刷新 · a 添加转发用法 · x 退出\n"
+	want := "herdr-forward | Port Forward   refresh 3s - r now - x quit\n──────────────────────────────────────────────────────────────\nFORWARDS (1)\n  #  LOCAL         REMOTE                 STATUS    NOTE\n  1  5173          127.0.0.1:5173         up        pid 4242\n\x1b[2m  d+<n> remove forward\x1b[0m\n──────────────────────────────────────────────────────────────\nMACHINES (2)  number keys = activate / deactivate\n  [x] 1. devbox           bob@devbox:22        (active - tab bar points here)\n\x1b[2m  [ ] 2. 待激活              user@remote:22       (inactive - press 2 to probe & activate)\x1b[0m\n──────────────────────────────────────────────────────────────\nkeys: 1-9 pick machine (confirm before activate) - d+<n> remove forward - r refresh - a add help - x quit\n"
 	if got != want {
 		t.Fatalf("frame mismatch:\n got %q\nwant %q", got, want)
 	}
@@ -47,12 +34,12 @@ func TestRenderFrameClientListeningGolden(t *testing.T) {
 		Listening:   []ListenerRow{{Port: 8080, Process: "python3"}},
 	})
 	for _, want := range []string{
-		"CLIENT  laptop 已连接",
+		"CLIENT  laptop connected",
 		"FORWARDS (1)",
 		"client:5173",
-		"LISTENING  本机监听端口",
+		"LISTENING  local ports",
 		"f1  8080 python3",
-		"f+序号 映射端口",
+		"f+<n> map port",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("frame missing %q: %q", want, got)

@@ -144,6 +144,7 @@ specs() {
 
   printf 'panel-frame-full\tpanel-frame\t%s\n' "${HERE}/fixtures/full.two.json"
   printf 'panel-frame-empty\tpanel-frame\t%s\n' "${ROOT}/tests/fixtures/forwards.empty.json"
+  printf 'panel-frame-machines\tpanel-frame\t%s\t%s\n' "${ROOT}/tests/fixtures/forwards.empty.json" "${HERE}/fixtures/machines.five.json"
   printf '%b\n' \
     'cli-list-unknown\tcli-error\tlist\t--wat' \
     'cli-ports-extra\tcli-error\tports\textra' \
@@ -225,6 +226,10 @@ PYJSON
   panel-frame)
     cp "${CASE_PAYLOAD}" "${CASE_STATE}/forwards.json"
     CASE_ARGS=(internal difftest phase4 panel-frame 3)
+    # 可选尾随参数（arg1）：machines fixture 路径（固化 MACHINES 段列宽差分）
+    if [[ -n "${arg1}" ]]; then
+      CASE_ARGS+=("${arg1}")
+    fi
     ;;
   cli-error)
     CASE_ARGS=("${CASE_PAYLOAD}" "${arg1}" "${arg2}")
@@ -262,8 +267,10 @@ decode() {
 specs >"${TMP}/specs.tsv"
 mapfile -t CASE_ROWS <"${TMP}/specs.tsv"
 TOTAL="${#CASE_ROWS[@]}"
-if [[ "${TOTAL}" != 438 ]]; then
-  printf 'RED: golden case inventory changed: expected 438, got %s.\n' "${TOTAL}" >&2
+# 用例总数随差分矩阵演进：panel-frame-machines（MACHINES 段列宽回归护栏）后为 439。
+EXPECTED_TOTAL=439
+if [[ "${TOTAL}" != "${EXPECTED_TOTAL}" ]]; then
+  printf 'RED: golden case inventory changed: expected %s, got %s.\n' "${EXPECTED_TOTAL}" "${TOTAL}" >&2
   exit 1
 fi
 

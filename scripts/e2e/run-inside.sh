@@ -637,7 +637,7 @@ run env HERDR_PLUGIN_STATE_DIR="${A_STATE_DIR}" "${WORK_DIR}/bin/forward" intern
 t_exit_ok 0 "${rc}" "panel golden probe rc=0"
 t_contains "herdr-forward" "${out}" "panel 帧标题"
 t_contains "FORWARDS" "${out}" "panel 帧 forwards 区"
-t_contains "刷新 3s" "${out}" "panel 帧刷新间隔"
+t_contains "refresh 3s" "${out}" "panel 帧刷新间隔"
 
 t_it "Go machines activate：ssh:// target 拆出 host 与端口"
 : >"${A_SSH_LOG}"

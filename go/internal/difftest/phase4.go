@@ -3,6 +3,8 @@ package difftest
 import (
 	"fmt"
 	"os"
+
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -39,6 +41,20 @@ func phase4PanelFrame(args []string) int {
 		refresh = time.Duration(n) * time.Second
 	}
 	fw, _ := state.Load()
-	fmt.Print(panel.RenderFrameFromState(fw, nil, nil, refresh))
+	// 可选第二参数：machines JSON 文件路径，用于固化 MACHINES 段渲染（列宽回归的
+	// 差分护栏；无则等价于旧行为——machines 段不出现）。
+	var machines []panel.MachineRow
+	if len(args) > 1 {
+		mf, err := os.ReadFile(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "difftest panel-frame: 读 machines fixture 失败：%v\n", err)
+			return exitUsage
+		}
+		if err := json.Unmarshal(mf, &machines); err != nil {
+			fmt.Fprintf(os.Stderr, "difftest panel-frame: machines fixture 非法 JSON：%v\n", err)
+			return exitUsage
+		}
+	}
+	fmt.Print(panel.RenderFrameFromState(fw, machines, nil, refresh))
 	return exitOK
 }

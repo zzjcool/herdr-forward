@@ -1,0 +1,7 @@
+[
+  {"id": "nj-mac", "label": "nj-mac", "target": "ssh://zheng@nj.rssyes.com:31415", "state": ""},
+  {"id": "devcloud", "label": "devcloud", "target": "ssh://root@devcloud.zzj.cool:2222", "state": ""},
+  {"id": "nj-hw", "label": "nj-hw", "target": "ssh://zzjcool@nj.rssyes.com:31416", "state": ""},
+  {"id": "nj-host", "label": "nj-host", "target": "ssh://chieh@nj.rssyes.com:31417", "state": ""},
+  {"id": "gpu", "label": "GPU机器", "target": "ssh://root@zhijiezheng-any4.devcloud.woa.com:36000", "state": ""}
+]

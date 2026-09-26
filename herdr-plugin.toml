@@ -46,7 +46,7 @@ title = "Port Forward: Add…"
 # herdr action invoke 不传 argv，交互式添加只能在面板里完成：
 # 优先用 herdr CLI 打开 Port Forward 面板（HERDR_BIN_PATH 由 herdr 注入，SCOUT-FACTS §2.2）；
 # CLI 不可用时退化为打印 add 用法提示，绝不静默失败。
-command = ["/bin/sh", "-c", 'if [ -n "${HERDR_BIN_PATH:-}" ] && command -v "$HERDR_BIN_PATH" >/dev/null 2>&1; then exec "$HERDR_BIN_PATH" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup; else exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" add; fi']
+command = ["/bin/sh", "-c", 'if [ -n "${HERDR_BIN_PATH:-}" ] && command -v "$HERDR_BIN_PATH" >/dev/null 2>&1; then exec "$HERDR_BIN_PATH" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement overlay; else exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" add; fi']
 
 [[actions]]
 id = "list"
@@ -59,7 +59,7 @@ command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}
 [[actions]]
 id = "remove"
 title = "Port Forward: Remove…"
-command = ["/bin/sh", "-c", 'if [ -n "${HERDR_BIN_PATH:-}" ] && command -v "$HERDR_BIN_PATH" >/dev/null 2>&1; then exec "$HERDR_BIN_PATH" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement popup; else exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" list; fi']
+command = ["/bin/sh", "-c", 'if [ -n "${HERDR_BIN_PATH:-}" ] && command -v "$HERDR_BIN_PATH" >/dev/null 2>&1; then exec "$HERDR_BIN_PATH" plugin pane open --plugin zzjcool:forward --entrypoint ports --placement overlay; else exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" list; fi']
 
 [[actions]]
 id = "doctor"
@@ -88,13 +88,13 @@ command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}
 # panes —— Port Forward 面板（表格 + 交互式增删）
 # ---------------------------------------------------------------------------
 
-# 面板一行约 70 列：默认的半屏 popup 会把行折断，给足宽高。
+# placement=overlay：herdr 0.9.1 的 popup 对含宽字符的行按「累积流」软折行（104 列），
+# 中文/表格行会被折断错位（用户实测报障「界面错乱」）。overlay 是全屏覆盖层，
+# 走完整终端 grid 渲染，无此缺陷。width/height 是 popup 限定属性，overlay 下移除。
 [[panes]]
 id = "ports"
 title = "Port Forward"
-placement = "popup"
-width = "80%"
-height = "80%"
+placement = "overlay"
 command = ["/bin/sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?HERDR_PLUGIN_ROOT unset}/bin/forward" watch']
 
 # ---------------------------------------------------------------------------
