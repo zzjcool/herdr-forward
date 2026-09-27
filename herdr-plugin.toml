@@ -8,7 +8,7 @@
 # TOML 注意：payload 里含双引号，故用 literal string（单引号）避免二次转义。
 id = "zzjcool:forward"
 name = "forward"
-version = "0.3.3"
+version = "0.4.0"
 min_herdr_version = "0.8.0"
 description = "Forward a saved SSH machine's TCP port to localhost, and optionally publish a localhost port to the public internet via a Cloudflare quick tunnel."
 platforms = ["linux", "macos"]
