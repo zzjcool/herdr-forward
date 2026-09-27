@@ -21,7 +21,9 @@ else
   (cd "${ROOT}/go" && GOFLAGS=-mod=vendor go build -o "${GO_ARCHIVE_BIN}" ./cmd/forward)
 fi
 chmod 0755 "${GO_ARCHIVE_BIN}"
-ARCHIVE="herdr-forward_0.2.0_linux_amd64.tar.gz"
+# 版本号从 herdr-plugin.toml 动态读取（postinstall 也这么读，硬编码会脱节）
+VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' "${ROOT}/herdr-plugin.toml" | head -n 1)"
+ARCHIVE="herdr-forward_${VERSION}_linux_amd64.tar.gz"
 tar -czf "${WORK}/release/${ARCHIVE}" -C "${WORK}/release" forward
 HASH="$(sha256sum "${WORK}/release/${ARCHIVE}" | awk '{print $1}')"
 printf '%s  %s\n' "${HASH}" "${ARCHIVE}" >"${WORK}/release/checksums.txt"

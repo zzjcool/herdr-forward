@@ -328,7 +328,9 @@ t_match '^[0-9]+$' "${ssh_pid}" "找到 supervisor 的 ssh 子进程"
 kill -KILL "${ssh_pid}" 2>/dev/null || true
 wait_for 10 port_closed "${A_PORT3}"
 t_exit_ok 0 "$?" "ssh 被杀后端口随之释放"
-wait_for 40 roundtrip_ok "${A_PORT3}"
+# 退避上限 60s（2s→60s 指数）：前面断线段落可能已把退避推高，等待窗口须
+# 覆盖满退避上限 + 建连时间，否则偶发超时（flaky），不是产品问题。
+wait_for 90 roundtrip_ok "${A_PORT3}"
 t_exit_ok 0 "$?" "supervisor 重连后映射自动恢复"
 new_sup="$(jq -r '.pid' "${A_STATE}/bridge/client-mB.json")"
 t_eq "${sup_pid}" "${new_sup}" "仍是同一个 supervisor（进程内重连）"

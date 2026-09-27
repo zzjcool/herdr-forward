@@ -396,7 +396,10 @@ func Run(ctx context.Context, opts Options) error {
 		if stdoutTTY {
 			_, err = io.WriteString(out, clearHome+clearAll+frame)
 		} else {
-			_, err = io.WriteString(out, frame)
+			// 非 TTY stdout（herdr pane：stdout 是 pipe、stdin 是 TTY）：
+			// 控制序列被 herdr 当纯文本。herdr pane 对 \f（form feed）做
+			// 「滚动清屏」处理——帧前发 \f 让每帧从干净视口开始。
+			_, err = io.WriteString(out, "\f"+frame)
 		}
 		if err != nil {
 			return err
