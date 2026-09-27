@@ -416,8 +416,8 @@ for _try in $(seq 1 25); do
   # herdr pane 双帧叠加时行变成「旧帧尾 + 新帧」拼接，[[ =~ ]] 的贪婪匹配会
   # 撞上旧帧残片；用 bash 子串匹配（模式里含空格直接量），叠加行中新帧子串
   # 依然完整存在。
-  [[ "${screen}" == *"f1  5173 python3"* ]] && listening_seen=$((listening_seen | 1))
-  [[ "${screen}" == *"f2  8080 python3"* ]] && listening_seen=$((listening_seen | 2))
+  [[ "${screen}" =~ f1[[:space:]]+5173[[:space:]]+python3 ]] && listening_seen=$((listening_seen | 1))
+  [[ "${screen}" =~ f2[[:space:]]+8080[[:space:]]+python3 ]] && listening_seen=$((listening_seen | 2))
   if [[ "${client_seen}" -eq 1 && "${listening_seen}" -eq 3 ]]; then
     break
   fi

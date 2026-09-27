@@ -118,6 +118,10 @@ type FrameData struct {
 	ClientHosts   []string
 	Flash         string
 	Refresh       time.Duration
+	// Cursor 是 LISTENING 段当前高亮行（全局序号，跨页）；-1 = 无高亮。
+	Cursor int
+	// Page 是 LISTENING 分页页号（0 起，每页 9 行）。
+	Page int
 }
 
 // RenderFrame renders the current state directory as one complete text frame.
@@ -225,16 +229,35 @@ func RenderFrameData(data FrameData) string {
 		if len(data.Listening) == 0 {
 			b.WriteString("LISTENING  (no other listening ports; start a dev server and it shows up here)\n")
 		} else {
-			b.WriteString("LISTENING  local ports - f+<n> maps to the client's localhost\n")
-			for i, l := range data.Listening {
-				if i >= 9 {
-					break
-				}
+			fmt.Fprintf(&b, "LISTENING  local ports - f+<n> or <n>/Enter maps to the client's localhost")
+			total := len(data.Listening)
+			if total > 9 {
+				fmt.Fprintf(&b, "  [page %d/%d, n/p to flip]", data.Page+1, (total+8)/9)
+			}
+			b.WriteString("\n")
+			// 分页：每页 9 行（f1..f9 键位绑定）；高亮行用 > 标记 + 上下/jk/Enter 导航。
+			start := data.Page * 9
+			if start >= total {
+				start = 0
+			}
+			end := start + 9
+			if end > total {
+				end = total
+			}
+			for i := start; i < end; i++ {
+				l := data.Listening[i]
 				proc := l.Process
 				if proc == "" {
 					proc = "-"
 				}
-				fmt.Fprintf(&b, "  f%d  %d %s\n", i+1, l.Port, proc)
+				mark := " "
+				if i == data.Cursor {
+					mark = ">"
+				}
+				fmt.Fprintf(&b, "%s f%d  %-6d %s\n", mark, i-start+1, l.Port, proc)
+			}
+			if total > end {
+				fmt.Fprintf(&b, "  ... +%d more (n for next page)\n", total-end)
 			}
 		}
 	}
@@ -286,7 +309,7 @@ func RenderFrameData(data FrameData) string {
 	}
 
 	b.WriteString("──────────────────────────────────────────────────────────────\n")
-	keys := "keys: 1-9 pick machine (confirm before activate)"
+	keys := "keys: 1-9 machine | up/down+j/k move | Enter/1-9 confirm | n/p page"
 	if data.ClientLive && len(data.Listening) > 0 {
 		keys += " - f+<n> map port"
 	}
@@ -388,9 +411,13 @@ func Run(ctx context.Context, opts Options) error {
 	var pending *byte
 	flash := ""
 	forwardArmed, removeArmed := false, false
+	cursor := -1
+	page := 0
 	for {
 		data := collectFrame(refresh)
 		data.Flash = flash
+		data.Cursor = cursor
+		data.Page = page
 		flash = ""
 		frame := RenderFrameData(data)
 		if stdoutTTY {
@@ -434,8 +461,82 @@ func Run(ctx context.Context, opts Options) error {
 			return nil
 		}
 		if key == '\r' || key == '\n' {
+			// Enter：有高亮行时触发该行（LISTENING 映射），否则仅刷新。
+			if cursor >= 0 && cursor < len(data.Listening) {
+				port := strconv.Itoa(data.Listening[cursor].Port)
+				if err := runAction(out, opts.OnAction, Action{Kind: ActionAddClient, Value: port}); err != nil {
+					flash = fmt.Sprintf("  [err] map failed: %v", err)
+				} else {
+					flash = fmt.Sprintf("  [ok] mapped local port %s", port)
+				}
+			}
 			// Bash read -n 1 sees Enter as an empty key.  It refreshes and
 			// never treats it as EOF/quit.
+			continue
+		}
+		if key == 0x1b {
+			// ESC 可能是方向键序列的开头（ESC[A/B/C/D）。短超时窥探后续字节：
+			// 50ms 内无后续 → 单独 ESC = 退出（历史行为）；有 [X → 方向键导航。
+			nxt, nerr := readByte(int(in.Fd()), 50*time.Millisecond)
+			if nerr != nil {
+				return nil
+			}
+			if nxt != '[' {
+				continue
+			}
+			dir, derr := readByte(int(in.Fd()), 50*time.Millisecond)
+			if derr != nil {
+				continue
+			}
+			switch dir {
+			case 'A': // up
+				if len(data.Listening) > 0 {
+					if cursor <= 0 {
+						cursor = len(data.Listening) - 1
+					} else {
+						cursor--
+					}
+					page = cursor / 9
+				}
+			case 'B': // down
+				if len(data.Listening) > 0 {
+					cursor = (cursor + 1) % len(data.Listening)
+					page = cursor / 9
+				}
+			}
+			continue
+		}
+		if key == 'j' && len(data.Listening) > 0 {
+			if cursor < 0 {
+				cursor = 0
+			} else {
+				cursor = (cursor + 1) % len(data.Listening)
+			}
+			page = cursor / 9
+			continue
+		}
+		if key == 'k' && len(data.Listening) > 0 {
+			if cursor <= 0 {
+				cursor = len(data.Listening) - 1
+			} else {
+				cursor--
+			}
+			page = cursor / 9
+			continue
+		}
+		if key == 'n' && len(data.Listening) > 9 {
+			page = (page + 1) % ((len(data.Listening) + 8) / 9)
+			if cursor < page*9 || cursor >= page*9+9 {
+				cursor = page * 9
+			}
+			continue
+		}
+		if key == 'p' && len(data.Listening) > 9 {
+			total := (len(data.Listening) + 8) / 9
+			page = (page + total - 1) % total
+			if cursor < page*9 || cursor >= page*9+9 {
+				cursor = page * 9
+			}
 			continue
 		}
 
