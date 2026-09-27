@@ -791,6 +791,18 @@ func collectFrame(refresh time.Duration) FrameData {
 					data.Listening = append(data.Listening, ListenerRow{Port: listener.Port, Process: listener.Process})
 				}
 			}
+			// 排序：用户最可能要映射的排最前（/proc 无启动时间，用进程名启发式）。
+			//   组 0：典型 dev server 进程（node/python/go/vite/next/deno/ruby/php/java…）
+			//   组 1：其它具名进程（cloudflared 等基础设施往后）
+			//   组 2：无进程名（/proc 直读拿不到 —— 保守放最后）
+			// 组内端口升序（稳定排序，同端口不跳）。
+			sort.SliceStable(data.Listening, func(i, j int) bool {
+				gi, gj := listenRank(data.Listening[i]), listenRank(data.Listening[j])
+				if gi != gj {
+					return gi < gj
+				}
+				return data.Listening[i].Port < data.Listening[j].Port
+			})
 		}
 	}
 	if os.Getenv("HERDR_BIN_PATH") != "" {
@@ -801,6 +813,28 @@ func collectFrame(refresh time.Duration) FrameData {
 		data.Machines = append(data.Machines, MachineRow{ID: m.ID, Label: m.Label, Target: m.Target, State: m.State, Note: bridgeNotes[m.ID]})
 	}
 	return data
+}
+
+// listenRank 返回 LISTENING 行的展示优先级组（0 最优先）。
+// /proc/net/tcp 拿不到监听启动时间，「最近添加优先」退化为进程名启发式：
+// 典型 dev server（node/vite/python/go 等）是用户映射的真实目标，
+// 基础设施（cloudflared/sshd 已被过滤/代理）与无名进程靠后。
+func listenRank(l ListenerRow) int {
+	if l.Process == "" || l.Process == "-" {
+		return 2
+	}
+	name := strings.ToLower(l.Process)
+	// 进程名可能带后缀（node-MainThread / python3.11），匹配前缀/子串。
+	devPrefixes := []string{"node", "python", "go", "vite", "next", "deno", "bun",
+		"ruby", "rails", "puma", "php", "java", "gradle", "cargo", "rustc",
+		"webpack", "esbuild", "tsx", "tsx", "uvicorn", "gunicorn", "flask",
+		"java", "dotnet", "swift", "air", "reflex", "streamlit", "jupyter"}
+	for _, pre := range devPrefixes {
+		if strings.HasPrefix(name, pre) {
+			return 0
+		}
+	}
+	return 1
 }
 
 func listeningProcesses() map[int]string {
