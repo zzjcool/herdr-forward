@@ -782,7 +782,9 @@ func collectFrame(refresh time.Duration) FrameData {
 		if listeners, err := ports.List(); err == nil {
 			processes := listeningProcesses()
 			for _, listener := range listeners {
-				if !done[listener.Port] && len(data.Listening) < 9 {
+				// 全量采集：分页在渲染层做（每页 9 行对齐 f1..f9 键位），
+				// 这里截断会让「n 翻页」永远无页可翻（用户实测抓到）。
+				if !done[listener.Port] {
 					if listener.Process == "" {
 						listener.Process = processes[listener.Port]
 					}
