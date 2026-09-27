@@ -155,7 +155,37 @@ func RenderFrameFromState(fw []state.Forward, machines []MachineRow, listening [
 		}
 		rows = append(rows, ForwardRow{ID: f.ID, Mode: mode, Local: local, Remote: remote, Status: f.Status, Note: note, Removable: mode != "bridge"})
 	}
-	return RenderFrameData(FrameData{Forwards: rows, Machines: machines, MachinesKnown: machines != nil, Listening: listening, Refresh: refresh})
+	return RenderFrameData(FrameData{Forwards: rows, Machines: machines, MachinesKnown: machines != nil, Listening: listening, Refresh: refresh, Cursor: -1})
+}
+
+// navItem 是统一光标模型里的一条可选中行（FORWARDS/LISTENING/MACHINES 三段）。
+type navItem struct {
+	kind string // "forward" | "listening" | "machine"
+	idx  int    // 段内索引（forward=sorted 序、listening=全局序、machine=序）
+}
+
+// navItems 构建可选中行的总表：FORWARDS（可删除的）→ LISTENING → MACHINES。
+func navItems(data FrameData) []navItem {
+	items := []navItem{}
+	rows := sortedForwards(data)
+	for i, row := range rows {
+		if row.Removable && row.Mode != "bridge" {
+			items = append(items, navItem{kind: "forward", idx: i})
+		}
+	}
+	for i := range data.Listening {
+		items = append(items, navItem{kind: "listening", idx: i})
+	}
+	for i := range data.Machines {
+		items = append(items, navItem{kind: "machine", idx: i})
+	}
+	return items
+}
+
+func sortedForwards(data FrameData) []ForwardRow {
+	rows := append([]ForwardRow(nil), data.Forwards...)
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Local < rows[j].Local })
+	return rows
 }
 
 // RenderFrameData emits the bash panel's frame text.  It is a pure function:
@@ -163,7 +193,7 @@ func RenderFrameFromState(fw []state.Forward, machines []MachineRow, listening [
 func RenderFrameData(data FrameData) string {
 	refresh := refreshSeconds(data.Refresh)
 	var b strings.Builder
-	fmt.Fprintf(&b, "herdr-forward | Port Forward   refresh %ds - r now - x quit\n", refresh)
+	fmt.Fprintf(&b, "Port Forward   refresh %ds\n", refresh)
 	b.WriteString("──────────────────────────────────────────────────────────────\n")
 	if data.Flash != "" {
 		b.WriteString(data.Flash)
@@ -177,29 +207,25 @@ func RenderFrameData(data FrameData) string {
 		b.WriteString(" connected - map local ports to its localhost (remote dev)\n")
 	}
 
-	rows := append([]ForwardRow(nil), data.Forwards...)
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Local < rows[j].Local })
-	removable := 0
-	for _, row := range rows {
-		if row.Removable && row.Mode != "bridge" {
-			removable++
-		}
+	rows := sortedForwards(data)
+	items := navItems(data)
+	cur := navItem{}
+	if data.Cursor >= 0 && data.Cursor < len(items) {
+		cur = items[data.Cursor]
 	}
 	fmt.Fprintf(&b, "FORWARDS (%d)\n", len(rows))
 	if len(rows) == 0 {
 		if data.ClientLive {
-			b.WriteString("  (no forwards) press f+<n> to map a listening port to the client, or run forward add <port>.\n")
+			b.WriteString("  (no forwards) pick a listening port below and press Enter\n")
 		} else {
-			b.WriteString("  (no forwards) run 'forward add 3000:3000 --machine <label>' in a terminal.\n")
+			b.WriteString("  (no forwards) run 'forward add 3000:3000 --machine <label>' in a terminal\n")
 		}
 	} else {
 		fmt.Fprintf(&b, "  %-2s %-13s %-22s %-9s %s\n", "#", "LOCAL", "REMOTE", "STATUS", "NOTE")
-		machineNumber := 0
-		for _, row := range rows {
+		for i, row := range rows {
 			number := "-"
-			if row.Mode != "bridge" && machineNumber < 9 {
-				machineNumber++
-				number = strconv.Itoa(machineNumber)
+			if row.Mode != "bridge" {
+				number = strconv.Itoa(i + 1)
 			}
 			local := strconv.Itoa(row.Local)
 			if row.Mode == string(state.ModeClient) {
@@ -217,10 +243,11 @@ func RenderFrameData(data FrameData) string {
 			if row.Mode == "bridge" {
 				note = "via bridge (registered on " + row.Remote + ")"
 			}
-			fmt.Fprintf(&b, "  %-2s %-13s %-22s %-9s %s\n", number, local, row.Remote, dash(row.Status), note)
-		}
-		if removable > 0 {
-			b.WriteString(dim + "  d+<n> remove forward" + reset + "\n")
+			mark := " "
+			if cur.kind == "forward" && cur.idx == i {
+				mark = ">"
+			}
+			fmt.Fprintf(&b, "%s %-2s %-13s %-22s %-9s %s\n", mark, number, local, row.Remote, dash(row.Status), note)
 		}
 	}
 
@@ -229,21 +256,13 @@ func RenderFrameData(data FrameData) string {
 		if len(data.Listening) == 0 {
 			b.WriteString("LISTENING  (no other listening ports; start a dev server and it shows up here)\n")
 		} else {
-			fmt.Fprintf(&b, "LISTENING  local ports - f+<n> or <n>/Enter maps to the client's localhost")
-			total := len(data.Listening)
-			if total > 9 {
-				fmt.Fprintf(&b, "  [page %d/%d, n/p to flip]", data.Page+1, (total+8)/9)
+			fmt.Fprintf(&b, "LISTENING  local ports (%d)  -  Enter maps to the client's localhost\n", len(data.Listening))
+			// 滚动窗口：以 LISTENING 光标为中心 ±8 行（去页概念，光标到哪滚到哪）。
+			li := -1
+			if cur.kind == "listening" {
+				li = cur.idx
 			}
-			b.WriteString("\n")
-			// 分页：每页 9 行（f1..f9 键位绑定）；高亮行用 > 标记 + 上下/jk/Enter 导航。
-			start := data.Page * 9
-			if start >= total {
-				start = 0
-			}
-			end := start + 9
-			if end > total {
-				end = total
-			}
+			start, end := scrollWindow(li, len(data.Listening))
 			for i := start; i < end; i++ {
 				l := data.Listening[i]
 				proc := l.Process
@@ -251,20 +270,20 @@ func RenderFrameData(data FrameData) string {
 					proc = "-"
 				}
 				mark := " "
-				if i == data.Cursor {
+				if i == li {
 					mark = ">"
 				}
-				fmt.Fprintf(&b, "%s f%d  %-6d %s\n", mark, i-start+1, l.Port, proc)
+				fmt.Fprintf(&b, "%s %-6d %s\n", mark, l.Port, proc)
 			}
-			if total > end {
-				fmt.Fprintf(&b, "  ... +%d more (n for next page)\n", total-end)
+			if start > 0 || end < len(data.Listening) {
+				fmt.Fprintf(&b, "  (%d of %d shown; keep moving to scroll)\n", end-start, len(data.Listening))
 			}
 		}
 	}
 
 	if len(data.Machines) > 0 {
 		b.WriteString("──────────────────────────────────────────────────────────────\n")
-		fmt.Fprintf(&b, "MACHINES (%d)  number keys = activate / deactivate\n", len(data.Machines))
+		fmt.Fprintf(&b, "MACHINES (%d)  -  Enter activates / deactivates\n", len(data.Machines))
 		for i, m := range data.Machines {
 			if i >= 9 {
 				break
@@ -277,7 +296,7 @@ func RenderFrameData(data FrameData) string {
 			if target == "" {
 				target = "-"
 			}
-			mark, desc := "[ ]", "(inactive - press "+strconv.Itoa(i+1)+" to probe & activate)"
+			mark, desc := "[ ]", "(inactive)"
 			switch m.State {
 			case "active":
 				mark = "[x]"
@@ -292,7 +311,11 @@ func RenderFrameData(data FrameData) string {
 			if m.State == "active" && m.Note != "" {
 				desc = "(active - " + m.Note + ")"
 			}
-			line := fmt.Sprintf("  %s %d. %-16s %-20s %s", mark, i+1, label, target, desc)
+			cmark := " "
+			if cur.kind == "machine" && cur.idx == i {
+				cmark = ">"
+			}
+			line := fmt.Sprintf("%s %s %d. %-16s %-20s %s", cmark, mark, i+1, label, target, desc)
 			if m.State != "active" && m.State != "local" {
 				b.WriteString(dim)
 			}
@@ -309,15 +332,27 @@ func RenderFrameData(data FrameData) string {
 	}
 
 	b.WriteString("──────────────────────────────────────────────────────────────\n")
-	keys := "keys: 1-9 machine | up/down+j/k move | Enter/1-9 confirm | n/p page"
-	if data.ClientLive && len(data.Listening) > 0 {
-		keys += " - f+<n> map port"
-	}
-	if removable > 0 {
-		keys += " - d+<n> remove forward"
-	}
-	b.WriteString(keys + " - r refresh - a add help - x quit\n")
+	b.WriteString("up/down move - Enter confirm - 1-9 machine - r refresh - x quit\n")
 	return b.String()
+}
+
+// scrollWindow 返回 LISTENING 段的滚动窗口 [start,end)：光标行居中，上下各留 8 行。
+func scrollWindow(cursor, total int) (int, int) {
+	const span = 17 // 每屏 17 行（光标居中 ±8）
+	if total <= span {
+		return 0, total
+	}
+	if cursor < 0 {
+		return 0, span
+	}
+	start := cursor - span/2
+	if start < 0 {
+		start = 0
+	}
+	if start+span > total {
+		start = total - span
+	}
+	return start, start + span
 }
 
 func refreshSeconds(d time.Duration) int {
@@ -410,14 +445,11 @@ func Run(ctx context.Context, opts Options) error {
 
 	var pending *byte
 	flash := ""
-	forwardArmed, removeArmed := false, false
 	cursor := -1
-	page := 0
 	for {
 		data := collectFrame(refresh)
 		data.Flash = flash
 		data.Cursor = cursor
-		data.Page = page
 		flash = ""
 		frame := RenderFrameData(data)
 		if stdoutTTY {
@@ -460,23 +492,66 @@ func Run(ctx context.Context, opts Options) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		if key == '\r' || key == '\n' {
-			// Enter：有高亮行时触发该行（LISTENING 映射），否则仅刷新。
-			if cursor >= 0 && cursor < len(data.Listening) {
-				port := strconv.Itoa(data.Listening[cursor].Port)
-				if err := runAction(out, opts.OnAction, Action{Kind: ActionAddClient, Value: port}); err != nil {
-					flash = fmt.Sprintf("  [err] map failed: %v", err)
+		// ---- 统一光标模型：up/down 在 FORWARDS→LISTENING→MACHINES 全表移动 ----
+		move := func(delta int) {
+			items := navItems(data)
+			if len(items) == 0 {
+				return
+			}
+			if cursor < 0 {
+				if delta > 0 {
+					cursor = 0
 				} else {
-					flash = fmt.Sprintf("  [ok] mapped local port %s", port)
+					cursor = len(items) - 1
+				}
+				return
+			}
+			cursor = (cursor + delta + len(items)) % len(items)
+		}
+
+		switch key {
+		case '\r', '\n':
+			// Enter 的分段语义（按光标所在区块）：
+			//   forward 行 → remove（带确认）；listening 行 → 映射到 client；
+			//   machine 行 → 激活/停用；无光标 → 仅刷新。
+			items := navItems(data)
+			if cursor >= 0 && cursor < len(items) {
+				switch it := items[cursor]; it.kind {
+				case "forward":
+					rows := sortedForwards(data)
+					if it.idx < len(rows) {
+						id := rows[it.idx].ID
+						if keyYN(out, in, "remove forward "+strconv.Itoa(rows[it.idx].Local)) {
+							if err := runAction(out, opts.OnAction, Action{Kind: ActionRemove, Value: id}); err != nil {
+								flash = fmt.Sprintf("  [err] remove failed: %v", err)
+							} else {
+								flash = fmt.Sprintf("  [ok] removed %d", rows[it.idx].Local)
+							}
+						}
+					}
+				case "listening":
+					if it.idx < len(data.Listening) {
+						port := strconv.Itoa(data.Listening[it.idx].Port)
+						if err := runAction(out, opts.OnAction, Action{Kind: ActionAddClient, Value: port}); err != nil {
+							flash = fmt.Sprintf("  [err] map failed: %v", err)
+						} else {
+							flash = fmt.Sprintf("  [ok] mapped local port %s", port)
+						}
+					}
+				case "machine":
+					if it.idx < len(data.Machines) {
+						m := data.Machines[it.idx]
+						if m.State == "active" || m.State == "local" {
+							pending = doMachineAction(ctx, in, out, opts.OnAction, Action{Kind: ActionDeactivate, Value: m.ID}, data)
+						} else {
+							pending = doMachineAction(ctx, in, out, opts.OnAction, Action{Kind: ActionActivate, Value: m.ID}, data)
+						}
+					}
 				}
 			}
-			// Bash read -n 1 sees Enter as an empty key.  It refreshes and
-			// never treats it as EOF/quit.
 			continue
-		}
-		if key == 0x1b {
-			// ESC 可能是方向键序列的开头（ESC[A/B/C/D）。短超时窥探后续字节：
-			// 50ms 内无后续 → 单独 ESC = 退出（历史行为）；有 [X → 方向键导航。
+		case 0x1b:
+			// ESC 可能是方向键序列（ESC[A/B）。50ms 窥探：无后续 = 单独 ESC = 退出。
 			nxt, nerr := readByte(int(in.Fd()), 50*time.Millisecond)
 			if nerr != nil {
 				return nil
@@ -489,105 +564,40 @@ func Run(ctx context.Context, opts Options) error {
 				continue
 			}
 			switch dir {
-			case 'A': // up
-				if len(data.Listening) > 0 {
-					if cursor <= 0 {
-						cursor = len(data.Listening) - 1
-					} else {
-						cursor--
-					}
-					page = cursor / 9
-				}
-			case 'B': // down
-				if len(data.Listening) > 0 {
-					cursor = (cursor + 1) % len(data.Listening)
-					page = cursor / 9
-				}
+			case 'A':
+				move(-1)
+			case 'B':
+				move(1)
 			}
 			continue
-		}
-		if key == 'j' && len(data.Listening) > 0 {
-			if cursor < 0 {
-				cursor = 0
-			} else {
-				cursor = (cursor + 1) % len(data.Listening)
-			}
-			page = cursor / 9
+		case 'j':
+			move(1)
 			continue
-		}
-		if key == 'k' && len(data.Listening) > 0 {
-			if cursor <= 0 {
-				cursor = len(data.Listening) - 1
-			} else {
-				cursor--
-			}
-			page = cursor / 9
-			continue
-		}
-		if key == 'n' && len(data.Listening) > 9 {
-			page = (page + 1) % ((len(data.Listening) + 8) / 9)
-			if cursor < page*9 || cursor >= page*9+9 {
-				cursor = page * 9
-			}
-			continue
-		}
-		if key == 'p' && len(data.Listening) > 9 {
-			total := (len(data.Listening) + 8) / 9
-			page = (page + total - 1) % total
-			if cursor < page*9 || cursor >= page*9+9 {
-				cursor = page * 9
-			}
+		case 'k':
+			move(-1)
 			continue
 		}
 
-		data = collectFrame(refresh)
-		if removeArmed || forwardArmed {
-			if key >= '1' && key <= '9' {
-				idx := int(key - '1')
-				if removeArmed {
-					if id := removeID(data, idx); id != "" {
-						_ = runAction(out, opts.OnAction, Action{Kind: ActionRemove, Value: id})
-					}
-				} else if idx < len(data.Listening) {
-					port := strconv.Itoa(data.Listening[idx].Port)
-					if err := runAction(out, opts.OnAction, Action{Kind: ActionAddClient, Value: port}); err != nil {
-						flash = fmt.Sprintf("  ⚠ 映射失败：%v", err)
-					} else {
-						flash = fmt.Sprintf("  [ok] mapped local port %s", port)
-					}
-				}
-				removeArmed, forwardArmed = false, false
-				continue
-			}
-			removeArmed, forwardArmed = false, false
-		}
-		if key == 'd' {
-			if err := runAction(out, opts.OnAction, Action{Kind: ActionDoctor}); err != nil {
-				fmt.Fprintf(out, "  ⚠ doctor 失败：%v\n", err)
-			}
-			removeArmed = hasRemovable(data)
-			continue
-		}
-		if key == 'f' || key == 'F' {
-			forwardArmed = data.ClientLive && len(data.Listening) > 0
-			continue
-		}
 		action := HandleKey(key, data)
 		switch action.Kind {
 		case ActionQuit:
 			return nil
 		case ActionRefresh:
 			continue
-		case ActionHint:
-			fmt.Fprintln(out, "panel: add forward: run 'forward add <port>' in a terminal (maps to its localhost when a client is attached).")
 		case ActionActivate, ActionDeactivate:
 			pending = doMachineAction(ctx, in, out, opts.OnAction, action, data)
-		case ActionPickForward:
-			forwardArmed = true
-		case ActionPickRemove:
-			removeArmed = true
 		}
 	}
+}
+
+// keyYN 在面板上问一个 y/N 问题（raw 模式下读单键）。返回是否确认。
+func keyYN(out io.Writer, in *os.File, question string) bool {
+	fmt.Fprintf(out, "\r\n  %s? [y/N] ", question)
+	key, err := readByte(int(in.Fd()), 30*time.Second)
+	if err != nil {
+		return false
+	}
+	return key == 'y' || key == 'Y'
 }
 
 var errReadTimeout = errors.New("panel: read timeout")

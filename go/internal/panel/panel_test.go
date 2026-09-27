@@ -10,6 +10,7 @@ import (
 
 func TestRenderFrameGolden(t *testing.T) {
 	got := RenderFrameData(FrameData{
+		Cursor:  -1,
 		Refresh: 3 * time.Second,
 		Forwards: []ForwardRow{
 			{ID: "f-5173", Mode: "tunnel", Local: 5173, Remote: "127.0.0.1:5173", Status: "up", Note: "pid 4242", Removable: true},
@@ -19,7 +20,7 @@ func TestRenderFrameGolden(t *testing.T) {
 			{ID: "m2", Label: "待激活", Target: "user@remote:22", State: "inactive"},
 		},
 	})
-	want := "herdr-forward | Port Forward   refresh 3s - r now - x quit\n──────────────────────────────────────────────────────────────\nFORWARDS (1)\n  #  LOCAL         REMOTE                 STATUS    NOTE\n  1  5173          127.0.0.1:5173         up        pid 4242\n\x1b[2m  d+<n> remove forward\x1b[0m\n──────────────────────────────────────────────────────────────\nMACHINES (2)  number keys = activate / deactivate\n  [x] 1. devbox           bob@devbox:22        (active - tab bar points here)\n\x1b[2m  [ ] 2. 待激活              user@remote:22       (inactive - press 2 to probe & activate)\x1b[0m\n──────────────────────────────────────────────────────────────\nkeys: 1-9 machine | up/down+j/k move | Enter/1-9 confirm | n/p page - d+<n> remove forward - r refresh - a add help - x quit\n"
+	want := "Port Forward   refresh 3s\n──────────────────────────────────────────────────────────────\nFORWARDS (1)\n  #  LOCAL         REMOTE                 STATUS    NOTE\n  1  5173          127.0.0.1:5173         up        pid 4242\n──────────────────────────────────────────────────────────────\nMACHINES (2)  -  Enter activates / deactivates\n  [x] 1. devbox           bob@devbox:22        (active - tab bar points here)\n\x1b[2m  [ ] 2. 待激活              user@remote:22       (inactive)\x1b[0m\n──────────────────────────────────────────────────────────────\nup/down move - Enter confirm - 1-9 machine - r refresh - x quit\n"
 	if got != want {
 		t.Fatalf("frame mismatch:\n got %q\nwant %q", got, want)
 	}
@@ -27,6 +28,7 @@ func TestRenderFrameGolden(t *testing.T) {
 
 func TestRenderFrameClientListeningGolden(t *testing.T) {
 	got := RenderFrameData(FrameData{
+		Cursor:      -1,
 		Refresh:     3 * time.Second,
 		ClientLive:  true,
 		ClientHosts: []string{"laptop"},
@@ -38,8 +40,8 @@ func TestRenderFrameClientListeningGolden(t *testing.T) {
 		"FORWARDS (1)",
 		"client:5173",
 		"LISTENING  local ports",
-		"> f1  8080   python3",
-		"f+<n> map port",
+		"  8080   python3",
+		"LISTENING  local ports (1)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("frame missing %q: %q", want, got)

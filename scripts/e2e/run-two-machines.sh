@@ -107,12 +107,14 @@ b_fwd() { docker exec -u bob "${B}" env "HERDR_PLUGIN_STATE_DIR=${B_STATE}" "${B
 
 # --- UI 助手：tmux 是真 herdr TUI 的虚拟终端 ------------------------------------
 ui_screen() { docker exec "${A}" tmux -L hf capture-pane -p -t ui 2>/dev/null | sed 's/[[:space:]]*$//'; }
-ui_keys() { docker exec "${A}" tmux -L hf send-keys -t ui "$@"; }
+ui_keys() { docker exec "${A}" tmux -L hf send-keys -t ui "$@" || true; }
 # ui_prefix <key>：herdr 的 prefix + 一个键。A 的键位照搬真实用户的配置：prefix = ctrl+space
 # （终端里就是 NUL 字节 0x00），reload = prefix+q，detach = prefix+d。tmux 的键名送不到
 # herdr，直接写原始字节才行（真 TUI 实测）。
 ui_prefix() {
-  docker exec "${A}" tmux -L hf send-keys -t ui -H 00
+  # 容错：远程 pane 切换瞬间 tmux 可能返回非零（E2E 偶发脚本死亡根因），
+  # 断言自会抓「面板没打开」，不应让 set -e 提前杀掉整轮。
+  docker exec "${A}" tmux -L hf send-keys -t ui -H 00 || true
   sleep 0.3
   ui_keys "$1"
 }
@@ -224,7 +226,7 @@ PY"
 }
 panel_still_open() {
   sleep 1.5
-  ui_shows 'herdr-forward | Port Forward'
+  ui_shows 'Port Forward   refresh'
 }
 
 # wait_for <seconds> <cmd...>：cmd 的 stdout 为 yes 即 WAITED_RC=0（否则 1）。恒 return 0：
@@ -342,7 +344,7 @@ t_exit_ok 0 "${rc}" "安装（build 步骤）退出 0"
 t_match '已装好键位|键位：已写入|install-keys: 已写入' "${out}" "build 步骤装好了键位"
 t_contains "现在就可以按 prefix+f" "${out}" "build 步骤重载了正在运行的 herdr"
 ui_prefix f
-wait_for 10 ui_shows 'herdr-forward | Port Forward'
+wait_for 10 ui_shows 'Port Forward   refresh'
 t_exit_ok 0 "${WAITED_RC}" "prefix+f 打开 Port Forward 面板（server 未重启）"
 wait_for 5 ui_shows 'MACHINES \(0\)  no saved machines yet'
 t_exit_ok 0 "${WAITED_RC}" "还没有 saved machine 时明说，并给出下一步"
@@ -371,7 +373,7 @@ wait_for 10 ui_shows 'MACHINES \(1\)'
 t_exit_ok 0 "${WAITED_RC}" "面板弹出并列出 saved machine"
 screen="$(ui_screen)"
 t_match '\[ \] 1\. devbox' "${screen}" "devbox 为未激活"
-t_match 'herdr-forward \| Port Forward' "${screen}" "overlay 面板打开（placement=overlay，行不折断）"
+t_match 'Port Forward   refresh' "${screen}" "overlay 面板打开（行不折断）"
 ui_keys 1
 wait_for 5 ui_shows 'probe devbox read-only over SSH, continue'
 t_exit_ok 0 "${WAITED_RC}" "激活前确认"
@@ -416,8 +418,11 @@ for _try in $(seq 1 25); do
   # herdr pane 双帧叠加时行变成「旧帧尾 + 新帧」拼接，[[ =~ ]] 的贪婪匹配会
   # 撞上旧帧残片；用 bash 子串匹配（模式里含空格直接量），叠加行中新帧子串
   # 依然完整存在。
-  [[ "${screen}" =~ f1[[:space:]]+5173[[:space:]]+python3 ]] && listening_seen=$((listening_seen | 1))
-  [[ "${screen}" =~ f2[[:space:]]+8080[[:space:]]+python3 ]] && listening_seen=$((listening_seen | 2))
+  # 正则放变量：[[ =~ ]] 的裸 [> 会被 bash 条件表达式误解析（E2E 曾因此语法崩）。
+  RE_L5173='[>[:space:]]5173[[:space:]]+python3'
+  RE_L8080='[>[:space:]]8080[[:space:]]+python3'
+  [[ "${screen}" =~ ${RE_L5173} ]] && listening_seen=$((listening_seen | 1))
+  [[ "${screen}" =~ ${RE_L8080} ]] && listening_seen=$((listening_seen | 2))
   if [[ "${client_seen}" -eq 1 && "${listening_seen}" -eq 3 ]]; then
     break
   fi
@@ -432,10 +437,12 @@ t_eq "" "${hint}" "B 上不再出现 saved machines 排障提示"
 actions="$(plugin_actions b)"
 t_contains "add" "${actions}" "按键由 B 的插件处理（B 的插件日志有 add）"
 
-t_it "B 的面板里按 f、1 → A 的 localhost:5173 取到 B 的服务"
-ui_keys f
-sleep 0.5
-ui_keys 1
+t_it "B 的面板里 j、Enter → A 的 localhost:5173 取到 B 的服务"
+# 统一光标模型：j 进入 LISTENING（第一行 5173），Enter 映射。
+sleep 1
+ui_keys j
+sleep 1
+ui_keys Enter
 # 与 B 侧 LISTENING 同款：herdr pane 双帧叠加下 wait_for 的正则匹配可能一直
 # 被残片打断，用重试窗口的子串判定。
 # flash 行（[ok] mapped local port 5173）出现在按键后的下一帧；远程 pane 下折点
