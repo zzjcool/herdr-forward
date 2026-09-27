@@ -394,12 +394,18 @@ func Run(ctx context.Context, opts Options) error {
 		flash = ""
 		frame := RenderFrameData(data)
 		if stdoutTTY {
-			_, err = io.WriteString(out, clearHome+clearAll+frame)
+			// stdin 的 PTY 已 MakeRaw（OPOST 关）：\n 不再由内核补 \r。
+			// herdr pane（stdout 与 stdin 同一 PTY）的 VT 解析把纯 LF 当
+			// 「换行不回列」（打字机行为）→ 逐行累积右移（=「界面错乱」
+			// 根因）。手动补 \r 恢复列归零。
+			_, err = io.WriteString(out, clearHome+clearAll+strings.ReplaceAll(frame, "\n", "\r\n"))
 		} else {
-			// 非 TTY stdout（herdr pane：stdout 是 pipe、stdin 是 TTY）：
-			// 控制序列被 herdr 当纯文本。herdr pane 对 \f（form feed）做
-			// 「滚动清屏」处理——帧前发 \f 让每帧从干净视口开始。
-			_, err = io.WriteString(out, "\f"+frame)
+			// 非 TTY stdout（herdr pane）：
+			// stdin 的 PTY 已被 MakeRaw（OPOST 关）——若 herdr 从该 PTY
+			// 侧收集输出，纯 \n 只换行不回列 0（打字机行为），造成
+			// 「每行右移上一行长度」的逐行漂移。补 \r 恢复列归零；
+			// \f 让每帧从干净视口开始（herdr pane 当空行）。
+			_, err = io.WriteString(out, "\f"+strings.ReplaceAll(frame, "\n", "\r\n"))
 		}
 		if err != nil {
 			return err

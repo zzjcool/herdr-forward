@@ -28,6 +28,12 @@ done
 # 与宿主 herdr 隔离：绝不连真实 server（SCOUT-FACTS §1.1）
 unset HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_BIN_PATH HERDR_ENV
 
+# 退避压缩：本测试多次制造断线（kill ssh / 端口占用），默认退避 2s→60s 指数
+# 会让后面的重连等待偶发超时（环境负载高时 flaky）。把退避钉在 1s，重连
+# 断言的等待窗口（10-90s）因此确定性覆盖；产品默认行为不受影响（仅测试环境）。
+export BRIDGE_BACKOFF_MIN_S=1
+export BRIDGE_BACKOFF_MAX_S=2
+
 out=""
 rc=0
 T="$(mktemp -d "${TMPDIR:-/tmp}/hf-bridge-it.XXXXXX")"
@@ -328,9 +334,7 @@ t_match '^[0-9]+$' "${ssh_pid}" "找到 supervisor 的 ssh 子进程"
 kill -KILL "${ssh_pid}" 2>/dev/null || true
 wait_for 10 port_closed "${A_PORT3}"
 t_exit_ok 0 "$?" "ssh 被杀后端口随之释放"
-# 退避上限 60s（2s→60s 指数）：前面断线段落可能已把退避推高，等待窗口须
-# 覆盖满退避上限 + 建连时间，否则偶发超时（flaky），不是产品问题。
-wait_for 90 roundtrip_ok "${A_PORT3}"
+wait_for 30 roundtrip_ok "${A_PORT3}"
 t_exit_ok 0 "$?" "supervisor 重连后映射自动恢复"
 new_sup="$(jq -r '.pid' "${A_STATE}/bridge/client-mB.json")"
 t_eq "${sup_pid}" "${new_sup}" "仍是同一个 supervisor（进程内重连）"

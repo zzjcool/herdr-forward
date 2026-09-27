@@ -423,7 +423,7 @@ for _try in $(seq 1 25); do
   fi
   sleep 1.2
 done
-t_exit_ok 0 "${client_seen}" "B 的面板：client laptop 已连接"
+t_exit_ok 0 "$((1 - client_seen))" "B 的面板：client laptop 已连接"
 # listening_seen 是位掩码（1=f1 命中、2=f2 命中）；转成「成功=0」语义传给 t_exit_ok
 t_exit_ok 0 "$((1 - (listening_seen & 1)))" "LISTENING 列出 B 的 5173"
 t_exit_ok 0 "$((1 - (listening_seen >> 1 & 1)))" "LISTENING 列出 B 的 8080"
@@ -449,7 +449,7 @@ for _try in $(seq 1 25); do
   fi
   sleep 1.2
 done
-t_exit_ok 0 "${mapped_seen}" "面板提示已映射"
+t_exit_ok 0 "$((1 - mapped_seen))" "面板提示已映射"
 
 wait_for 15 serves 5173 hello-from-devbox
 t_exit_ok 0 "${WAITED_RC}" "A GET localhost:5173 = B 的页面"
@@ -519,13 +519,13 @@ t_exit_ok 0 "${WAITED_RC}" "面板显示 devbox 为当前活动"
 bridge_note_seen=0
 for _try in $(seq 1 10); do
   screen="$(ui_screen)"
-  if [[ "${screen}" == *bridge:up* ]]; then
+  if [[ "${screen}" == *"bridge connected"* ]]; then
     bridge_note_seen=1
     break
   fi
   sleep 1.2
 done
-t_exit_ok 0 "${bridge_note_seen}" "面板显示桥接已连接"
+t_exit_ok 0 "$((1 - bridge_note_seen))" "面板显示桥接已连接"
 ui_keys 1
 wait_for 5 ui_shows 'deactivate devbox, continue'
 t_exit_ok 0 "${WAITED_RC}" "停用前确认"
